@@ -1,5 +1,3 @@
-#include <stdio.h>
-
 #include "asic_profile.h"
 
 namespace amdgpu {
@@ -106,8 +104,24 @@ const char *version_string(const IPVersion &v) {
 	static uint32_t next = 0;
 	char *buf = pool[next];
 	next = (next + 1) % (uint32_t)(sizeof(pool) / sizeof(pool[0]));
-	// snprintf, not '0' + major: PSP and SMU are 13.x, and 48 + 13 is '='.
-	snprintf(buf, sizeof(pool[0]), "%u.%u.%u", v.major, v.minor, v.rev);
+
+	// Hand-rolled decimal, not snprintf. This translation unit is built twice:
+	// once into the kext, where MacKernelSDK has no <stdio.h> (snprintf there is
+	// declared by <IOKit/IOLib.h>), and once by the host test, which has no IOKit
+	// at all. Formatting by hand needs only <stdint.h>, so one source serves both.
+	// Decimal, not '0' + major: PSP and SMU are 13.x, and 48 + 13 is '='.
+	char *p = buf;
+	auto put = [&](uint32_t n) {
+		if (n >= 100) *p++ = '0' + n / 100;
+		if (n >= 10)  *p++ = '0' + n / 10 % 10;
+		*p++ = '0' + n % 10;
+	};
+	put(v.major);
+	*p++ = '.';
+	put(v.minor);
+	*p++ = '.';
+	put(v.rev);
+	*p = '\0';
 	return buf;
 }
 
