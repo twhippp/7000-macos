@@ -1,0 +1,131 @@
+name: build-kext
+
+# Builds Navi48Bringup.kext on a macOS runner and uploads it as an artifact.
+#
+# Why this exists: BUILDING.txt needs macOS (Xcode CLT: clang, codesign, xattr,
+# xcrun, python3) plus two inputs that are deliberately not in the tree --
+# MacKernelSDK (acidanthera, via RDNA4FB) and the ten linux-firmware blobs. All
+# of them are public, so a runner can assemble them. That makes it possible to
+# produce a kext from a clean clone with no Mac to hand.
+#
+# Nothing here touches the driver logic: it is fetch inputs, run make, ship the
+# bundle. If the build fails, the log is the real output.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # macos-14 is the oldest runner with an Xcode new enough for the
+    # Tahoe-era kernels this kext targets. Bump deliberately, not by accident.
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # This repo vendors no submodules of its own; MacKernelSDK is cloned
+          # below from RDNA4FB rather than as a submodule.
+          submodules: false
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          clang --version | head -1
+          python3 --version
+
+      # --- MacKernelSDK -------------------------------------------------------
+      # RDNA4FB is a shallow clone of a third-party repo just to reach its
+      # MacKernelSDK submodule. Cached because it never changes between runs.
+      - name: Cache MacKernelSDK
+        id: mksdk-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/mksdk
+          key: mksdk-${{ runner.os }}-${{ hashFiles('src/navi48-bringup/Makefile') }}
+
+      - name: Fetch MacKernelSDK
+        if: steps.mksdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git /tmp/mksdk
+          cd /tmp/mksdk
+          git log -1 --format='MacKernelSDK %H (%cd)' --date=short
+
+      - name: Verify MacKernelSDK
+        run: |
+          test -d /tmp/mksdk/Headers || { echo "MacKernelSDK Headers missing"; exit 1; }
+          test -f /tmp/mksdk/Library/x86_64/libkmod.a || {
+            echo "libkmod.a missing -- kext will not link"; exit 1; }
+          ls /tmp/mksdk/Library/x86_64/
+
+      # --- linux-firmware -----------------------------------------------------
+      # ~10 files out of amdgpu/. Sparse + blob:none because the full repo is
+      # several GB and we only ever copy ten blobs out of it.
+      - name: Cache AMD firmware
+        id: fw-cache
+        uses: actions/cache@v4
+        with:
+          path: src/navi48-bringup/firmware
+          key: amd-fw-${{ runner.os }}-${{ hashFiles('tools/fetch-firmware.sh') }}
+
+      - name: Fetch AMD firmware
+        if: steps.fw-cache.outputs.cache-hit != 'true'
+        run: |
+          # linux-firmware is published on gitlab; kernel-firmware/linux-firmware
+          # is the official GitHub mirror and clones faster from Actions.
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/kernel-firmware/linux-firmware.git /tmp/linux-firmware
+          cd /tmp/linux-firmware
+          git sparse-checkout set amdgpu
+          git log -1 --format='linux-firmware %H (%cd)' --date=short
+
+      - name: Copy blobs into the tree
+        if: steps.fw-cache.outputs.cache-hit != 'true'
+        run: |
+          # fetch-firmware.sh handles the .zst form, but only if zstd exists.
+          command -v zstd >/dev/null || brew install zstd
+          tools/fetch-firmware.sh /tmp/linux-firmware
+
+      - name: Verify required blobs are present
+        run: |
+          missing=0
+          for f in gc_12_0_1_imu gc_12_0_1_me gc_12_0_1_mec gc_12_0_1_pfp \
+                   gc_12_0_1_rlc gc_12_0_1_uni_mes psp_14_0_3_sos psp_14_0_3_ta \
+                   sdma_7_0_1 smu_14_0_3; do
+            if [ -s "src/navi48-bringup/firmware/$f.bin" ]; then
+              printf '  ok      %-22s %s\n' "$f" "$(wc -c < "src/navi48-bringup/firmware/$f.bin") bytes"
+            else
+              printf '  MISSING %s\n' "$f"; missing=1
+            fi
+          done
+          [ $missing -eq 0 ] || { echo "a required blob is missing or empty"; exit 1; }
+
+      # --- build --------------------------------------------------------------
+      - name: Build
+        run: make -C src/navi48-bringup MKSDK=/tmp/mksdk all
+
+      # The Makefile already fails the link if any of OUR symbols are undefined
+      # (the kext would then silently not load). Re-check from outside so a
+      # green build really means a loadable bundle.
+      - name: Verify bundle
+        run: |
+          KEXT=src/navi48-bringup/build/Navi48Bringup.kext
+          test -x "$KEXT/Contents/MacOS/Navi48Bringup" || { echo "no binary in bundle"; exit 1; }
+          test -f "$KEXT/Contents/_CodeSignature/CodeResources" || {
+            echo "not signed -- macOS will refuse to load it"; exit 1; }
+          echo "uuid: $(dwarfdump --uuid "$KEXT/Contents/MacOS/Navi48Bringup")"
+          file "$KEXT/Contents/MacOS/Navi48Bringup"
+          # Confirm the Navi33 personality is actually in the built plist.
+          /usr/libexec/PlistBuddy -c 'Print :IOKitPersonalities:Navi48Bringup:IOPCIPrimaryMatch' \
+            "$KEXT/Contents/Info.plist"
+
+      - name: Upload kext
+        uses: actions/upload-artifact@v4
+        with:
+          name: Navi48Bringup-kext
+          path: src/navi48-bringup/build/Navi48Bringup.kext
+          if-no-files-found: error

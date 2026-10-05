@@ -36,6 +36,20 @@ Multi-monitor support
 Multiple display paths
 Native GPU rendering for app content
 
+In progress: RDNA3 (Navi 33 / gfx1102)
+----------------------------------------
+The kext is being extended to a second ASIC family, currently targeting the RX 7600
+(PCI 0x7480). Only the detection stage exists so far: `navi33bringup=1` makes the
+bring-up personality claim a Navi 33 card, log the on-die IP versions and the MMHUB
+framebuffer location, and attach read-only. No gfx11 firmware is loaded and no
+functional register is programmed, so a Navi 33 card will not produce a desktop yet.
+The survey is read back with `navi48test log` — an OpenCore-injected kext does not
+appear in the unified log. MMHUB register offsets are selected from the discovered IP
+version rather than from the device name, since MMHUB 3.0 and 4.1 place the same
+registers at different offsets. The profile matching and the table selection are
+host-tested (no kext, SDK or firmware needed) as `asic_profile` in
+tools/conductor/suites.sh.
+
 Can I install this?
 -------------------
 Not reliably. Wait for the first official public release

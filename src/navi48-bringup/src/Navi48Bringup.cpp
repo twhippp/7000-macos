@@ -10,8 +10,10 @@
 #include "regs.hpp"
 #include "amd/amdgpu_discovery.h"
 #include "amd/amdgpu_init.h"
+#include "amd/amdgpu_mmhub.h"
 #include "amd/amdgpu_regs.h"
 #include "amd/amdgpu_sdma.h"
+#include "amd/asic_profile.h"
 #include "Navi48MetalNub.hpp"   // 0.0.610: terminate a published Metal nub at stop
 #include <libkern/c++/OSData.h>
 #include "amd/native_s1b.h"   // 0.0.600 (native S1b): navi48-native=1, default OFF
@@ -7188,18 +7190,57 @@ void Navi48Bringup::publishInterruptCounters() {
 // ---------------------------------------------------------------------------
 
 IOService *Navi48Bringup::probe(IOService *provider, SInt32 *score) {
-	uint32_t on = 0;
-	if (!PE_parse_boot_argn("navi48bringup", &on, sizeof(on)) || on == 0) return nullptr;
+	uint32_t on48 = 0, on33 = 0;
+	PE_parse_boot_argn("navi48bringup", &on48, sizeof(on48));
+	PE_parse_boot_argn("navi33bringup", &on33, sizeof(on33));
+	if ((on48 == 0) && (on33 == 0)) return nullptr;
 	if (!super::probe(provider, score)) return nullptr;
 	auto *pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!pci) return nullptr;
 	uint32_t vendorDevice = pci->configRead32(kIOPCIConfigVendorID);
 	uint16_t device = static_cast<uint16_t>(vendorDevice >> 16);
-	if ((vendorDevice & 0xffff) != 0x1002 || (device != 0x7550 && device != 0x7551)) {
-		N48LOG("probe: 0x%08x not Navi 48, ignoring", vendorDevice); return nullptr;
+	uint16_t vendor = static_cast<uint16_t>(vendorDevice & 0xffff);
+
+	amdgpu::PciIdentity id {};
+	id.vendor = vendor;
+	id.device = device;
+	id.revision = static_cast<uint8_t>(pci->configRead8(kIOPCIConfigRevisionID));
+	uint32_t subsys = pci->configRead32(kIOPCIConfigSubSystemID);
+	id.subsystemVendor = static_cast<uint16_t>(subsys & 0xffff);
+	id.subsystem = static_cast<uint16_t>(subsys >> 16);
+
+	const amdgpu::AsicProfile *profile = amdgpu::profileForPci(id);
+
+	// Navi48 first, byte-for-byte the old behaviour: the navi48bringup arg alone
+	// never claims a Navi33 card, so the proven path cannot be reached by the
+	// new arg.
+	if (profile != nullptr && profile->gen == amdgpu::GpuGeneration::Navi48) {
+		if (on48 == 0) {
+			N48LOG("probe: Navi 48 0x%04x present but navi48bringup is off", device);
+			return nullptr;
+		}
+		amdgpu::setActiveProfile(profile);
+		N48LOG("probe: Navi 48 %s (0x%04x) — bring-up enabled", device == 0x7550 ? "RX 9070/XT" : "R9700", device);
+		return this;
 	}
-	N48LOG("probe: Navi 48 %s (0x%04x) — bring-up enabled", device == 0x7550 ? "RX 9070/XT" : "R9700", device);
-	return this;
+
+	if (profile != nullptr && profile->gen == amdgpu::GpuGeneration::Navi33) {
+		if (on33 == 0) {
+			N48LOG("probe: Navi 33 0x%04x present but navi33bringup is off", device);
+			return nullptr;
+		}
+		amdgpu::setActiveProfile(profile);
+		N48LOG("probe: Navi 33 0x%04x rev 0x%02x subsys 0x%04x/0x%04x — bring-up enabled",
+		       device, (unsigned)id.revision, id.subsystemVendor, id.subsystem);
+		return this;
+	}
+
+	if (amdgpu::navi33KnownDeviceId(device) && vendor == 0x1002) {
+		N48LOG("probe: 0x%08x is a Navi 33 id we have not armed — ignoring", vendorDevice);
+		return nullptr;
+	}
+	N48LOG("probe: 0x%08x not Navi 48/Navi 33, ignoring", vendorDevice);
+	return nullptr;
 }
 
 bool Navi48Bringup::start(IOService *provider) {
@@ -7229,6 +7270,93 @@ bool Navi48Bringup::start(IOService *provider) {
 		surveyIPs();
 		surveyPSP();
 		surveySMU();
+
+		// Select the MMHUB register map from the harvested MMHUB version rather
+		// than from a chip name. For Navi48 this resolves to the 4.1.0 table,
+		// which is offset-for-offset identical to the MMHUBRegs constants the
+		// existing code compiles against, so the proven path is unchanged. For
+		// Navi33 it resolves to 3.0.0, where FB_LOCATION_BASE is 0x08ec instead
+		// of 0x0554 — using the wrong one yields a garbage vram_start and faults
+		// later instead of failing here.
+		//
+		// The version is read straight out of the discovery table because
+		// buildDeviceContext() has not run yet: it is gated behind a successful
+		// PSP SOS boot, which is exactly what Navi33 cannot do yet.
+		{
+			IpDiscovery::IpEntry mmhubEntry {};
+			amdgpu::IPVersion mmhubVer {0, 0, 0};
+			bool haveMmhubVer = ipDiscovery.findIp(IpDiscovery::HwMmhub, 0, mmhubEntry);
+			if (haveMmhubVer) mmhubVer = amdgpu::IPVersion{ mmhubEntry.major, mmhubEntry.minor, mmhubEntry.revision };
+
+			const amdgpu::MmhubRegs *mr = amdgpu::mmhubRegsForVersion(mmhubVer);
+			if (mr != nullptr) {
+				amdgpu::setMmhubRegs(mr);
+				N48LOG("mmhub: discovered v%s -> offset table %s (FB_LOCATION_BASE 0x%04x)",
+				       amdgpu::version_string(mmhubVer), mr->ip_version, mr->FB_LOCATION_BASE);
+			} else {
+				N48LOG("mmhub: discovered v%s -> NO offset table; refusing to touch MMHUB",
+				       amdgpu::version_string(mmhubVer));
+			}
+		}
+
+		const amdgpu::AsicProfile *profile = amdgpu::activeProfile();
+		if (profile != nullptr && !profile->modulesAvailable) {
+			N48LOG("start: %s detected, MMIO verified, discovery parsed — but the gfx11 module family does not exist yet.",
+			       profile->name);
+			N48LOG("start: stopping here. No firmware loaded, no functional register written.");
+			N48LOG("start: expected  GC=%s PSP=%s SMU=%s SDMA=%s MMHUB=%s NBIO=%s",
+			       amdgpu::version_string(profile->expectGfx), amdgpu::version_string(profile->expectPsp),
+			       amdgpu::version_string(profile->expectSmu), amdgpu::version_string(profile->expectSdma),
+			       amdgpu::version_string(profile->expectMmhub), amdgpu::version_string(profile->expectNbio));
+
+			auto logIp = [&](const char *label, uint16_t hwId) {
+				IpDiscovery::IpEntry e {};
+				if (ipDiscovery.findIp(hwId, 0, e)) {
+					N48LOG("start: harvested %-6s v%u.%u.%u  bases=%u", label,
+					       (unsigned)e.major, (unsigned)e.minor, (unsigned)e.revision, (unsigned)e.numBases);
+				} else {
+					N48LOG("start: harvested %-6s ABSENT", label);
+				}
+			};
+			logIp("GC",     IpDiscovery::HwGc);
+			logIp("MP0",    IpDiscovery::HwMp0);
+			logIp("MP1",    IpDiscovery::HwMp1);
+			logIp("SDMA0",  IpDiscovery::HwSdma0);
+			logIp("MMHUB",  IpDiscovery::HwMmhub);
+			logIp("NBIF",   IpDiscovery::HwNbif);
+			logIp("HDP",    IpDiscovery::HwHdp);
+			logIp("OSSSYS", IpDiscovery::HwOsssys);
+			logIp("UMC",    IpDiscovery::HwUmc);
+			logIp("DCN",    IpDiscovery::HwDmu);
+
+			const amdgpu::MmhubRegs *mr = amdgpu::mmhubRegs();
+			if (mr != nullptr) {
+				uint32_t fbBase = regReadIp(IpDiscovery::HwMmhub, 0, 0, mr->FB_LOCATION_BASE);
+				uint32_t fbTop  = regReadIp(IpDiscovery::HwMmhub, 0, 0, mr->FB_LOCATION_TOP);
+				uint32_t fbOff  = regReadIp(IpDiscovery::HwMmhub, 0, 0, mr->FB_OFFSET);
+				if (fbBase != 0xFFFFFFFF) {
+					N48LOG("mmhub: FB_LOCATION_BASE=%#010x TOP=%#010x FB_OFFSET=%#010x -> vram_start MC %#llx",
+					       fbBase, fbTop, fbOff, (unsigned long long)((fbBase & 0x00FFFFFFu) << 24));
+					setProperty("VramMCBase", static_cast<uint64_t>(fbBase & 0x00FFFFFFu) << 24, 64);
+				} else {
+					N48LOG("mmhub: FB_LOCATION read failed (table %s)", mr->ip_version);
+				}
+			}
+			// Return TRUE, not false. The survey is only useful if it can be read
+			// back, and it cannot: an OpenCore-injected kext does not appear in the
+			// unified log (see n48log.h), so the ring buffer is the only way out —
+			// and the ring is reachable only through newUserClient(), which requires
+			// an ATTACHED driver. Failing start() here would discard exactly the
+			// evidence this milestone exists to collect.
+			//
+			// TRUE is safe because every Navi48-specific step still lies ahead of
+			// this point: no firmware, no ladder, no n48dcn::attach, no accel hook,
+			// no functional write of any kind. stop() already no-ops on all of
+			// those and correctly unmaps what start() did map.
+			N48LOG("start: survey complete — attaching read-only so `navi48test log` can read it back.");
+			return true;
+		}
+
 		if (!PE_parse_boot_argn("navi48-stage", &targetStage, sizeof(targetStage))) targetStage = 0;
 		if (targetStage) N48LOG("stages: navi48-stage=%u (mac-amdgpu BringupStage numbering; 5 = PSP SOS)", targetStage);
 		// Arm the host side before the ladder so stage 2 (IHInit) can bring the
@@ -7243,6 +7371,20 @@ bool Navi48Bringup::start(IOService *provider) {
 		if (wantIrq != 0) gBringup.wantInterrupts = armInterrupts();
 		stagePSP();        // no-op unless navi48-psp=1 or navi48-stage>=5
 		publishInterruptCounters();
+	}
+	// A Navi33 card must never fall through to the DCN 4.1 / Apple-accel work
+	// below: n48dcn and the hook installer both assume the gfx12 register maps,
+	// and running them on a gfx1102 part would program registers that do not mean
+	// what the code thinks. The discovery-success path already returned above;
+	// this catches the discovery-failure path, which otherwise falls through here.
+	// Still TRUE: even with no discovery the probe/MMIO lines above are worth
+	// reading back, and the same log-reachability argument applies.
+	{
+		const amdgpu::AsicProfile *profile = amdgpu::activeProfile();
+		if (profile != nullptr && profile->gen == amdgpu::GpuGeneration::Navi33) {
+			N48LOG("start: Navi33 refuses to continue past discovery — the DCN 4.1 and accel paths are gfx12-only.");
+			return true;
+		}
 	}
 	// build 0.0.515: the read-only raster device the AGDC LINKCFG reply reads through
 	// (n48dcn::liveRaster), built here - after stagePSP built the device context, before the Phase 4 block below can install

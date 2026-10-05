@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.620</string>
+	<string>0.0.621</string>
 	<key>CFBundleVersion</key>
-	<string>0.0.620</string>
+	<string>0.0.621</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>Navi48AccelPeer</key>
@@ -83,7 +83,7 @@
 			<key>IOMatchCategory</key>
 			<string>Navi48Bringup</string>
 			<key>IOPCIPrimaryMatch</key>
-			<string>0x75501002 0x75511002</string>
+			<string>0x75501002 0x75511002 0x74801002</string>
 			<key>IOProbeScore</key>
 			<integer>10000</integer>
 			<key>IOProviderClass</key>
