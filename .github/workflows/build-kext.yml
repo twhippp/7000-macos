@@ -75,10 +75,10 @@ jobs:
       - name: Fetch AMD firmware
         if: steps.fw-cache.outputs.cache-hit != 'true'
         run: |
-          # linux-firmware is published on gitlab; kernel-firmware/linux-firmware
-          # is the official GitHub mirror and clones faster from Actions.
+          # Upstream location, the one tools/fetch-firmware.sh names. There is
+          # NO GitHub mirror: github.com/kernel-firmware/linux-firmware 404s.
           git clone --depth 1 --filter=blob:none --sparse \
-            https://github.com/kernel-firmware/linux-firmware.git /tmp/linux-firmware
+            https://gitlab.com/kernel-firmware/linux-firmware.git /tmp/linux-firmware
           cd /tmp/linux-firmware
           git sparse-checkout set amdgpu
           git log -1 --format='linux-firmware %H (%cd)' --date=short
