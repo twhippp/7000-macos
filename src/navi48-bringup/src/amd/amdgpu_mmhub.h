@@ -128,11 +128,31 @@ inline constexpr MmhubRegs kMmhub3_0_0 = {
     "3.0.0",
 };
 
-// Picks the table for a harvested MMHUB version. MMHUB 3.0.1 and 3.0.2 are
-// gfx11.5/11.7 APU parts and share the 3.0.0 offsets for everything this kext
-// touches; treating them as 3.0.0 keeps one table instead of three. Returns
-// nullptr for a version we have no transcribed map for, which callers must
-// treat as fatal rather than falling back to a guess.
+// MMHUB 3.0.2 — what a real RX 7600 (0x7480) reports from on-die discovery
+// (mmhub_3_0_2_offset.h). NOT the same map as 3.0.0: every register this kext
+// touches sits exactly 0x80 dwords lower (FB_LOCATION_BASE 0x086c, not 0x08ec).
+// gmc_v11_0.c gives 3.0.2 its own mmhub_v3_0_2_funcs for this reason. Reading
+// the 3.0.0 offsets on a 3.0.2 part returns an unrelated register, which is
+// exactly the silent-garbage vram_start this file exists to prevent.
+// Generated field-by-field from the upstream header, same order as MmhubRegs.
+inline constexpr MmhubRegs kMmhub3_0_2 = {
+    0x086c, 0x086d, 0x0857,
+    0x086e, 0x086f, 0x0870,
+    0x0871, 0x0872, 0x0858, 0x0859,
+    0x0873,
+    0x06c0, 0x072b, 0x072c, 0x074b, 0x074c, 0x076b, 0x076c,
+    0x06c1, 0x074d, 0x074e, 0x076d, 0x076e,
+    0x0680, 0x0681, 0x0682, 0x0698, 0x069e,
+    0x0689, 0x068f, 0x0690,
+    0x0692, 0x0693, 0x0694, 0x0695, 0x0696, 0x0697,
+    0x06d1, 0x06e3, 0x06f5, 0x0707, 0x0708,
+    "3.0.2",
+};
+
+// Picks the table for a harvested MMHUB version. 3.0.0 and 3.0.1 share one map
+// (checked field-by-field against mmhub_3_0_0_offset.h and mmhub_3_0_1_offset.h);
+// 3.0.2 has its own. Returns nullptr for a version we have no transcribed map
+// for, which callers must treat as fatal rather than falling back to a guess.
 const MmhubRegs *mmhubRegsForVersion(const IPVersion &v);
 
 // Process-wide selection, made once after discovery. Defaults to nullptr so a

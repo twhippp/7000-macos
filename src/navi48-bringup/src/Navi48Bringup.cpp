@@ -7283,10 +7283,11 @@ bool Navi48Bringup::start(IOService *provider) {
 		// Select the MMHUB register map from the harvested MMHUB version rather
 		// than from a chip name. For Navi48 this resolves to the 4.1.0 table,
 		// which is offset-for-offset identical to the MMHUBRegs constants the
-		// existing code compiles against, so the proven path is unchanged. For
-		// Navi33 it resolves to 3.0.0, where FB_LOCATION_BASE is 0x08ec instead
-		// of 0x0554 — using the wrong one yields a garbage vram_start and faults
-		// later instead of failing here.
+		// existing code compiles against, so the proven path is unchanged. A real
+		// RX 7600 harvests MMHUB 3.0.2, which resolves to the 3.0.2 table
+		// (FB_LOCATION_BASE 0x086c; 3.0.0 is 0x08ec, 4.1.0 is 0x0554) — using the
+		// wrong one yields a garbage vram_start and faults later instead of
+		// failing here.
 		//
 		// The version is read straight out of the discovery table because
 		// buildDeviceContext() has not run yet: it is gated behind a successful

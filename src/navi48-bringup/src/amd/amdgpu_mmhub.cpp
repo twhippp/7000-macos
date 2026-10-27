@@ -50,6 +50,13 @@ static_assert(kMmhub4_1_0.INVALIDATE_ENG0_ACK == MMHUBRegs::MMVM_INVALIDATE_ENG0
 static_assert(kMmhub4_1_0.INVALIDATE_ENG0_ADDR_RANGE_LO32 == MMHUBRegs::MMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32, "inv lo drifted");
 static_assert(kMmhub4_1_0.INVALIDATE_ENG0_ADDR_RANGE_HI32 == MMHUBRegs::MMVM_INVALIDATE_ENG0_ADDR_RANGE_HI32, "inv hi drifted");
 
+// 3.0.2 spot checks against mmhub_3_0_2_offset.h. The table was generated from
+// the header, but these pin the two values every later stage depends on.
+static_assert(kMmhub3_0_2.FB_LOCATION_BASE == 0x086c, "3.0.2 FB_LOCATION_BASE drifted");
+static_assert(kMmhub3_0_2.FB_OFFSET        == 0x0857, "3.0.2 FB_OFFSET drifted");
+static_assert(kMmhub3_0_2.FB_LOCATION_BASE == kMmhub3_0_0.FB_LOCATION_BASE - 0x80,
+              "3.0.2 is the 3.0.0 map shifted down by 0x80");
+
 namespace {
 const MmhubRegs *g_mmhub = nullptr;
 } // namespace
@@ -60,22 +67,19 @@ const MmhubRegs *mmhubRegsForVersion(const IPVersion &v) {
 		if (v.minor == 1) return &kMmhub4_1_0;
 		return nullptr;
 	}
-	if (v.major == 3) {
-		// 3.0.0 / 3.0.1 / 3.0.2 all use the 3.0.0 offsets for every register
-		// listed in MmhubRegs. gmc_v11_0.c separates them only by function
-		// table (mmhub_v3_0_1_funcs / mmhub_v3_0_2_funcs), which we do not have
-		// transcribed yet. Any other major.minor returns nullptr so the caller
-		// refuses to touch MMHUB rather than reading garbage.
-		//
-		// ONLY minor == 0. IPVersion is {major, minor, rev}, so "3.0.1" is
-		// {3, 0, 1} — the .0.1 patch level is `rev`, not `minor`. Every 3.0.x
-		// part therefore shares minor == 0, and a genuine 3.1.0 is {3, 1, 0}.
-		// Testing minor instead of the full triple hands untranscribed maps
-		// plausible-looking offsets; the cost of being strict is one extra log
-		// line on a part that may not exist, against a silent garbage
-		// vram_start that faults somewhere unrelated if we are lax.
-		if (v.minor == 0) return &kMmhub3_0_0;
-		return nullptr;
+	if (v.major == 3 && v.minor == 0) {
+		// Select on the full triple. IPVersion is {major, minor, rev}, so the
+		// .0.x patch level is `rev`, and it DOES change the register map:
+		// mmhub_3_0_1_offset.h matches 3.0.0 field-for-field, but
+		// mmhub_3_0_2_offset.h (the RX 7600's MMHUB, per on-die discovery) has
+		// every register 0x80 dwords lower. An unknown rev returns nullptr so the
+		// caller refuses to touch MMHUB rather than reading garbage.
+		switch (v.rev) {
+		case 0:
+		case 1:  return &kMmhub3_0_0;
+		case 2:  return &kMmhub3_0_2;
+		default: return nullptr;
+		}
 	}
 	return nullptr;
 }

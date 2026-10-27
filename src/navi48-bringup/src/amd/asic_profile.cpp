@@ -28,8 +28,10 @@ constexpr AsicProfile kProfileNavi33 = {
     /* expectPsp    */ { 13, 0, 7 },
     /* expectSmu    */ { 13, 0, 7 },
     /* expectSdma   */ {  6, 0, 2 },
-    /* expectMmhub  */ {  3, 0, 0 },
-    /* expectNbio   */ {  7, 4, 0 },
+    // MMHUB and NBIO as harvested from a real RX 7600 (0x7480): MMHUB 3.0.2
+    // and NBIF 4.3.1 (Linux nbio_v4_3.c). Earlier guesses were 3.0.0 / 7.4.0.
+    /* expectMmhub  */ {  3, 0, 2 },
+    /* expectNbio   */ {  4, 3, 1 },
     /* fwGfxPrefix */ "gc_11_0_2",
     /* fwPspPrefix */ "psp_13_0_7",
     /* fwSmuName   */ "smu_13_0_7.bin",

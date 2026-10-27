@@ -92,7 +92,8 @@ int main() {
 	// offsets, which is how vram_start turns into a garbage address.
 	check(mmhubRegsForVersion(IPVersion{3, 0, 0}) == &kMmhub3_0_0, "MMHUB 3.0.0 -> 3.0.0 table");
 	check(mmhubRegsForVersion(IPVersion{3, 0, 1}) == &kMmhub3_0_0, "MMHUB 3.0.1 -> 3.0.0 table");
-	check(mmhubRegsForVersion(IPVersion{3, 0, 2}) == &kMmhub3_0_0, "MMHUB 3.0.2 -> 3.0.0 table");
+	check(mmhubRegsForVersion(IPVersion{3, 0, 2}) == &kMmhub3_0_2, "MMHUB 3.0.2 (RX 7600) -> 3.0.2 table");
+	check(mmhubRegsForVersion(IPVersion{3, 0, 3}) == nullptr, "MMHUB 3.0.3 must have no table");
 	check(mmhubRegsForVersion(IPVersion{4, 1, 0}) == &kMmhub4_1_0, "MMHUB 4.1.0 -> 4.1.0 table");
 
 	check(mmhubRegsForVersion(IPVersion{3, 1, 0}) == nullptr, "MMHUB 3.1.0 must have no table");
@@ -107,6 +108,18 @@ int main() {
 	check(kMmhub3_0_0.FB_LOCATION_BASE == 0x08ec, "3.0.0 FB_LOCATION_BASE is 0x08ec");
 	check(kMmhub4_1_0.FB_LOCATION_BASE != kMmhub3_0_0.FB_LOCATION_BASE,
 	      "the two tables must differ (catches one copied into the other)");
+	check(kMmhub3_0_2.FB_LOCATION_BASE == 0x086c, "3.0.2 FB_LOCATION_BASE is 0x086c");
+	check(kMmhub3_0_2.FB_LOCATION_BASE != kMmhub3_0_0.FB_LOCATION_BASE,
+	      "3.0.2 must not reuse the 3.0.0 map (real RX 7600 is 3.0.2)");
+
+	// The profile's cross-check values match what a real RX 7600 harvests.
+	{
+		const AsicProfile *p = profileForPci(ident(0x1002, 0x7480));
+		check(p != nullptr && p->expectMmhub.major == 3 && p->expectMmhub.minor == 0 &&
+		      p->expectMmhub.rev == 2, "Navi33 expects MMHUB 3.0.2");
+		check(p != nullptr && p->expectNbio.major == 4 && p->expectNbio.minor == 3 &&
+		      p->expectNbio.rev == 1, "Navi33 expects NBIO 4.3.1");
+	}
 
 	// Unselected by default, so a caller running before discovery fails loudly
 	// instead of reading 4.1.0 offsets off a 3.0.0 part.
