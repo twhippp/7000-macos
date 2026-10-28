@@ -583,7 +583,7 @@ void Navi48Bringup::stagePSPRingNavi33() {
 	if (r != kIOReturnSuccess) { N48LOG("psp-stage2: SOS not alive at ring time 0x%x", r); setProperty("PSP,Stage2", "sos-gone"); return; }
 
 	r = amdgpu::psp_ring_create(dev, psp);
-	setProperty("PSP,RingResult", static_cast<uint64_t>(r), 32);
+	setProperty("PSP,RingResult", static_cast<uint64_t>(static_cast<uint32_t>(r)), 32);
 	if (r != kIOReturnSuccess) {
 		N48LOG("psp-stage2: ring create FAILED 0x%x", r);
 		setProperty("PSP,Stage2", "ring-failed");
@@ -593,7 +593,9 @@ void Navi48Bringup::stagePSPRingNavi33() {
 	N48LOG("psp-stage2: GPCOM ring created at MC 0x%llx", psp.ringBusAddr);
 
 	r = amdgpu::psp_setup_tmr(dev, psp);
-	setProperty("PSP,TMRResult", static_cast<uint64_t>(r), 32);
+	setProperty("PSP,TMRResult", static_cast<uint64_t>(static_cast<uint32_t>(r)), 32);
+	setProperty("PSP,TMRRespStatus", static_cast<uint64_t>(psp.tmrRespStatus), 32);   // the PSP's own reason code
+	setProperty("PSP,TMRVramOffset", psp.tmrVRAMOffset, 64);
 	if (r != kIOReturnSuccess) {
 		N48LOG("psp-stage2: SETUP_TMR FAILED 0x%x", r);
 		setProperty("PSP,Stage2", "tmr-failed");

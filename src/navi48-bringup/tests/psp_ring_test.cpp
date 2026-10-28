@@ -125,7 +125,7 @@ int main() {
 		check(rig.cmds.size() == 1, "13.0.7: exactly one ring command sent (SETUP_TMR)");
 		if (!rig.cmds.empty()) {
 			const auto &c = rig.cmds[0];
-			const uint64_t tmrMc = kMcBase + (8u << 20) + 0x200000;
+			const uint64_t tmrMc = kMcBase + (16u << 20);   // first 4 MiB-aligned slot >= vramBase + 8 MiB
 			const size_t u = kPSPGfxCmdUnionOffset;
 			check(u32(c, 8) == 5, "13.0.7: cmd_id = GFX_CMD_ID_SETUP_TMR (5)");
 			check(u32(c, u + 0) == (uint32_t)tmrMc && u32(c, u + 4) == (uint32_t)(tmrMc >> 32),
@@ -133,8 +133,9 @@ int main() {
 			check(u32(c, u + 8) == 4u << 20, "13.0.7: buf_size = 4 MiB (PSP_TMR_SIZE)");
 			check(u32(c, u + 12) == 0x2, "13.0.7: flags = virt_phy_addr");
 			const uint64_t pa = ((uint64_t)u32(c, u + 20) << 32) | u32(c, u + 16);
-			check(pa == (8u << 20) + 0x200000, "13.0.7: system_phy_addr = VRAM physical (not MC)");
-			check(((tmrMc - kMcBase) & 0xFFFFF) == 0, "13.0.7: TMR 1 MiB aligned (PSP_TMR_ALIGNMENT)");
+			check(pa == (16u << 20), "13.0.7: system_phy_addr = VRAM physical (not MC)");
+			check(((tmrMc - kMcBase) & 0x3FFFFF) == 0, "13.0.7: TMR naturally aligned (4 MiB)");
+			check(psp.tmrRespStatus == 0, "13.0.7: PSP resp.status recorded (0)");
 			check(psp.tmrSetUp, "13.0.7: tmrSetUp recorded");
 		}
 	}
@@ -148,7 +149,7 @@ int main() {
 		if (!rig.cmds.empty()) {
 			const size_t u = kPSPGfxCmdUnionOffset;
 			const uint64_t pa = ((uint64_t)u32(rig.cmds[0], u + 20) << 32) | u32(rig.cmds[0], u + 16);
-			check(pa == (8u << 20) + 0x200000 + (0x10ull << 24), "FB_OFFSET!=0: system_phy_addr adds FB_OFFSET<<24");
+			check(pa == (16u << 20) + (0x10ull << 24), "FB_OFFSET!=0: system_phy_addr adds FB_OFFSET<<24");
 		}
 	}
 

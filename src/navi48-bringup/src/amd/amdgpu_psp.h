@@ -177,6 +177,7 @@ struct PSPContext {
     uint64_t  tmrBusAddr;
     uint64_t  tmrSize;
     bool      tmrSetUp;
+    uint32_t  tmrRespStatus;   // resp.status of the last SETUP_TMR (0 = accepted); published by navi33 stage 2
 
     // ---- firmware.fw_buf equivalent -------------------------------------
     // Upstream amdgpu_ucode_create_bo allocates ONE buffer and gives EACH

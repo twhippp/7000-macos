@@ -795,6 +795,23 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
         PSP_LOG("setup_tmr: vram_start=0; MMHUB not ready");
         return kIOReturnNotReady;
     }
+    // Natural alignment: upstream psp_tmr_init notes the HW engineers want the TMR
+    // start to be a multiple of its size. The fixed slot (vramBase + 2 MiB) is only
+    // 1 MiB aligned, and the first hardware run on an RX 7600 had the PSP reject
+    // SETUP_TMR there. Use the first 4 MiB-aligned VRAM address at or above
+    // vramBase + 8 MiB when it fits before the SMU driver table (vramBase + 14 MiB);
+    // [+0x781000, +0xE00000) is unused by every other fixed buffer. Otherwise keep the slot.
+    {
+        const uint64_t want = (dev.vramBase + 0x800000ull + kPSPTMRDefaultSize - 1) &
+                              ~(uint64_t)(kPSPTMRDefaultSize - 1);
+        if (want + kPSPTMRDefaultSize <= dev.vramBase + 0xE00000ull &&
+            (dev.vramLimit == 0 || want + kPSPTMRDefaultSize <= dev.vramLimit)) {
+            psp.tmrVRAMOffset = want;
+        } else {
+            PSP_LOG("setup_tmr: no 4 MiB-aligned slot before the SMU table; keeping vram+%#llx",
+                    (unsigned long long)psp.tmrVRAMOffset);
+        }
+    }
     psp.tmrBusAddr = dev.vramMC(psp.tmrVRAMOffset);
     psp.tmrSize    = kPSPTMRDefaultSize;
     uint64_t vramBaseOffset = 0;
@@ -827,9 +844,10 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
             (unsigned long long)psp.tmrSize, tmr->tmr_flags,
             (unsigned long long)tmrPA, (unsigned long long)vramBaseOffset);
 
-    uint32_t resp = 0;
+    uint32_t resp = 0xFFFFFFFFu;   // stays all-ones if the PSP never answers
     kern_return_t ret = psp_ring_cmd_submit(dev, psp, cmd_buf,
                                             kPSPGfxCmdRespSize, &resp);
+    psp.tmrRespStatus = resp;
     if (ret != kIOReturnSuccess) {
         PSP_LOG("SETUP_TMR submit failed: %#x (resp=%#x)", ret, resp);
         return ret;
