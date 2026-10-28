@@ -9,10 +9,11 @@
 //
 //  What it pins down:
 //   * MP0 13.0.7 (RX 7600): SETUP_TMR IS sent (upstream boot_time_tmr = false), with
-//     buf_phy_addr = the TMR's MC address, buf_size = 4 MiB, flags = virt_phy_addr (0x2),
+//     first LOAD_TOC with the SOS package's TOC, then buf_phy_addr = the TMR's MC address,
+//     buf_size = the size LOAD_TOC returned (4 MiB without a TOC), flags = virt_phy_addr (0x2),
 //     and system_phy_addr = VRAM physical address = (mc - vram_start) + FB_OFFSET<<24,
 //     as upstream psp_prep_tmr_cmd_buf / amdgpu_gmc_vram_pa.
-//   * The TMR lies inside the bring-up region, 1 MiB aligned (PSP_TMR_ALIGNMENT).
+//   * The TMR is allocated top-down below the top 32 MiB of VRAM, 1 MiB aligned (PSP_TMR_ALIGNMENT).
 //   * MP0 14.0.3 (Navi 48): no SETUP_TMR is sent — unchanged behaviour.
 //   * FB_LOCATION is read through the MMHUB 3.0.2 table (0x086c).
 //
@@ -45,6 +46,8 @@ constexpr uint32_t kMp0Base   = 0x16000;   // dword bases, arbitrary but distinc
 constexpr uint32_t kMmhubBase = 0x1A000;
 constexpr uint32_t kNbioBase2 = 0x0D20;
 constexpr uint64_t kMcBase    = 0x8000000000ull;
+
+uint32_t u32at(const std::vector<uint8_t> &b, size_t at) { uint32_t v; std::memcpy(&v, &b[at], 4); return v; }
 
 struct Rig {
 	std::vector<uint32_t> regs = std::vector<uint32_t>(0x100000 / 4, 0);
@@ -98,6 +101,10 @@ struct Rig {
 				std::vector<uint8_t> c(&vram[vramOff(cmdMc)], &vram[vramOff(cmdMc)] + kPSPGfxCmdRespSize);
 				cmds.push_back(c);
 				std::memset(&vram[vramOff(cmdMc) + kPSPGfxRespStatusOffset], 0, 4);   // resp.status = 0
+				if (u32at(c, 8) == 0x20) {   // LOAD_TOC: answer with the TMR size an RDNA3 PSP asks for
+					const uint32_t ts = 0x1300000;
+					std::memcpy(&vram[vramOff(cmdMc) + kPSPGfxRespTmrSizeOffset], &ts, 4);
+				}
 				std::memcpy(&vram[vramOff(fenceMc)], &fenceVal, 4);
 				lastWptr = wptr;
 			}
@@ -113,7 +120,10 @@ uint32_t u32(const std::vector<uint8_t> &b, size_t at) { uint32_t v; std::memcpy
 int main() {
 	std::printf("psp_ring\n");
 
-	// ---- RX 7600: MP0 13.0.7, FB_OFFSET 0 ----
+	static const uint8_t kToc[2304] = { 0x54, 0x4f, 0x43 };   // stand-in for the sos.bin TOC sub-binary
+	const uint64_t kVram = 8ull << 30;
+
+	// ---- RX 7600: MP0 13.0.7 with the SOS package's TOC (psp_13_0_7_sos.bin has one) ----
 	{
 		Rig rig(IPVersion{13, 0, 7}, 0);
 		PSPContext psp {};
@@ -121,35 +131,45 @@ int main() {
 		check(psp_adopt_sos_alive(rig.dev, psp) == kIOReturnSuccess, "13.0.7: adopts the SOS stage 1 booted");
 		check(psp_ring_create(rig.dev, psp) == kIOReturnSuccess, "13.0.7: GPCOM ring created");
 		check(psp.ringBusAddr == kMcBase + (8u << 20) + 0x100000, "13.0.7: ring at bring-up base + 1 MiB (MC)");
-		check(psp_setup_tmr(rig.dev, psp) == kIOReturnSuccess, "13.0.7: SETUP_TMR accepted");
-		check(rig.cmds.size() == 1, "13.0.7: exactly one ring command sent (SETUP_TMR)");
-		if (!rig.cmds.empty()) {
-			const auto &c = rig.cmds[0];
-			const uint64_t tmrMc = kMcBase + (16u << 20);   // first 4 MiB-aligned slot >= vramBase + 8 MiB
+		psp.toc.start_addr = kToc; psp.toc.size_bytes = sizeof(kToc);
+		check(psp_setup_tmr(rig.dev, psp) == kIOReturnSuccess, "13.0.7: LOAD_TOC + SETUP_TMR accepted");
+		check(rig.cmds.size() == 2, "13.0.7: two ring commands (LOAD_TOC, SETUP_TMR)");
+		if (rig.cmds.size() == 2) {
 			const size_t u = kPSPGfxCmdUnionOffset;
+			const auto &t = rig.cmds[0];
+			check(u32(t, 8) == 0x20, "13.0.7: first command is LOAD_TOC (0x20)");
+			check(u32(t, u + 8) == sizeof(kToc), "13.0.7: LOAD_TOC size = TOC sub-binary size");
+			check(psp.tocTmrSize == 0x1300000, "13.0.7: PSP's requested TMR size recorded");
+
+			const auto &c = rig.cmds[1];
+			const uint64_t tmrOff = (kVram - (32ull << 20) - 0x1300000) & ~((16ull << 20) - 1);
+			const uint64_t tmrMc = kMcBase + tmrOff;
 			check(u32(c, 8) == 5, "13.0.7: cmd_id = GFX_CMD_ID_SETUP_TMR (5)");
 			check(u32(c, u + 0) == (uint32_t)tmrMc && u32(c, u + 4) == (uint32_t)(tmrMc >> 32),
-			      "13.0.7: buf_phy_addr = TMR MC address");
-			check(u32(c, u + 8) == 4u << 20, "13.0.7: buf_size = 4 MiB (PSP_TMR_SIZE)");
+			      "13.0.7: buf_phy_addr = TMR MC address near the top of VRAM");
+			check(u32(c, u + 8) == 0x1300000, "13.0.7: buf_size = the size LOAD_TOC returned");
 			check(u32(c, u + 12) == 0x2, "13.0.7: flags = virt_phy_addr");
 			const uint64_t pa = ((uint64_t)u32(c, u + 20) << 32) | u32(c, u + 16);
-			check(pa == (16u << 20), "13.0.7: system_phy_addr = VRAM physical (not MC)");
-			check(((tmrMc - kMcBase) & 0x3FFFFF) == 0, "13.0.7: TMR naturally aligned (4 MiB)");
-			check(psp.tmrRespStatus == 0, "13.0.7: PSP resp.status recorded (0)");
-			check(psp.tmrSetUp, "13.0.7: tmrSetUp recorded");
+			check(pa == tmrOff, "13.0.7: system_phy_addr = VRAM physical (not MC)");
+			check((tmrOff & 0xFFFFF) == 0, "13.0.7: TMR 1 MiB aligned (PSP_TMR_ALIGNMENT)");
+			check(tmrOff + 0x1300000 <= kVram - (32ull << 20), "13.0.7: top 32 MiB left alone");
+			check(psp.tmrRespStatus == 0 && psp.tmrSetUp, "13.0.7: accepted and recorded");
 		}
 	}
 
-	// ---- FB_OFFSET non-zero: system_phy_addr follows amdgpu_gmc_vram_pa ----
+	// ---- no TOC: PSP_TMR_SIZE, still top-down; FB_OFFSET follows amdgpu_gmc_vram_pa ----
 	{
 		Rig rig(IPVersion{13, 0, 7}, 0x10);
 		PSPContext psp {};
 		psp_init(rig.dev, psp); psp_adopt_sos_alive(rig.dev, psp); psp_ring_create(rig.dev, psp);
-		check(psp_setup_tmr(rig.dev, psp) == kIOReturnSuccess, "FB_OFFSET!=0: SETUP_TMR accepted");
+		check(psp_setup_tmr(rig.dev, psp) == kIOReturnSuccess, "no TOC: SETUP_TMR accepted");
+		check(rig.cmds.size() == 1, "no TOC: only SETUP_TMR sent");
 		if (!rig.cmds.empty()) {
 			const size_t u = kPSPGfxCmdUnionOffset;
+			const uint64_t tmrOff = (kVram - (32ull << 20) - (4ull << 20)) & ~((16ull << 20) - 1);
+			check(u32(rig.cmds[0], u + 8) == 4u << 20, "no TOC: buf_size = 4 MiB");
 			const uint64_t pa = ((uint64_t)u32(rig.cmds[0], u + 20) << 32) | u32(rig.cmds[0], u + 16);
-			check(pa == (16u << 20) + (0x10ull << 24), "FB_OFFSET!=0: system_phy_addr adds FB_OFFSET<<24");
+			check(pa == tmrOff + (0x10ull << 24), "FB_OFFSET!=0: system_phy_addr adds FB_OFFSET<<24");
 		}
 	}
 

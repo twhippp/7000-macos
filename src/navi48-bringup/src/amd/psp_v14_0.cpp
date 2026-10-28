@@ -782,38 +782,60 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
     }
 
     // PSP families that take SETUP_TMR from the driver (MP0 13.0.7 on the RX 7600)
-    // — port of upstream psp_tmr_load + psp_prep_tmr_cmd_buf:
-    //   buf_phy_addr   = tmr_mc_addr (FB-aperture MC address)
-    //   buf_size       = PSP_TMR_SIZE (4 MiB; no TOC on 13.0.7, so no LOAD_TOC resize)
-    //   virt_phy_addr  = 1
-    //   system_phy_addr= amdgpu_gmc_vram_pa(tmr_bo) = (mc - vram_start) + vram_base_offset,
-    //                    vram_base_offset = FB_OFFSET << 24 (gmc_v11 get_mc_fb_offset).
-    // The earlier version of this (unreachable) path passed the MC address as
-    // system_phy_addr; upstream passes the VRAM physical address.
+    // — port of upstream psp_tmr_init + psp_tmr_load + psp_prep_tmr_cmd_buf:
+    //   1. psp_tmr_init: when the SOS package carries a TOC (psp_13_0_7_sos.bin does:
+    //      descriptor type 4, ~2 KiB), send LOAD_TOC first. The PSP answers with the
+    //      TMR size it needs — on RDNA3 that is ~19 MiB, not PSP_TMR_SIZE (4 MiB);
+    //      Linux's "reserve 0x1300000 ... for PSP TMR" line is that number. Offering a
+    //      4 MiB TMR without the TOC got TEE_ERROR_BAD_PARAMETERS (0xFFFF0006) on the
+    //      first two RX 7600 runs.
+    //   2. Allocate that many bytes, PSP_TMR_ALIGNMENT (1 MiB) aligned. Linux kernel BOs
+    //      come from the top of VRAM; we do the same, leaving the top 32 MiB alone
+    //      (runtime DB, discovery table, firmware-reserved region), 16 MiB aligned.
+    //      The TMR is PSP-private: the CPU never touches it, so it may lie outside BAR0.
+    //   3. SETUP_TMR: buf_phy_addr = MC address, buf_size = that size, virt_phy_addr = 1,
+    //      system_phy_addr = amdgpu_gmc_vram_pa = vram offset + FB_OFFSET << 24.
     uint64_t vram_start = psp_read_vram_start(dev);
     if (vram_start == 0) {
         PSP_LOG("setup_tmr: vram_start=0; MMHUB not ready");
         return kIOReturnNotReady;
     }
-    // Natural alignment: upstream psp_tmr_init notes the HW engineers want the TMR
-    // start to be a multiple of its size. The fixed slot (vramBase + 2 MiB) is only
-    // 1 MiB aligned, and the first hardware run on an RX 7600 had the PSP reject
-    // SETUP_TMR there. Use the first 4 MiB-aligned VRAM address at or above
-    // vramBase + 8 MiB when it fits before the SMU driver table (vramBase + 14 MiB);
-    // [+0x781000, +0xE00000) is unused by every other fixed buffer. Otherwise keep the slot.
-    {
+    uint64_t tmrSize = kPSPTMRDefaultSize;
+    psp.tocRespStatus = 0;
+    psp.tocTmrSize    = 0;
+    if (psp.toc.start_addr != nullptr && psp.toc.size_bytes > 0) {
+        uint32_t tocSize = 0, tocResp = 0xFFFFFFFFu;
+        kern_return_t tr = psp_load_toc_subbin(dev, psp, psp.toc.start_addr,
+                                               static_cast<uint32_t>(psp.toc.size_bytes),
+                                               &tocSize, &tocResp);
+        psp.tocRespStatus = tocResp;
+        psp.tocTmrSize    = tocSize;
+        if (tr != kIOReturnSuccess) {
+            PSP_LOG("setup_tmr: LOAD_TOC failed kr=%#x resp=%#x", tr, tocResp);
+            return tr;
+        }
+        if (tocSize != 0) tmrSize = ((uint64_t)tocSize + 0xFFFFFull) & ~0xFFFFFull;   // 1 MiB granules
+    } else {
+        PSP_LOG("setup_tmr: no TOC in the SOS package; offering PSP_TMR_SIZE");
+    }
+
+    const uint64_t kTopReserve = 32ull << 20, kAlign = 16ull << 20;
+    const uint64_t lowFloor = dev.vramBase + (32ull << 20);   // above the whole bring-up span
+    if (dev.vramSizeBytes > kTopReserve + tmrSize &&
+        ((dev.vramSizeBytes - kTopReserve - tmrSize) & ~(kAlign - 1)) >= lowFloor) {
+        psp.tmrVRAMOffset = (dev.vramSizeBytes - kTopReserve - tmrSize) & ~(kAlign - 1);
+    } else if (tmrSize <= kPSPTMRDefaultSize) {
+        // No VRAM size known: the old low slot, 4 MiB aligned, before the SMU table.
         const uint64_t want = (dev.vramBase + 0x800000ull + kPSPTMRDefaultSize - 1) &
                               ~(uint64_t)(kPSPTMRDefaultSize - 1);
-        if (want + kPSPTMRDefaultSize <= dev.vramBase + 0xE00000ull &&
-            (dev.vramLimit == 0 || want + kPSPTMRDefaultSize <= dev.vramLimit)) {
-            psp.tmrVRAMOffset = want;
-        } else {
-            PSP_LOG("setup_tmr: no 4 MiB-aligned slot before the SMU table; keeping vram+%#llx",
-                    (unsigned long long)psp.tmrVRAMOffset);
-        }
+        if (want + kPSPTMRDefaultSize <= dev.vramBase + 0xE00000ull) psp.tmrVRAMOffset = want;
+    } else {
+        PSP_LOG("setup_tmr: TMR of %llu B does not fit (vram size %llu)",
+                (unsigned long long)tmrSize, (unsigned long long)dev.vramSizeBytes);
+        return kIOReturnNoSpace;
     }
     psp.tmrBusAddr = dev.vramMC(psp.tmrVRAMOffset);
-    psp.tmrSize    = kPSPTMRDefaultSize;
+    psp.tmrSize    = tmrSize;
     uint64_t vramBaseOffset = 0;
     if (const MmhubRegs *mr = mmhubRegs()) {
         const uint32_t fbOff = RREG32(dev, dev.ip.get(IPBlock::MMHUB) + mr->FB_OFFSET);

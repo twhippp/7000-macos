@@ -581,6 +581,10 @@ void Navi48Bringup::stagePSPRingNavi33() {
 	if (r != kIOReturnSuccess) { N48LOG("psp-stage2: psp_init failed 0x%x", r); setProperty("PSP,Stage2", "init-failed"); return; }
 	r = amdgpu::psp_adopt_sos_alive(dev, psp);
 	if (r != kIOReturnSuccess) { N48LOG("psp-stage2: SOS not alive at ring time 0x%x", r); setProperty("PSP,Stage2", "sos-gone"); return; }
+	// The TOC that SETUP_TMR's LOAD_TOC needs lives inside psp_13_0_7_sos.bin (type 4).
+	if (amdgpu::psp_parse_sos_microcode(psp, fw_psp_13_0_7_sos, fw_psp_13_0_7_sos_size) != kIOReturnSuccess)
+		N48LOG("psp-stage2: SOS package parse failed; SETUP_TMR goes without a TOC");
+	setProperty("PSP,TOCBytes", static_cast<uint64_t>(psp.toc.size_bytes), 32);
 
 	r = amdgpu::psp_ring_create(dev, psp);
 	setProperty("PSP,RingResult", static_cast<uint64_t>(static_cast<uint32_t>(r)), 32);
@@ -596,13 +600,15 @@ void Navi48Bringup::stagePSPRingNavi33() {
 	setProperty("PSP,TMRResult", static_cast<uint64_t>(static_cast<uint32_t>(r)), 32);
 	setProperty("PSP,TMRRespStatus", static_cast<uint64_t>(psp.tmrRespStatus), 32);   // the PSP's own reason code
 	setProperty("PSP,TMRVramOffset", psp.tmrVRAMOffset, 64);
+	setProperty("PSP,TOCRespStatus", static_cast<uint64_t>(psp.tocRespStatus), 32);
+	setProperty("PSP,TOCTmrSize", static_cast<uint64_t>(psp.tocTmrSize), 32);
+	setProperty("PSP,TMRSize", psp.tmrSize, 64);
 	if (r != kIOReturnSuccess) {
 		N48LOG("psp-stage2: SETUP_TMR FAILED 0x%x", r);
 		setProperty("PSP,Stage2", "tmr-failed");
 		return;
 	}
 	setProperty("PSP,TMRMC", psp.tmrBusAddr, 64);
-	setProperty("PSP,TMRSize", psp.tmrSize, 64);
 	setProperty("PSP,Stage2", "ring-and-tmr-ok");
 	N48LOG("psp-stage2: SUCCESS — ring up, TMR accepted at MC 0x%llx (%llu MiB)", psp.tmrBusAddr, psp.tmrSize >> 20);
 }

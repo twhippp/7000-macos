@@ -177,6 +177,8 @@ struct PSPContext {
     uint64_t  tmrBusAddr;
     uint64_t  tmrSize;
     bool      tmrSetUp;
+    uint32_t  tocRespStatus;   // resp.status of LOAD_TOC before SETUP_TMR (MP0 13.0.7); 0 = accepted
+    uint32_t  tocTmrSize;      // TMR size the PSP asked for in its LOAD_TOC reply (0 = no TOC / not sent)
     uint32_t  tmrRespStatus;   // resp.status of the last SETUP_TMR (0 = accepted); published by navi33 stage 2
 
     // ---- firmware.fw_buf equivalent -------------------------------------
