@@ -177,6 +177,11 @@ struct PSPContext {
     uint64_t  tmrBusAddr;
     uint64_t  tmrSize;
     bool      tmrSetUp;
+    bool      tmrPrepared;     // psp_tmr_init placed the TMR (LOAD_TOC done)
+    bool      tmrRejected;     // SETUP_TMR got a non-zero status but a tolerant caller carried on
+    bool      tolerateRespErrors;   // mirror Linux: non-zero resp.status is a warning, not a stop
+    uint32_t  lastRespStatus;  // resp.status of the most recent ring command (0xFFFFFFFF = timeout)
+    bool      lastTimedOut;
     uint32_t  tocRespStatus;   // resp.status of LOAD_TOC before SETUP_TMR (MP0 13.0.7); 0 = accepted
     uint32_t  tocTmrSize;      // TMR size the PSP asked for in its LOAD_TOC reply (0 = no TOC / not sent)
     uint32_t  tmrRespStatus;   // resp.status of the last SETUP_TMR (0 = accepted); published by navi33 stage 2
@@ -318,6 +323,7 @@ namespace PSPGfxFwType {
     // RDNA4 (sdma_v7_1) packs both engines into one RS64 firmware that
     // PSP loads ONCE with TH0=71. Per upstream amdgpu_sdma_init_microcode.
     constexpr uint32_t SDMA_UCODE_TH0 = 71;
+    constexpr uint32_t SDMA_UCODE_TH1 = 72;   // sdma v2 (SOC21 / gfx11) control thread
     constexpr uint32_t RLC_G     = 8;
     constexpr uint32_t CP_ME     = 1;
     constexpr uint32_t CP_PFP    = 2;
@@ -489,6 +495,12 @@ kern_return_t psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
 //
 kern_return_t psp_setup_tmr(DeviceContext &dev, PSPContext &psp);
 
+// The two halves of psp_setup_tmr for driver-allocated TMRs (MP0 13.0.7):
+// psp_tmr_init = LOAD_TOC + placement, psp_tmr_load = SETUP_TMR. Linux loads the
+// SMU firmware between them on PMFW-centralised parts.
+kern_return_t psp_tmr_init(DeviceContext &dev, PSPContext &psp);
+kern_return_t psp_tmr_load(DeviceContext &dev, PSPContext &psp);
+
 //
 // psp_load_ip_fw — port of psp_load_ip_fw. Submits GFX_CMD_ID_LOAD_IP_FW
 // for one firmware image already staged at MC address `fwBusAddr`.
@@ -496,7 +508,8 @@ kern_return_t psp_setup_tmr(DeviceContext &dev, PSPContext &psp);
 //
 kern_return_t psp_load_ip_fw(DeviceContext &dev, PSPContext &psp,
                              uint64_t fwBusAddr, uint32_t fwSize,
-                             uint32_t fwType);
+                             uint32_t fwType,
+                             bool beforeTmr = false);
 
 //
 // psp_query_fw_reservation — port of psp_update_fw_reservation

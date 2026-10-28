@@ -38,6 +38,15 @@ psp_14_0_3_ta     38d6691bf64232946cd5ce5735363c7c2877830ff640b9b95516403257fe29
 sdma_7_0_1        73c29e1c1714ebc95d2221ba56e187910902891593010653bf9518937e414a59
 smu_14_0_3        3221ef2ddb341570eeb727e1e16f170bfb2ea1230be4a7eb248d0b183fbfbf15
 psp_13_0_7_sos    unpinned-navi33-stage1
+smu_13_0_7        unpinned-navi33
+sdma_6_0_3        unpinned-navi33
+gc_11_0_2_pfp     unpinned-navi33
+gc_11_0_2_me      unpinned-navi33
+gc_11_0_2_mec     unpinned-navi33
+gc_11_0_2_mes_2   unpinned-navi33
+gc_11_0_2_mes1    unpinned-navi33
+gc_11_0_2_imu     unpinned-navi33
+gc_11_0_2_rlc     unpinned-navi33
 "
 
 while read -r name want; do

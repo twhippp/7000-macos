@@ -111,7 +111,8 @@ private:
 	void surveySMU();
 	void stagePSP();       // navi48-psp=1 (== navi48-stage=5)
 	void stagePSPNavi33(); // navi33-psp=1 — PSP 13.0.7 SOS boot; navi33-psp=2 adds ring + TMR
-	void stagePSPRingNavi33(); // navi33-psp=2 — GPCOM ring + driver-allocated TMR, then stop
+	void stagePSPRingNavi33(uint32_t level); // navi33-psp=2: ring + TOC + SMU + TMR; >=3: + GFX firmware + RLC autoload
+	uint32_t smuMailbox(uint32_t msgId, uint32_t param, uint32_t *ret);   // MP1 C2PMSG_66/82/90; returns resp
 	bool runPspChain(const uint8_t *fw, size_t fwSize, int gen);   // shared body; gen = n48::PspGen
 	bool buildDeviceContext();   // fills `dev` for the ported amdgpu modules
 	bool mapDoorbells();         // BAR2 -> dev.bar2 (CP/MES/SDMA stages)

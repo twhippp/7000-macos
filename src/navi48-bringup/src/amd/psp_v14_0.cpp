@@ -671,6 +671,8 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
         elapsed += 1000;
     }
     if (observed != fence_index) {
+        psp.lastRespStatus = 0xFFFFFFFFu;
+        psp.lastTimedOut   = true;
         PSP_LOG("ring_cmd_submit: fence timeout (cmd_id=%#x, expected %u, "
                 "got %u, wptr now %u, resp.status=%#x, C2PMSG_64=%#010x, C2PMSG_81=%#010x)",
                 cmd_id, fence_index, observed, RREG32(dev, regWptr),
@@ -685,6 +687,8 @@ psp_ring_cmd_submit(DeviceContext &dev, PSPContext &psp,
     uint32_t resp_status = RBAR2_32(dev,
         psp.cmdVRAMOffset + kPSPGfxRespStatusOffset);
     if (outRespStatus) *outRespStatus = resp_status;
+    psp.lastRespStatus = resp_status;
+    psp.lastTimedOut   = false;
     if (resp_status != 0) {
         PSP_LOG("ring_cmd_submit: cmd_id=%#x PSP returned status %#x "
                 "(fence=%u took %llu us)",
@@ -781,6 +785,25 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
         return kIOReturnSuccess;
     }
 
+    // MP0 13.0.7 (RX 7600): the driver sends SETUP_TMR itself. Linux's psp_hw_start
+    // for a PMFW-centralised part (13.0.7 is in psp_check_pmfw_centralized_cstate_management)
+    // is psp_tmr_init -> psp_load_smu_fw -> psp_tmr_load; navi33 stage 2 calls the two
+    // halves separately to load the SMU in between. Called together here.
+    {
+        kern_return_t ir = psp_tmr_init(dev, psp);
+        if (ir != kIOReturnSuccess) return ir;
+        return psp_tmr_load(dev, psp);
+    }
+}
+
+//
+// psp_tmr_init — upstream psp_tmr_init for a driver-allocated TMR.
+//
+kern_return_t
+psp_tmr_init(DeviceContext &dev, PSPContext &psp)
+{
+    if (psp.tmrPrepared) return kIOReturnSuccess;
+    if (!psp.ringCreated) return kIOReturnNotReady;
     // PSP families that take SETUP_TMR from the driver (MP0 13.0.7 on the RX 7600)
     // — port of upstream psp_tmr_init + psp_tmr_load + psp_prep_tmr_cmd_buf:
     //   1. psp_tmr_init: when the SOS package carries a TOC (psp_13_0_7_sos.bin does:
@@ -836,6 +859,22 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
     }
     psp.tmrBusAddr = dev.vramMC(psp.tmrVRAMOffset);
     psp.tmrSize    = tmrSize;
+    psp.tmrPrepared = true;
+    PSP_LOG("tmr_init: TMR will be %llu B at vram+%#llx (mc %#llx)",
+            (unsigned long long)psp.tmrSize, (unsigned long long)psp.tmrVRAMOffset,
+            (unsigned long long)psp.tmrBusAddr);
+    return kIOReturnSuccess;
+}
+
+//
+// psp_tmr_load — upstream psp_tmr_load / psp_prep_tmr_cmd_buf: SETUP_TMR for the
+// TMR psp_tmr_init placed.
+//
+kern_return_t
+psp_tmr_load(DeviceContext &dev, PSPContext &psp)
+{
+    if (psp.tmrSetUp) return kIOReturnSuccess;
+    if (!psp.tmrPrepared) return kIOReturnNotReady;
     uint64_t vramBaseOffset = 0;
     if (const MmhubRegs *mr = mmhubRegs()) {
         const uint32_t fbOff = RREG32(dev, dev.ip.get(IPBlock::MMHUB) + mr->FB_OFFSET);
@@ -872,6 +911,12 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
     psp.tmrRespStatus = resp;
     if (ret != kIOReturnSuccess) {
         PSP_LOG("SETUP_TMR submit failed: %#x (resp=%#x)", ret, resp);
+        // Linux's psp_cmd_submit_buf only warns on a non-zero resp.status (bare metal)
+        // and carries on; tolerant callers (navi33 stage 3) may do the same.
+        if (ret == kIOReturnError && psp.tolerateRespErrors) {
+            psp.tmrSetUp = true;
+            psp.tmrRejected = true;
+        }
         return ret;
     }
     psp.tmrSetUp = true;
@@ -890,9 +935,11 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
 //
 kern_return_t
 psp_load_ip_fw(DeviceContext &dev, PSPContext &psp,
-               uint64_t fwBusAddr, uint32_t fwSize, uint32_t fwType)
+               uint64_t fwBusAddr, uint32_t fwSize, uint32_t fwType,
+               bool beforeTmr)
 {
-    if (!psp.tmrSetUp) {
+    // beforeTmr: Linux loads the SMU before SETUP_TMR on PMFW-centralised parts.
+    if (!psp.tmrSetUp && !beforeTmr) {
         PSP_LOG("load_ip_fw(type=%u): TMR not set up — call psp_setup_tmr "
                 "first", fwType);
         return kIOReturnNotReady;

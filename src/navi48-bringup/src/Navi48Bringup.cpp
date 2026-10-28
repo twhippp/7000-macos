@@ -3,6 +3,7 @@
 //  bootloader chain when navi48-psp=1.
 //
 #include "Navi48Bringup.hpp"
+#include "amd/navi33_fw.h"
 #include "apple/Navi48Ttl.hpp"
 #include "apple/AppleTtlHook.hpp"
 #include "apple/AppleHardwareHook.hpp"
@@ -43,6 +44,16 @@ extern const size_t  fw_psp_14_0_3_sos_size;
 // was not fetched the build embeds a zero-length blob and stagePSPNavi33 refuses.
 extern const uint8_t fw_psp_13_0_7_sos[];
 extern const size_t  fw_psp_13_0_7_sos_size;
+// Navi 33 stage 2/3 firmware, all optional (zero-length stubs when not fetched).
+extern const uint8_t fw_smu_13_0_7[];      extern const size_t fw_smu_13_0_7_size;
+extern const uint8_t fw_sdma_6_0_3[];      extern const size_t fw_sdma_6_0_3_size;
+extern const uint8_t fw_gc_11_0_2_pfp[];   extern const size_t fw_gc_11_0_2_pfp_size;
+extern const uint8_t fw_gc_11_0_2_me[];    extern const size_t fw_gc_11_0_2_me_size;
+extern const uint8_t fw_gc_11_0_2_mec[];   extern const size_t fw_gc_11_0_2_mec_size;
+extern const uint8_t fw_gc_11_0_2_mes_2[]; extern const size_t fw_gc_11_0_2_mes_2_size;
+extern const uint8_t fw_gc_11_0_2_mes1[];  extern const size_t fw_gc_11_0_2_mes1_size;
+extern const uint8_t fw_gc_11_0_2_imu[];   extern const size_t fw_gc_11_0_2_imu_size;
+extern const uint8_t fw_gc_11_0_2_rlc[];   extern const size_t fw_gc_11_0_2_rlc_size;
 }
 
 OSDefineMetaClassAndStructors(Navi48Bringup, IOService)
@@ -511,7 +522,7 @@ void Navi48Bringup::stagePSPNavi33() {
 	if (!chooseVramBase())         { setProperty("PSP,Stage", "no-vram-region"); return; }
 	if (!apertureCheck(vramBase))  { N48LOG("psp-stage: aperture check failed; refusing"); setProperty("PSP,Stage", "aperture-mismatch"); return; }
 	const bool sosOk = runPspChain(fw_psp_13_0_7_sos, fw_psp_13_0_7_sos_size, static_cast<int>(n48::PspGen::V13));
-	if (sosOk && on >= 2) stagePSPRingNavi33();
+	if (sosOk && on >= 2) stagePSPRingNavi33(on);
 	else if (on >= 2) setProperty("PSP,Stage2", "skipped-sos-not-alive");
 }
 
@@ -552,9 +563,36 @@ static amdgpu::BringupContext gBringup;   // one ladder per boot; constructed at
 // SETUP_TMR path, which 13.0.7 needs because upstream sets boot_time_tmr = false for
 // it (the 9070 XT's PSP sets its TMR up itself). Nothing past the PSP is touched.
 // ---------------------------------------------------------------------------
-void Navi48Bringup::stagePSPRingNavi33() {
+// MP1 13.0.x mailbox: regMP1_SMN_C2PMSG_66 / _82 / _90 = 0x0282 / 0x0292 / 0x029a at
+// base index 0 (mp_13_0_0_offset.h; Navi 48's MP1 14 uses 0x82.. at index 1, surveySMU).
+// Returns the response (0 = no answer within ~500 ms or no mailbox). Only TestMessage and
+// GetSmuVersion are sent, and neither changes anything.
+uint32_t Navi48Bringup::smuMailbox(uint32_t msgId, uint32_t param, uint32_t *ret) {
+	uint32_t regMsg, regParam, regResp;
+	if (!ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, 0, 0x0282, regMsg)   ||
+	    !ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, 0, 0x0292, regParam) ||
+	    !ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, 0, 0x029a, regResp))
+		return 0;
+	if (regMsg + 4 > rmmioSize || regParam + 4 > rmmioSize || regResp + 4 > rmmioSize) return 0;
+	rmmio[regResp / 4] = 0; rmmio[regParam / 4] = param; rmmio[regMsg / 4] = msgId;
+	uint32_t resp = 0;
+	for (int i = 0; i < 500; i++) { resp = rmmio[regResp / 4]; if (resp) break; IOSleep(1); }
+	if (ret) *ret = rmmio[regParam / 4];
+	return resp;
+}
+
+// navi33-psp=2: GPCOM ring, LOAD_TOC, SMU firmware, SETUP_TMR — Linux psp_hw_start for
+// a PMFW-centralised part (MP0 13.0.7): ring_create, tmr_init, load_smu_fw, tmr_load.
+// navi33-psp=3 (or higher): + every GFX/SDMA/MES/IMU/RLC firmware, AUTOLOAD_RLC, and the
+// read-only wait for the RLC autoload to finish (gfx_v11_0_hw_init). Stops before any
+// CP/GFX ring programming. Every step publishes its own property, so one boot shows
+// exactly where it stopped. Like Linux, a non-zero PSP status at 3+ is recorded and the
+// sequence carries on; only a PSP that stops answering ends it.
+void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	setProperty("PSP,Stage2", "requested");
+	setProperty("PSP,Level", static_cast<uint64_t>(level), 32);
 	if (!buildDeviceContext()) { setProperty("PSP,Stage2", "no-device-context"); return; }
+	setProperty("PSP,VramSizeMB", static_cast<uint64_t>(vramMB), 32);
 
 	// HDP flush window. psp_ring_cmd_submit flushes HDP through the NBIO remap window
 	// (amdgpu_hdp_flush). Linux programs it in common hw_init (nbio_v4_3_remap_hdp_registers:
@@ -581,7 +619,7 @@ void Navi48Bringup::stagePSPRingNavi33() {
 	if (r != kIOReturnSuccess) { N48LOG("psp-stage2: psp_init failed 0x%x", r); setProperty("PSP,Stage2", "init-failed"); return; }
 	r = amdgpu::psp_adopt_sos_alive(dev, psp);
 	if (r != kIOReturnSuccess) { N48LOG("psp-stage2: SOS not alive at ring time 0x%x", r); setProperty("PSP,Stage2", "sos-gone"); return; }
-	// The TOC that SETUP_TMR's LOAD_TOC needs lives inside psp_13_0_7_sos.bin (type 4).
+	// The TOC that LOAD_TOC needs lives inside psp_13_0_7_sos.bin (type 4).
 	if (amdgpu::psp_parse_sos_microcode(psp, fw_psp_13_0_7_sos, fw_psp_13_0_7_sos_size) != kIOReturnSuccess)
 		N48LOG("psp-stage2: SOS package parse failed; SETUP_TMR goes without a TOC");
 	setProperty("PSP,TOCBytes", static_cast<uint64_t>(psp.toc.size_bytes), 32);
@@ -596,21 +634,111 @@ void Navi48Bringup::stagePSPRingNavi33() {
 	setProperty("PSP,RingMC", psp.ringBusAddr, 64);
 	N48LOG("psp-stage2: GPCOM ring created at MC 0x%llx", psp.ringBusAddr);
 
-	r = amdgpu::psp_setup_tmr(dev, psp);
-	setProperty("PSP,TMRResult", static_cast<uint64_t>(static_cast<uint32_t>(r)), 32);
-	setProperty("PSP,TMRRespStatus", static_cast<uint64_t>(psp.tmrRespStatus), 32);   // the PSP's own reason code
-	setProperty("PSP,TMRVramOffset", psp.tmrVRAMOffset, 64);
+	// 1. psp_tmr_init: LOAD_TOC, then place the TMR at the size the PSP asked for.
+	r = amdgpu::psp_tmr_init(dev, psp);
 	setProperty("PSP,TOCRespStatus", static_cast<uint64_t>(psp.tocRespStatus), 32);
 	setProperty("PSP,TOCTmrSize", static_cast<uint64_t>(psp.tocTmrSize), 32);
 	setProperty("PSP,TMRSize", psp.tmrSize, 64);
+	setProperty("PSP,TMRVramOffset", psp.tmrVRAMOffset, 64);
 	if (r != kIOReturnSuccess) {
+		N48LOG("psp-stage2: TMR init (LOAD_TOC) FAILED 0x%x", r);
+		setProperty("PSP,Stage2", "toc-failed");
+		return;
+	}
+
+	// 2. psp_load_smu_fw — before SETUP_TMR on PMFW-centralised parts.
+	{
+		uint32_t ver = 0;
+		const uint32_t pre = smuMailbox(n48::kSmuMsgTestMessage, 0xC0FFEE, nullptr);
+		setProperty("SMU,PingBeforeLoad", static_cast<uint64_t>(pre), 32);
+		amdgpu::N33Payload smu {};
+		const amdgpu::N33Blob smuBlob { fw_smu_13_0_7, fw_smu_13_0_7_size };
+		if (fw_smu_13_0_7_size == 0 || !amdgpu::navi33_smu_payload(smuBlob, smu)) {
+			N48LOG("psp-stage2: smu_13_0_7.bin missing or unreadable; SMU load skipped");
+			setProperty("PSP,SMULoad", "no-firmware");
+		} else {
+			uint64_t mc = 0;
+			r = amdgpu::psp_fw_buf_stage(dev, psp, smu.src, smu.size, &mc);
+			if (r == kIOReturnSuccess) r = amdgpu::psp_load_ip_fw(dev, psp, mc, smu.size, smu.fw_type, /*beforeTmr*/ true);
+			setProperty("PSP,SMULoadResult", static_cast<uint64_t>(static_cast<uint32_t>(r)), 32);
+			setProperty("PSP,SMULoadResp", static_cast<uint64_t>(psp.lastRespStatus), 32);
+			setProperty("PSP,SMULoad", r == kIOReturnSuccess ? "ok" : (psp.lastTimedOut ? "timeout" : "rejected"));
+			if (psp.lastTimedOut) { setProperty("PSP,Stage2", "smu-timeout"); return; }
+			// Linux smu_v13_0_check_fw_status is an SMN read; the mailbox ping says the same thing here.
+			IOSleep(50);
+			const uint32_t post = smuMailbox(n48::kSmuMsgTestMessage, 0xC0FFEE, nullptr);
+			setProperty("SMU,PingAfterLoad", static_cast<uint64_t>(post), 32);
+			if (post == n48::kSmuRespOK && smuMailbox(n48::kSmuMsgGetSmuVersion, 0, &ver) == n48::kSmuRespOK)
+				setProperty("SMU,FirmwareVersion", static_cast<uint64_t>(ver), 32);
+		}
+	}
+
+	// 3. psp_tmr_load — SETUP_TMR.
+	psp.tolerateRespErrors = level >= 3;
+	r = amdgpu::psp_tmr_load(dev, psp);
+	setProperty("PSP,TMRResult", static_cast<uint64_t>(static_cast<uint32_t>(r)), 32);
+	setProperty("PSP,TMRRespStatus", static_cast<uint64_t>(psp.tmrRespStatus), 32);   // the PSP's own reason code
+	setProperty("PSP,TMRMC", psp.tmrBusAddr, 64);
+	if (r != kIOReturnSuccess && !psp.tmrRejected) {
 		N48LOG("psp-stage2: SETUP_TMR FAILED 0x%x", r);
 		setProperty("PSP,Stage2", "tmr-failed");
 		return;
 	}
-	setProperty("PSP,TMRMC", psp.tmrBusAddr, 64);
-	setProperty("PSP,Stage2", "ring-and-tmr-ok");
-	N48LOG("psp-stage2: SUCCESS — ring up, TMR accepted at MC 0x%llx (%llu MiB)", psp.tmrBusAddr, psp.tmrSize >> 20);
+	setProperty("PSP,Stage2", r == kIOReturnSuccess ? "ring-and-tmr-ok" : "tmr-rejected-continuing");
+	N48LOG("psp-stage2: ring up, SETUP_TMR %s at MC 0x%llx (%llu MiB)",
+	       r == kIOReturnSuccess ? "accepted" : "REJECTED (continuing like Linux)", psp.tmrBusAddr, psp.tmrSize >> 20);
+	if (level < 3) return;
+
+	// 4. Stage 3: psp_load_non_psp_fw for GC 11.0.2 + AUTOLOAD_RLC.
+	setProperty("PSP,Stage3", "requested");
+	const amdgpu::N33FwSet fw {
+		{ fw_smu_13_0_7, fw_smu_13_0_7_size }, { fw_sdma_6_0_3, fw_sdma_6_0_3_size },
+		{ fw_gc_11_0_2_pfp, fw_gc_11_0_2_pfp_size }, { fw_gc_11_0_2_me, fw_gc_11_0_2_me_size },
+		{ fw_gc_11_0_2_mec, fw_gc_11_0_2_mec_size }, { fw_gc_11_0_2_mes_2, fw_gc_11_0_2_mes_2_size },
+		{ fw_gc_11_0_2_mes1, fw_gc_11_0_2_mes1_size }, { fw_gc_11_0_2_imu, fw_gc_11_0_2_imu_size },
+		{ fw_gc_11_0_2_rlc, fw_gc_11_0_2_rlc_size },
+	};
+	amdgpu::N33LoadReport rep {};
+	r = amdgpu::navi33_load_gfx_fw(dev, psp, fw, rep);
+	setProperty("FW,Result", static_cast<uint64_t>(static_cast<uint32_t>(r)), 32);
+	setProperty("FW,Total", static_cast<uint64_t>(rep.total), 32);
+	setProperty("FW,Sent", static_cast<uint64_t>(rep.sent), 32);
+	setProperty("FW,Accepted", static_cast<uint64_t>(rep.accepted), 32);
+	setProperty("FW,FirstBadType", static_cast<uint64_t>(rep.firstBadType), 32);
+	setProperty("FW,FirstBadResp", static_cast<uint64_t>(rep.firstBadResp), 32);
+	setProperty("FW,LastType", static_cast<uint64_t>(rep.lastType), 32);
+	setProperty("FW,AutoloadSent", rep.autoloadSent);
+	setProperty("FW,AutoloadResp", static_cast<uint64_t>(rep.autoloadResp), 32);
+	if (r != kIOReturnSuccess) {
+		setProperty("PSP,Stage3", r == kIOReturnNotFound ? "firmware-missing" :
+		                          r == kIOReturnTimeout ? "psp-timeout" : "load-stopped");
+		return;
+	}
+
+	// 5. The register list, if this SOS package carries one (psp_rl_load, after the TAs).
+	if (psp.rl.start_addr && psp.rl.size_bytes) {
+		r = amdgpu::psp_rl_load(dev, psp);
+		setProperty("FW,RegListResp", static_cast<uint64_t>(psp.lastRespStatus), 32);
+	}
+
+	// 6. Read-only: gfx_v11_0_wait_for_rlc_autoload_complete (2 s here; Linux allows 100 ms).
+	uint32_t cpStat = 0, bootload = 0;
+	const bool done = amdgpu::navi33_wait_autoload(dev, 2000, &cpStat, &bootload);
+	setProperty("GFX,CP_STAT", static_cast<uint64_t>(cpStat), 32);
+	setProperty("GFX,BootloadStatus", static_cast<uint64_t>(bootload), 32);
+	setProperty("GFX,AutoloadComplete", done);
+	{
+		uint32_t ver = 0;
+		const uint32_t ping = smuMailbox(n48::kSmuMsgTestMessage, 0xC0FFEE, nullptr);
+		setProperty("SMU,PingAfterGfx", static_cast<uint64_t>(ping), 32);
+		if (ping == n48::kSmuRespOK && smuMailbox(n48::kSmuMsgGetSmuVersion, 0, &ver) == n48::kSmuRespOK)
+			setProperty("SMU,FirmwareVersion", static_cast<uint64_t>(ver), 32);
+	}
+	const bool clean = rep.accepted == rep.total && psp.tmrSetUp && !psp.tmrRejected;
+	setProperty("PSP,Stage3", done ? (clean ? "gfx-firmware-running" : "gfx-running-with-warnings")
+	                               : "autoload-not-complete");
+	N48LOG("psp-stage3: %u/%u firmware accepted, autoload %s (CP_STAT 0x%08x, BOOTLOAD 0x%08x)",
+	       rep.accepted, rep.total, done ? "COMPLETE" : "not complete", cpStat, bootload);
 }
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware
