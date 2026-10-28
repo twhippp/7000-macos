@@ -28,4 +28,9 @@ enum {
     kIOReturnNotReady,
     kIOReturnIOError,
     kIOReturnNotFound,
+    // added for tests/psp_ring_test.cpp (psp_v14_0.cpp's return codes)
+    kIOReturnNoSpace,
+    kIOReturnInvalid,
+    kIOReturnInternalError,
+    kIOReturnNotAligned,
 };

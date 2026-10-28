@@ -510,7 +510,9 @@ void Navi48Bringup::stagePSPNavi33() {
 	captureBootFramebuffer();
 	if (!chooseVramBase())         { setProperty("PSP,Stage", "no-vram-region"); return; }
 	if (!apertureCheck(vramBase))  { N48LOG("psp-stage: aperture check failed; refusing"); setProperty("PSP,Stage", "aperture-mismatch"); return; }
-	(void)runPspChain(fw_psp_13_0_7_sos, fw_psp_13_0_7_sos_size, static_cast<int>(n48::PspGen::V13));
+	const bool sosOk = runPspChain(fw_psp_13_0_7_sos, fw_psp_13_0_7_sos_size, static_cast<int>(n48::PspGen::V13));
+	if (sosOk && on >= 2) stagePSPRingNavi33();
+	else if (on >= 2) setProperty("PSP,Stage2", "skipped-sos-not-alive");
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +530,10 @@ bool Navi48Bringup::buildDeviceContext() {
 	dev.vramSizeBytes = static_cast<uint64_t>(vramMB) << 20;
 	dev.vramBase  = vramBase;
 	dev.vramLimit = bar0Size;
-	uint32_t fbBase = regReadIp(IpDiscovery::HwMmhub, 0, 0, 0x0554);
+	// FB_LOCATION_BASE through the version-selected MMHUB table (0x086c on an RX 7600's
+	// MMHUB 3.0.2); 0x0554 is the 4.1.0 offset and stays the fallback for Navi 48.
+	const amdgpu::MmhubRegs *mr = amdgpu::mmhubRegs();
+	uint32_t fbBase = regReadIp(IpDiscovery::HwMmhub, 0, 0, mr ? mr->FB_LOCATION_BASE : 0x0554);
 	if (fbBase == 0xFFFFFFFF) { N48LOG("dev: cannot read FB_LOCATION_BASE"); return false; }
 	dev.vramMcBase = static_cast<uint64_t>(fbBase & 0x00FFFFFF) << 24;
 	if (!amdgpu::fill_ip_base_table(ipDiscovery, dev.ip)) { N48LOG("dev: IP base table incomplete"); return false; }
@@ -539,6 +544,66 @@ bool Navi48Bringup::buildDeviceContext() {
 }
 
 static amdgpu::BringupContext gBringup;   // one ladder per boot; constructed at kext load
+
+// ---------------------------------------------------------------------------
+// navi33-psp=2 — Navi 33 stage 2: the PSP's GPCOM ring + the TMR (MP0 13.0.7).
+// Runs only after stage 1 left SOS alive. Uses the ported psp_v14_0.cpp ring code
+// (MP0 mailbox offsets C2PMSG_64/67/69/70/71 are identical in mp_13_0_x), and its
+// SETUP_TMR path, which 13.0.7 needs because upstream sets boot_time_tmr = false for
+// it (the 9070 XT's PSP sets its TMR up itself). Nothing past the PSP is touched.
+// ---------------------------------------------------------------------------
+void Navi48Bringup::stagePSPRingNavi33() {
+	setProperty("PSP,Stage2", "requested");
+	if (!buildDeviceContext()) { setProperty("PSP,Stage2", "no-device-context"); return; }
+
+	// HDP flush window. psp_ring_cmd_submit flushes HDP through the NBIO remap window
+	// (amdgpu_hdp_flush). Linux programs it in common hw_init (nbio_v4_3_remap_hdp_registers:
+	// MEM_FLUSH_CNTL -> MMIO_REG_HOLE_OFFSET + 0, REG_FLUSH_CNTL -> + 4, with
+	// MMIO_REG_HOLE_OFFSET = 0x80000 - 4 KiB). NBIO 4.3: 0x012d / 0x012e at base index 2,
+	// the same values as amdgpu_ip.h's constant. Only written if the firmware left it empty.
+	if (dev.ip.isResolved(amdgpu::IPBlock::NBIO, 2)) {
+		constexpr uint32_t kMmioRegHole = 0x80000u - 0x1000u;
+		const uint32_t memReg = amdgpu::SOC15_REG_OFFSET_BIDX(dev, amdgpu::IPBlock::NBIO, 2,
+		                                                      amdgpu::NBIORegs::BIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL);
+		const uint32_t regReg = amdgpu::SOC15_REG_OFFSET_BIDX(dev, amdgpu::IPBlock::NBIO, 2, 0x012Eu);
+		const uint32_t cur = amdgpu::RREG32(dev, memReg);
+		N48LOG("psp-stage2: HDP remap MEM_FLUSH_CNTL=0x%08x (rmmio %zu KiB)", cur, dev.rmmioSize >> 10);
+		if ((cur == 0 || cur == 0xFFFFFFFFu) && dev.rmmioSize >= kMmioRegHole + 8) {
+			amdgpu::WREG32(dev, memReg, kMmioRegHole + 0);
+			amdgpu::WREG32(dev, regReg, kMmioRegHole + 4);
+			N48LOG("psp-stage2: programmed HDP remap -> 0x%x / 0x%x (as nbio_v4_3_remap_hdp_registers)",
+			       kMmioRegHole, kMmioRegHole + 4);
+		}
+	}
+
+	amdgpu::PSPContext &psp = gBringup.psp;
+	kern_return_t r = amdgpu::psp_init(dev, psp);
+	if (r != kIOReturnSuccess) { N48LOG("psp-stage2: psp_init failed 0x%x", r); setProperty("PSP,Stage2", "init-failed"); return; }
+	r = amdgpu::psp_adopt_sos_alive(dev, psp);
+	if (r != kIOReturnSuccess) { N48LOG("psp-stage2: SOS not alive at ring time 0x%x", r); setProperty("PSP,Stage2", "sos-gone"); return; }
+
+	r = amdgpu::psp_ring_create(dev, psp);
+	setProperty("PSP,RingResult", static_cast<uint64_t>(r), 32);
+	if (r != kIOReturnSuccess) {
+		N48LOG("psp-stage2: ring create FAILED 0x%x", r);
+		setProperty("PSP,Stage2", "ring-failed");
+		return;
+	}
+	setProperty("PSP,RingMC", psp.ringBusAddr, 64);
+	N48LOG("psp-stage2: GPCOM ring created at MC 0x%llx", psp.ringBusAddr);
+
+	r = amdgpu::psp_setup_tmr(dev, psp);
+	setProperty("PSP,TMRResult", static_cast<uint64_t>(r), 32);
+	if (r != kIOReturnSuccess) {
+		N48LOG("psp-stage2: SETUP_TMR FAILED 0x%x", r);
+		setProperty("PSP,Stage2", "tmr-failed");
+		return;
+	}
+	setProperty("PSP,TMRMC", psp.tmrBusAddr, 64);
+	setProperty("PSP,TMRSize", psp.tmrSize, 64);
+	setProperty("PSP,Stage2", "ring-and-tmr-ok");
+	N48LOG("psp-stage2: SUCCESS — ring up, TMR accepted at MC 0x%llx (%llu MiB)", psp.tmrBusAddr, psp.tmrSize >> 20);
+}
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware
 // atomicity: a second user between the index write and the data access redirects the

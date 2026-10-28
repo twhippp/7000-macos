@@ -59,6 +59,7 @@
 #include "amdgpu_psp.h"
 #include "amdgpu_ucode_psp.h"
 #include "amdgpu_log.h"
+#include "amdgpu_mmhub.h"
 
 // bzero comes from the kernel's string.h via IOKit/IOLib.h (amdgpu_regs.h
 // declares memcpy the same way). Every zero-fill the reference writes as
@@ -87,7 +88,11 @@ psp_read_vram_start(const DeviceContext &dev)
     uint32_t raw = 0;
     if (dev.ip.isResolved(IPBlock::MMHUB)) {
         const uint32_t mmhub_base = dev.ip.get(IPBlock::MMHUB);
-        raw = RREG32(dev, mmhub_base + MMHUBRegs::MMMC_VM_FB_LOCATION_BASE);
+        // Version-selected offset (amdgpu_mmhub.h): 0x086c on MMHUB 3.0.2 (RX 7600),
+        // the 4.1.0 constant on Navi 48 (the two tables agree there by static_assert).
+        const MmhubRegs *mr = mmhubRegs();
+        raw = RREG32(dev, mmhub_base + (mr ? mr->FB_LOCATION_BASE
+                                           : MMHUBRegs::MMMC_VM_FB_LOCATION_BASE));
         live = ((uint64_t)(raw & MMHUBRegs::kFBBaseMask))
                << MMHUBRegs::kFBBaseShift;
     }
@@ -730,7 +735,13 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
     // MES/RLC) with TEE_BAD_PARAMETERS (0xFFFF0006) and AUTOLOAD_RLC returns
     // TEE_ERROR_ITEM_NOT_FOUND (0xFFFF0007). SMU + IMU pass because they
     // bypass TMR slotting.
-    if (kIP_PSP.major == 14) {
+    // Decide on the DISCOVERED MP0 version, not the pinned kIP_PSP: an RX 7600
+    // runs MP0 13.0.7, where upstream sets boot_time_tmr = false (amdgpu_psp.c
+    // psp_early_init) so psp_skip_tmr() is false and the driver must send
+    // SETUP_TMR itself. Navi 48 discovers 14.0.3 and keeps the path below.
+    const IPVersion mp0 = dev.ip.version[(int)IPBlock::MP0];
+    const bool skipTmr = (mp0.major != 0) ? (mp0.major == 14) : (kIP_PSP.major == 14);
+    if (skipTmr) {
         psp.tmrBusAddr = 0;  // SOS-managed; we have no MC address
         psp.tmrSize    = 0;
 
@@ -770,10 +781,15 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
         return kIOReturnSuccess;
     }
 
-    // Legacy / other PSP families that DO accept SETUP_TMR from the driver —
-    // port of upstream psp_setup_tmr (amdgpu_psp.c:825 sets virt_phy_addr=1
-    // unconditionally; system_phy_addr is the CPU-visible BAR phys address
-    // of the TMR BO). Unreachable on this chip; kept for fidelity.
+    // PSP families that take SETUP_TMR from the driver (MP0 13.0.7 on the RX 7600)
+    // — port of upstream psp_tmr_load + psp_prep_tmr_cmd_buf:
+    //   buf_phy_addr   = tmr_mc_addr (FB-aperture MC address)
+    //   buf_size       = PSP_TMR_SIZE (4 MiB; no TOC on 13.0.7, so no LOAD_TOC resize)
+    //   virt_phy_addr  = 1
+    //   system_phy_addr= amdgpu_gmc_vram_pa(tmr_bo) = (mc - vram_start) + vram_base_offset,
+    //                    vram_base_offset = FB_OFFSET << 24 (gmc_v11 get_mc_fb_offset).
+    // The earlier version of this (unreachable) path passed the MC address as
+    // system_phy_addr; upstream passes the VRAM physical address.
     uint64_t vram_start = psp_read_vram_start(dev);
     if (vram_start == 0) {
         PSP_LOG("setup_tmr: vram_start=0; MMHUB not ready");
@@ -781,6 +797,12 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
     }
     psp.tmrBusAddr = dev.vramMC(psp.tmrVRAMOffset);
     psp.tmrSize    = kPSPTMRDefaultSize;
+    uint64_t vramBaseOffset = 0;
+    if (const MmhubRegs *mr = mmhubRegs()) {
+        const uint32_t fbOff = RREG32(dev, dev.ip.get(IPBlock::MMHUB) + mr->FB_OFFSET);
+        if (fbOff != 0xFFFFFFFFu) vramBaseOffset = (uint64_t)(fbOff & 0x00FFFFFFu) << 24;
+    }
+    const uint64_t tmrPA = psp.tmrVRAMOffset + vramBaseOffset;
 
     uint8_t cmd_buf[kPSPGfxCmdRespSize];
     bzero(cmd_buf, sizeof(cmd_buf));
@@ -797,12 +819,13 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
     tmr->buf_phy_addr_hi    = static_cast<uint32_t>(psp.tmrBusAddr >> 32);
     tmr->buf_size           = static_cast<uint32_t>(psp.tmrSize);
     tmr->tmr_flags          = 0x2;  // bit 1 = virt_phy_addr per upstream
-    tmr->system_phy_addr_lo = static_cast<uint32_t>(psp.tmrBusAddr & 0xFFFFFFFFu);
-    tmr->system_phy_addr_hi = static_cast<uint32_t>(psp.tmrBusAddr >> 32);
+    tmr->system_phy_addr_lo = static_cast<uint32_t>(tmrPA & 0xFFFFFFFFu);
+    tmr->system_phy_addr_hi = static_cast<uint32_t>(tmrPA >> 32);
 
-    PSP_LOG("SETUP_TMR: buf mc=%#llx size=%llu flags=%#x",
+    PSP_LOG("SETUP_TMR: buf mc=%#llx size=%llu flags=%#x system_pa=%#llx (vram_base_offset %#llx)",
             (unsigned long long)psp.tmrBusAddr,
-            (unsigned long long)psp.tmrSize, tmr->tmr_flags);
+            (unsigned long long)psp.tmrSize, tmr->tmr_flags,
+            (unsigned long long)tmrPA, (unsigned long long)vramBaseOffset);
 
     uint32_t resp = 0;
     kern_return_t ret = psp_ring_cmd_submit(dev, psp, cmd_buf,

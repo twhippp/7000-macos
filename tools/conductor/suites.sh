@@ -73,6 +73,9 @@ run asic_profile clang++ $W $SAN -I src/navi48-bringup/src -I src/navi48-bringup
 # Navi 33 stage 1: the real psp.cpp against a simulated MP0 bootloader — v13 (RX 7600) command order,
 # the v14 (Navi48) order unchanged, MMHUB-table-driven FB_LOCATION reads. hosttest/shim stands in for IOLib.
 run psp_gen clang++ $W $SAN -I src/navi48-bringup/hosttest/shim -I src/navi48-bringup/src -I src/navi48-bringup/src/amd $T/psp_gen_test.cpp -- src/navi48-bringup/src/psp.cpp src/navi48-bringup/src/amd/amdgpu_mmhub.cpp
+# Navi 33 stage 2: the real psp_v14_0.cpp ring + SETUP_TMR against a simulated PSP thread — 13.0.7 sends
+# SETUP_TMR (boot_time_tmr=false upstream) with the upstream buffer/physical addresses; 14.0.3 still skips it.
+run psp_ring clang++ $W $SAN -pthread -I src/navi48-bringup/hosttest/shim -I src/navi48-bringup/src -I src/navi48-bringup/src/amd $T/psp_ring_test.cpp -- src/navi48-bringup/src/amd/psp_v14_0.cpp src/navi48-bringup/src/amd/amdgpu_mmhub.cpp
 run ctx_latch clang++ $W $SAN -I $A $T/ctx_latch_test.cpp --
 run dcn_liveraster clang++ $W $SAN -I $A -I src/navi48-bringup/src/dcn -I src/dcn41 -x c++ $T/dcn_liveraster_test.cpp src/dcn41/dcn41_core.c src/dcn41/dcn41_otg.c -- src/navi48-bringup/src/dcn/navi48_dcn.cpp src/navi48-bringup/src/Navi48Bringup.cpp $A/DisplayPipeGuard.cpp
 run display_pipe_guard clang++ $Wn -I $A $T/display_pipe_guard_test.cpp --

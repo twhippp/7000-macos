@@ -110,7 +110,8 @@ private:
 	void surveyPSP();
 	void surveySMU();
 	void stagePSP();       // navi48-psp=1 (== navi48-stage=5)
-	void stagePSPNavi33(); // navi33-psp=1 — PSP 13.0.7 SOS boot only, then stop (no ladder)
+	void stagePSPNavi33(); // navi33-psp=1 — PSP 13.0.7 SOS boot; navi33-psp=2 adds ring + TMR
+	void stagePSPRingNavi33(); // navi33-psp=2 — GPCOM ring + driver-allocated TMR, then stop
 	bool runPspChain(const uint8_t *fw, size_t fwSize, int gen);   // shared body; gen = n48::PspGen
 	bool buildDeviceContext();   // fills `dev` for the ported amdgpu modules
 	bool mapDoorbells();         // BAR2 -> dev.bar2 (CP/MES/SDMA stages)
