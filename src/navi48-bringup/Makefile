@@ -41,7 +41,8 @@ $(SHADER_FW_SRCS): src/fw/fw_shader_%.c: shaders/%.bin tools/embed-firmware.py
 # shader cache then refuses to open (sc_open -> SC_E_SHORT, "substitution stays OFF") and the blit
 # kernel substitution refuses every mode (size 0 -> "reason 1"), so nothing is substituted or armed.
 FW_OPTIONAL := shadercache shader_blit_copy_gfx1201 shader_blit_diag_gfx1201 shader_blit_diagmin_gfx1201 \
-               shader_blit_copy_offen_gfx1201
+               shader_blit_copy_offen_gfx1201 \
+               psp_13_0_7_sos
 FW_STUBS    := $(filter-out $(patsubst firmware/%.bin,%,$(FW_BINS)),$(FW_OPTIONAL))
 FW_STUB_SRCS := $(patsubst %,src/fw/fw_%.c,$(FW_STUBS))
 FW_SRCS     := $(sort $(FW_SRCS) $(FW_STUB_SRCS))

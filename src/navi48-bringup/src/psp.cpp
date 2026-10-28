@@ -6,6 +6,7 @@
 #include "psp.hpp"
 #include "regs.hpp"
 #include "ipdiscovery.hpp"
+#include "amdgpu_mmhub.h"
 #include <IOKit/IOLib.h>
 
 #define PSPLOG(fmt, ...) IOLog("Navi48Bringup: psp: " fmt "\n", ##__VA_ARGS__)
@@ -52,6 +53,8 @@ namespace BlCmd {
 	static constexpr uint32_t LoadRASDrv      = 0x000E0000;
 	static constexpr uint32_t LoadIPKeyMgrDrv = 0x000F0000;
 	static constexpr uint32_t LoadSOSDrv      = 0x00020000;
+	static constexpr uint32_t LoadDbgDrv      = 0x000C0000;   // v13 name; same value as HAD (amdgpu_psp.h)
+	static constexpr uint32_t LoadSpdmDrv     = 0x20000000;   // PSP_BL__LOAD_SPDMDRV
 }
 
 // MP0 (PSP) scratch regs, segment 0.
@@ -170,10 +173,28 @@ bool PspLoader::preflight() {
 	lastStepName = "preflight";
 	const uint32_t bl  = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35);
 	const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
-	const uint32_t fbBase = hw.regReadIp(IpDiscovery::HwMmhub, 0, kMmhubSeg, kMmhubFbLocationBase);
-	const uint32_t fbTop  = hw.regReadIp(IpDiscovery::HwMmhub, 0, kMmhubSeg, kMmhubFbLocationTop);
-	const uint32_t fbOff  = hw.regReadIp(IpDiscovery::HwMmhub, 0, kMmhubSeg, kMmhubFbOffset);
-	const uint32_t dcnBase = hw.regReadIp(IpDiscovery::HwDmu, 0, kDmuSeg, kDcnVmFbLocationBase);
+
+	// FB_LOCATION comes from the MMHUB offset table chosen from the harvested
+	// version (amdgpu_mmhub.h) when one is selected: 3.0.2 on an RX 7600, where
+	// the 4.1.0 offsets below would read an unrelated register. With no table
+	// selected the V14 path keeps its original 4.1.0 constants unchanged; V13
+	// refuses, since guessing here is exactly how vram_start goes wrong.
+	const amdgpu::MmhubRegs *mr = amdgpu::mmhubRegs();
+	if (gen == PspGen::V13 && mr == nullptr) {
+		PSPLOG("preflight: no MMHUB offset table selected for this part; refusing");
+		return false;
+	}
+	const uint32_t offBase = mr ? mr->FB_LOCATION_BASE : kMmhubFbLocationBase;
+	const uint32_t offTop  = mr ? mr->FB_LOCATION_TOP  : kMmhubFbLocationTop;
+	const uint32_t offOff  = mr ? mr->FB_OFFSET        : kMmhubFbOffset;
+	const uint32_t fbBase = hw.regReadIp(IpDiscovery::HwMmhub, 0, kMmhubSeg, offBase);
+	const uint32_t fbTop  = hw.regReadIp(IpDiscovery::HwMmhub, 0, kMmhubSeg, offTop);
+	const uint32_t fbOff  = hw.regReadIp(IpDiscovery::HwMmhub, 0, kMmhubSeg, offOff);
+	// The DCN cross-check uses a DCN 4.1 register; on DCN 3.2.1 (V13) it would
+	// read something else, so it is skipped there (it only ever logged a warning).
+	const uint32_t dcnBase = (gen == PspGen::V14)
+		? hw.regReadIp(IpDiscovery::HwDmu, 0, kDmuSeg, kDcnVmFbLocationBase) : 0xFFFFFFFFu;
+	if (mr) PSPLOG("preflight: MMHUB offsets from the %s table (FB_LOCATION_BASE 0x%04x)", mr->ip_version, offBase);
 
 	PSPLOG("preflight: C2PMSG_35=0x%08x (%s) C2PMSG_81=0x%08x (%s)",
 	       bl, (bl & n48::kPspBootReadyBit) ? "bootloader READY" : "bootloader NOT ready",
@@ -274,6 +295,26 @@ bool PspLoader::loadSOS() {
 
 bool PspLoader::runChain() {
 	if (sosAlive()) { PSPLOG("chain: SOS already alive, skipping"); return true; }
+	if (gen == PspGen::V13) {
+		// psp_hw_start order with psp_v13_0's bootloader_load_* callbacks.
+		// SPL: gated on the SPL image being present (is_psp_fw_valid(psp->spl)),
+		// but the image staged is the KDB — psp_v13_0_bootloader_load_spl passes
+		// &psp->kdb. No IPKEYMGR on v13 (no callback); SPDM is loaded if present.
+		PSPLOG("chain: PSP v13 sequence");
+		if (!loadComponent("KDB", kdb, BlCmd::LoadKeyDatabase)) return false;
+		if (spl.present() && !loadComponent("SPL(kdb)", kdb, BlCmd::LoadTosSPLTable)) return false;
+		struct Step13 { const char *name; const SubBin *bin; uint32_t cmd; } v13[] = {
+			{ "SYS_DRV",  &sys,  BlCmd::LoadSysDrv  },
+			{ "SOC_DRV",  &soc,  BlCmd::LoadSocDrv  },
+			{ "INTF_DRV", &intf, BlCmd::LoadIntfDrv },
+			{ "DBG_DRV",  &dbg,  BlCmd::LoadDbgDrv  },
+			{ "RAS_DRV",  &ras,  BlCmd::LoadRASDrv  },
+			{ "SPDM_DRV", &spdm, BlCmd::LoadSpdmDrv },
+		};
+		for (auto &s : v13)
+			if (!loadComponent(s.name, *s.bin, s.cmd)) return false;
+		return loadSOS();
+	}
 	struct Step { const char *name; const SubBin *bin; uint32_t cmd; } steps[] = {
 		// Order from Linux psp_hw_start; identical to mac-amdgpu's proven
 		// psp_load_sos_package (no SPDM_DRV: psp_14_0_3 ships none).

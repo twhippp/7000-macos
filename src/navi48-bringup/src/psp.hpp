@@ -51,11 +51,26 @@ struct SubBin {
 	bool present() const { return data != nullptr && size != 0; }
 };
 
+// Which upstream PSP driver's pre-SOS sequence to follow. The mailbox registers
+// (C2PMSG_35/36/81) and the PSP_BL__* command values are identical between the
+// two (mp_13_0_x and mp_14_0_x headers, amdgpu_psp.h); only the component list
+// differs:
+//   V14 (psp_v14_0.c, Navi 48):  KDB, SPL, SYS, SOC, INTF, HAD, RAS, IPKEYMGR, SOS
+//   V13 (psp_v13_0.c, Navi 33):  KDB, SPL*, SYS, SOC, INTF, DBG, RAS, SPDM, SOS
+//   * psp_v13_0_bootloader_load_spl() hands the bootloader the KDB image with the
+//     SPL command (upstream passes &psp->kdb). Copied verbatim: it is what every
+//     Linux boot of an RX 7600 does.
+enum class PspGen : uint8_t { V14 = 0, V13 = 1 };
+
 class PspLoader {
 public:
 	static constexpr uint32_t kFwPriSize = 1024u * 1024u;   // PSP_1_MEG
 
 	explicit PspLoader(HwAccess &hw) : hw(hw) {}
+
+	// Default V14 keeps the proven Navi 48 path byte-for-byte unchanged.
+	void setGeneration(PspGen g) { gen = g; }
+	PspGen generation() const { return gen; }
 
 	// Parse the sos.bin container (header v2.0/v2.1). Returns false on a
 	// malformed container. Keeps pointers into `fw`; caller owns it.
@@ -91,6 +106,7 @@ private:
 	bool loadSOS();
 
 	HwAccess &hw;
+	PspGen   gen { PspGen::V14 };
 	uint64_t vramMcBase { 0 };      // MC address of VRAM offset 0
 	uint64_t vramMcTop  { 0 };      // MC address one past the last VRAM byte
 	uint64_t fwPriOff   { 0 };      // VRAM byte offset of fw_pri

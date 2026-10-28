@@ -39,6 +39,10 @@
 extern "C" {
 extern const uint8_t fw_psp_14_0_3_sos[];
 extern const size_t  fw_psp_14_0_3_sos_size;
+// Navi 33 (RX 7600) PSP firmware. Optional in the Makefile: if firmware/psp_13_0_7_sos.bin
+// was not fetched the build embeds a zero-length blob and stagePSPNavi33 refuses.
+extern const uint8_t fw_psp_13_0_7_sos[];
+extern const size_t  fw_psp_13_0_7_sos_size;
 }
 
 OSDefineMetaClassAndStructors(Navi48Bringup, IOService)
@@ -456,14 +460,24 @@ void Navi48Bringup::stagePSP() {
 	if (!chooseVramBase())         { setProperty("PSP,Stage", "no-vram-region"); return; }
 	if (!apertureCheck(vramBase))  { N48LOG("psp-stage: aperture check failed — BAR0 offsets are not VRAM offsets here; refusing"); setProperty("PSP,Stage", "aperture-mismatch"); return; }
 
+	const bool ok = runPspChain(fw_psp_14_0_3_sos, fw_psp_14_0_3_sos_size, static_cast<int>(n48::PspGen::V14));
+	if (ok && targetStage > 5) {
+		if (buildDeviceContext()) { dev.psoCAlive = true; runStages(targetStage); }
+	}
+}
+
+// Shared by both generations: parse the embedded sos container, preflight, run the
+// bootloader chain, publish PSP,* properties. Assumes the VRAM aperture/base are set.
+bool Navi48Bringup::runPspChain(const uint8_t *fw, size_t fwSize, int genInt) {
 	HwBridge hw(this);
 	n48::PspLoader psp(hw);
-	if (!psp.parseContainer(fw_psp_14_0_3_sos, fw_psp_14_0_3_sos_size)) {
-		N48LOG("psp-stage: embedded container failed to parse; aborting"); setProperty("PSP,Stage", "bad-container"); return;
+	psp.setGeneration(static_cast<n48::PspGen>(genInt));
+	if (!psp.parseContainer(fw, fwSize)) {
+		N48LOG("psp-stage: embedded container failed to parse; aborting"); setProperty("PSP,Stage", "bad-container"); return false;
 	}
 	setProperty("PSP,ContainerSOSVersion", static_cast<uint64_t>(psp.sosVersion()), 32);
-	if (!psp.setFwPriOffset(vramBase)) { setProperty("PSP,Stage", "bad-fwpri"); return; }
-	if (!psp.preflight()) { N48LOG("psp-stage: preflight refused; nothing sent to the PSP"); setProperty("PSP,Stage", "preflight-refused"); return; }
+	if (!psp.setFwPriOffset(vramBase)) { setProperty("PSP,Stage", "bad-fwpri"); return false; }
+	if (!psp.preflight()) { N48LOG("psp-stage: preflight refused; nothing sent to the PSP"); setProperty("PSP,Stage", "preflight-refused"); return false; }
 	setProperty("PSP,VramMCBase", psp.mcBase(), 64);
 	setProperty("PSP,FwPriMC", psp.fwPriMC(), 64);
 
@@ -474,9 +488,29 @@ void Navi48Bringup::stagePSP() {
 	if (ok) N48LOG("psp-stage: SUCCESS — SOS alive (sign-of-life 0x%08x)", psp.lastBootloaderStatus());
 	else    N48LOG("psp-stage: FAILED at step %s, bootloader status 0x%08x", psp.lastStep(), psp.lastBootloaderStatus());
 	surveyPSP();   // record the live state either way
-	if (ok && targetStage > 5) {
-		if (buildDeviceContext()) { dev.psoCAlive = true; runStages(targetStage); }
+	return ok;
+}
+
+// ---------------------------------------------------------------------------
+// navi33-psp=1 — Navi 33 (RX 7600) stage 1: PSP 13.0.7 bootloader chain -> SOS alive.
+// Requires navi33bringup=1 as well. Same VRAM staging and safety checks as the Navi 48
+// stage; afterwards start() still stops, so nothing past the PSP is touched.
+// ---------------------------------------------------------------------------
+void Navi48Bringup::stagePSPNavi33() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("navi33-psp", &on, sizeof(on)) || on == 0) return;
+	N48LOG("psp-stage: navi33-psp=1 — PSP 13.0.7 chain; this WRITES to VRAM and the PSP mailbox");
+	setProperty("PSP,Stage", "requested");
+	if (fw_psp_13_0_7_sos_size == 0) {
+		N48LOG("psp-stage: psp_13_0_7_sos.bin was not embedded in this build; nothing sent");
+		setProperty("PSP,Stage", "no-firmware");
+		return;
 	}
+	if (!mapVramAperture())        { N48LOG("psp-stage: no usable BAR0 aperture; aborting"); setProperty("PSP,Stage", "no-bar0"); return; }
+	captureBootFramebuffer();
+	if (!chooseVramBase())         { setProperty("PSP,Stage", "no-vram-region"); return; }
+	if (!apertureCheck(vramBase))  { N48LOG("psp-stage: aperture check failed; refusing"); setProperty("PSP,Stage", "aperture-mismatch"); return; }
+	(void)runPspChain(fw_psp_13_0_7_sos, fw_psp_13_0_7_sos_size, static_cast<int>(n48::PspGen::V13));
 }
 
 // ---------------------------------------------------------------------------
@@ -7363,6 +7397,9 @@ bool Navi48Bringup::start(IOService *provider) {
 			// this point: no firmware, no ladder, no n48dcn::attach, no accel hook,
 			// no functional write of any kind. stop() already no-ops on all of
 			// those and correctly unmaps what start() did map.
+			// Navi 33 stage 1 (opt-in): boot the PSP's secure OS. Still no ladder afterwards.
+			if (profile->gen == amdgpu::GpuGeneration::Navi33) stagePSPNavi33();
+
 			N48LOG("start: survey complete — attaching read-only so `navi48test log` can read it back.");
 			return true;
 		}

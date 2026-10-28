@@ -110,6 +110,8 @@ private:
 	void surveyPSP();
 	void surveySMU();
 	void stagePSP();       // navi48-psp=1 (== navi48-stage=5)
+	void stagePSPNavi33(); // navi33-psp=1 — PSP 13.0.7 SOS boot only, then stop (no ladder)
+	bool runPspChain(const uint8_t *fw, size_t fwSize, int gen);   // shared body; gen = n48::PspGen
 	bool buildDeviceContext();   // fills `dev` for the ported amdgpu modules
 	bool mapDoorbells();         // BAR2 -> dev.bar2 (CP/MES/SDMA stages)
 	void runStages(uint32_t target);   // navi48-stage=N: mac-amdgpu BringupStage ladder beyond SOS
