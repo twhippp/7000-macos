@@ -20,8 +20,8 @@ on:
 jobs:
   build:
     # macos-14 is retired on 2026-11-02 (brownouts cancel its jobs before then),
-    # so this moved to macos-15. Bump deliberately, not by accident.
-    runs-on: macos-15
+    # so this moved to macos-15-intel (the arm64 pool was out of capacity). Bump deliberately, not by accident.
+    runs-on: macos-15-intel
     timeout-minutes: 30
 
     steps:
