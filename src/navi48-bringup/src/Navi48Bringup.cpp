@@ -442,7 +442,7 @@ void Navi48Bringup::surveySMU() {
 	auto send = [&](uint32_t msgId, uint32_t param, uint32_t *ret) -> uint32_t {
 		rmmio[regResp / 4] = 0; rmmio[regParam / 4] = param; rmmio[regMsg / 4] = msgId;
 		uint32_t resp = 0;
-		for (uint32_t i = 0; i < timeoutMs; i++) { resp = rmmio[regResp / 4]; if (resp) break; IOSleep(1); }
+		for (int i = 0; i < 500; i++) { resp = rmmio[regResp / 4]; if (resp) break; IOSleep(1); }
 		if (ret) *ret = rmmio[regParam / 4];
 		return resp;
 	};
