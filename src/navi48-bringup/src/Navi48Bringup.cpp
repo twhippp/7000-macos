@@ -14,6 +14,7 @@
 #include "amd/amdgpu_mmhub.h"
 #include "amd/amdgpu_regs.h"
 #include "amd/amdgpu_sdma.h"
+#include "amd/amdgpu_smu.h"
 #include "amd/asic_profile.h"
 #include "Navi48MetalNub.hpp"   // 0.0.610: terminate a published Metal nub at stop
 #include <libkern/c++/OSData.h>
@@ -441,7 +442,7 @@ void Navi48Bringup::surveySMU() {
 	auto send = [&](uint32_t msgId, uint32_t param, uint32_t *ret) -> uint32_t {
 		rmmio[regResp / 4] = 0; rmmio[regParam / 4] = param; rmmio[regMsg / 4] = msgId;
 		uint32_t resp = 0;
-		for (int i = 0; i < 500; i++) { resp = rmmio[regResp / 4]; if (resp) break; IOSleep(1); }
+		for (uint32_t i = 0; i < timeoutMs; i++) { resp = rmmio[regResp / 4]; if (resp) break; IOSleep(1); }
 		if (ret) *ret = rmmio[regParam / 4];
 		return resp;
 	};
@@ -565,9 +566,10 @@ static amdgpu::BringupContext gBringup;   // one ladder per boot; constructed at
 // ---------------------------------------------------------------------------
 // MP1 13.0.x mailbox: regMP1_SMN_C2PMSG_66 / _82 / _90 = 0x0282 / 0x0292 / 0x029a at
 // base index 0 (mp_13_0_0_offset.h; Navi 48's MP1 14 uses 0x82.. at index 1, surveySMU).
-// Returns the response (0 = no answer within ~500 ms or no mailbox). Only TestMessage and
-// GetSmuVersion are sent, and neither changes anything.
-uint32_t Navi48Bringup::smuMailbox(uint32_t msgId, uint32_t param, uint32_t *ret) {
+// Returns the response (0 = no answer within timeoutMs, default ~500 ms, or no mailbox).
+// Stages 1-2 send only TestMessage and GetSmuVersion, which change nothing; stage 3's
+// navi33SmuFeatures() is the one caller that changes power state.
+uint32_t Navi48Bringup::smuMailbox(uint32_t msgId, uint32_t param, uint32_t *ret, uint32_t timeoutMs) {
 	uint32_t regMsg, regParam, regResp;
 	if (!ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, 0, 0x0282, regMsg)   ||
 	    !ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, 0, 0x0292, regParam) ||
@@ -576,15 +578,65 @@ uint32_t Navi48Bringup::smuMailbox(uint32_t msgId, uint32_t param, uint32_t *ret
 	if (regMsg + 4 > rmmioSize || regParam + 4 > rmmioSize || regResp + 4 > rmmioSize) return 0;
 	rmmio[regResp / 4] = 0; rmmio[regParam / 4] = param; rmmio[regMsg / 4] = msgId;
 	uint32_t resp = 0;
-	for (int i = 0; i < 500; i++) { resp = rmmio[regResp / 4]; if (resp) break; IOSleep(1); }
+	for (uint32_t i = 0; i < timeoutMs; i++) { resp = rmmio[regResp / 4]; if (resp) break; IOSleep(1); }
 	if (ret) *ret = rmmio[regParam / 4];
 	return resp;
 }
 
+// navi33-psp>=3 — the SMU half of Linux's bring-up order. Linux runs the SMU IP block's
+// hw_init (smu_smc_hw_setup, amdgpu_smu.c) AFTER the PSP has loaded every firmware and sent
+// AUTOLOAD_RLC, and BEFORE gfx_v11_0_hw_init polls RLC_RLCS_BOOTLOAD_STATUS. The first
+// stage-3 hardware run skipped it: 26/26 accepted, AUTOLOAD_RLC resp 0, but BOOTLOAD_STATUS
+// stayed 0. Navi 48 hit the identical symptom and only cleared it once EnableAllSmuFeatures
+// had run (runStages: "SMU feature enable is REQUIRED for the GFX core to power up").
+//
+// Subset sent, in Linux order (smu_v13_0_7_ppsmc.h ids == the PPSMC table in amdgpu_ip.h):
+//   SetDriverDramAddrHigh/Low -> RunDcBtc -> SetAllowedFeaturesMaskHigh/Low -> EnableAllSmuFeatures
+// Not sent: tool table, memory pool, pptable write (PMFW keeps its own IFWI pptable).
+// Uses smuMailbox's MP1 13.0.x offsets — smu_v14_0.cpp's sender is wired for MP1 14 (0x82 @ idx 1)
+// and would miss this card's mailbox. Changes clocks/power and may spin the fan up;
+// navi33-smu-basic=1 skips it.
+void Navi48Bringup::navi33SmuFeatures() {
+	using namespace amdgpu;
+	setProperty("SMU,Setup", "requested");
+	const uint64_t off = dev.vramBase + kSMUDriverTableVRAMOffset;   // free slot between TMR default and fw_buf
+	if (dev.vramMcBase == 0 || dev.vramLimit == 0 || off + kSMUDriverTableSize > dev.vramLimit) {
+		setProperty("SMU,Setup", "no-driver-table-slot");
+		return;
+	}
+	bar0_memset_vram(dev, off, 0u, kSMUDriverTableSize);
+	const uint64_t mc = dev.vramMC(off);
+	constexpr uint32_t kSlowMs = 2000;   // Linux: SMU messages get ~2 s (usec_timeout * 20)
+
+	uint32_t resp = smuMailbox(PPSMC::SetDriverDramAddrHigh, static_cast<uint32_t>(mc >> 32), nullptr, kSlowMs);
+	if (resp == n48::kSmuRespOK)
+		resp = smuMailbox(PPSMC::SetDriverDramAddrLow, static_cast<uint32_t>(mc), nullptr, kSlowMs);
+	setProperty("SMU,DriverTableResp", static_cast<uint64_t>(resp), 32);
+
+	resp = smuMailbox(PPSMC::RunDcBtc, 0, nullptr, kSlowMs);
+	setProperty("SMU,BtcResp", static_cast<uint64_t>(resp), 32);
+
+	resp = smuMailbox(PPSMC::SetAllowedFeaturesMaskHigh, 0xFFFFFFFFu, nullptr, kSlowMs);
+	const uint32_t lo = smuMailbox(PPSMC::SetAllowedFeaturesMaskLow, 0xFFFFFFFFu, nullptr, kSlowMs);
+	setProperty("SMU,AllowMaskResp", static_cast<uint64_t>(resp == n48::kSmuRespOK ? lo : resp), 32);
+
+	const uint32_t en = smuMailbox(PPSMC::EnableAllSmuFeatures, 0, nullptr, kSlowMs);
+	setProperty("SMU,EnableFeaturesResp", static_cast<uint64_t>(en), 32);
+
+	uint32_t fLo = 0, fHi = 0;
+	smuMailbox(PPSMC::GetRunningSmuFeaturesLow, 0, &fLo, kSlowMs);
+	smuMailbox(PPSMC::GetRunningSmuFeaturesHigh, 0, &fHi, kSlowMs);
+	setProperty("SMU,FeaturesRunning", (static_cast<uint64_t>(fHi) << 32) | fLo, 64);
+	setProperty("SMU,Setup", en == n48::kSmuRespOK ? "features-enabled" : "enable-failed");
+	N48LOG("psp-stage3: SMU setup — driver table mc 0x%llx, EnableAllSmuFeatures resp 0x%x, running 0x%08x_%08x",
+	       mc, en, fHi, fLo);
+}
+
 // navi33-psp=2: GPCOM ring, LOAD_TOC, SMU firmware, SETUP_TMR — Linux psp_hw_start for
 // a PMFW-centralised part (MP0 13.0.7): ring_create, tmr_init, load_smu_fw, tmr_load.
-// navi33-psp=3 (or higher): + every GFX/SDMA/MES/IMU/RLC firmware, AUTOLOAD_RLC, and the
-// read-only wait for the RLC autoload to finish (gfx_v11_0_hw_init). Stops before any
+// navi33-psp=3 (or higher): + every GFX/SDMA/MES/IMU/RLC firmware, AUTOLOAD_RLC, the SMU
+// feature enable (navi33SmuFeatures; navi33-smu-basic=1 skips it), and the read-only wait
+// for the RLC autoload to finish (gfx_v11_0_hw_init). Stops before any
 // CP/GFX ring programming. Every step publishes its own property, so one boot shows
 // exactly where it stopped. Like Linux, a non-zero PSP status at 3+ is recorded and the
 // sequence carries on; only a PSP that stops answering ends it.
@@ -721,12 +773,35 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 		setProperty("FW,RegListResp", static_cast<uint64_t>(psp.lastRespStatus), 32);
 	}
 
-	// 6. Read-only: gfx_v11_0_wait_for_rlc_autoload_complete (2 s here; Linux allows 100 ms).
+	// 6. SMU hw_init (Linux runs it here, between the PSP load and the GFX autoload wait).
+	//    Snapshot the GC state first so one boot shows what the SMU step changed.
+	{
+		uint32_t cp0 = 0, bl0 = 0;
+		(void)amdgpu::navi33_wait_autoload(dev, 0, &cp0, &bl0);
+		setProperty("GFX,BootloadBeforeSmu", static_cast<uint64_t>(bl0), 32);
+	}
+	uint32_t basic = 0;
+	if (PE_parse_boot_argn("navi33-smu-basic", &basic, sizeof(basic)) && basic != 0)
+		setProperty("SMU,Setup", "skipped-by-boot-arg");
+	else
+		navi33SmuFeatures();
+
+	// 7. Read-only: gfx_v11_0_wait_for_rlc_autoload_complete (2 s here; Linux allows 100 ms).
 	uint32_t cpStat = 0, bootload = 0;
 	const bool done = amdgpu::navi33_wait_autoload(dev, 2000, &cpStat, &bootload);
 	setProperty("GFX,CP_STAT", static_cast<uint64_t>(cpStat), 32);
 	setProperty("GFX,BootloadStatus", static_cast<uint64_t>(bootload), 32);
 	setProperty("GFX,AutoloadComplete", done);
+	// Power witnesses (gc_11_0_0_offset.h): all-zero here means the GFX block is still
+	// powered down; real values with BOOTLOAD 0 would mean powered but the RLC never booted.
+	if (dev.ip.isResolved(amdgpu::IPBlock::GC, 0) && dev.ip.isResolved(amdgpu::IPBlock::GC, 1)) {
+		setProperty("GFX,GRBM_STATUS",
+		            static_cast<uint64_t>(amdgpu::RREG32(dev, amdgpu::SOC15_REG_OFFSET_BIDX(dev, amdgpu::IPBlock::GC, 0, 0x0da4u))), 32);
+		setProperty("GFX,GB_ADDR_CONFIG",
+		            static_cast<uint64_t>(amdgpu::RREG32(dev, amdgpu::SOC15_REG_OFFSET_BIDX(dev, amdgpu::IPBlock::GC, 0, 0x13deu))), 32);
+		setProperty("GFX,CGCG_CGLS_CTRL",
+		            static_cast<uint64_t>(amdgpu::RREG32(dev, amdgpu::SOC15_REG_OFFSET_BIDX(dev, amdgpu::IPBlock::GC, 1, 0x4c49u))), 32);
+	}
 	{
 		uint32_t ver = 0;
 		const uint32_t ping = smuMailbox(n48::kSmuMsgTestMessage, 0xC0FFEE, nullptr);
