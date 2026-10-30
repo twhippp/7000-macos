@@ -107,7 +107,14 @@ jobs:
 
       # --- build --------------------------------------------------------------
       - name: Build
-        run: make -C src/navi48-bringup MKSDK=/tmp/mksdk all
+        run: |
+          set -o pipefail
+          # Compiler errors also go out as annotations, so they can be read
+          # without downloading the full log.
+          make -C src/navi48-bringup MKSDK=/tmp/mksdk all 2>&1 | tee /tmp/build.log || {
+            grep -E 'error:|Error [0-9]|\*\*\*' /tmp/build.log | head -20 | sed 's/^/::error::/'
+            exit 1
+          }
 
       # The Makefile already fails the link if any of OUR symbols are undefined
       # (the kext would then silently not load). Re-check from outside so a
