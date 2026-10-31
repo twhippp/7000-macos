@@ -66,10 +66,12 @@ configure() {
 	local cross=()
 	if [ "$(uname -m)" != x86_64 ]; then cross=(--cross-file "$MESA_DIR/cross-x86_64.ini"); fi
 	if [ -f "$MESA_DIR/$BUILD/build.ninja" ]; then return; fi
-	say "configuring ($(uname -m) host${cross:+, cross to x86_64})"
+	local note=""; [ ${#cross[@]} -eq 0 ] || note=", cross to x86_64"
+	say "configuring ($(uname -m) host$note)"
 	# RADV only, ACO only (no LLVM), no GL/EGL/GBM/X11/Wayland: the only consumer is the Metal
 	# bundle and test tools, which load the dylib directly.
-	meson setup "$MESA_DIR/$BUILD" "$MESA_DIR" "${cross[@]}" \
+	# ${cross[@]+...}: macOS bash 3.2 treats an empty array as unbound under set -u.
+	meson setup "$MESA_DIR/$BUILD" "$MESA_DIR" ${cross[@]+"${cross[@]}"} \
 		-Dbuildtype=debugoptimized -Db_ndebug=false \
 		-Dvulkan-drivers=amd -Dgallium-drivers= -Dplatforms= \
 		-Dopengl=false -Dgles1=disabled -Dgles2=disabled -Degl=disabled -Dglx=disabled -Dgbm=disabled \
