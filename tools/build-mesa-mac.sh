@@ -20,6 +20,8 @@ BUILD=build-x86_64
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 PATCHES="$HERE/mesa-patches"
 LOG="$HOME/navi48-native/build-mesa.log"
+TOOLS="$HOME/navi48-native/tools"
+PYVER=3.12
 mkdir -p "$(dirname "$MESA_DIR")"
 
 say() { printf '\n== %s\n' "$*"; }
@@ -27,7 +29,27 @@ die() { printf '\nbuild-mesa-mac: %s\n' "$*" >&2; exit 1; }
 
 mode=${1:-build}
 
+# Mesa needs Python >= 3.10; macOS's Command Line Tools ship 3.9. Without Homebrew or an admin
+# password, uv fetches a standalone Python into the user's home and a venv there holds the build
+# tools (meson, ninja, pkgconf, mako, pyyaml, packaging, cmake).
+ensure_python() {
+	local venv="$TOOLS/venv"
+	PATH="$venv/bin:$PATH"; export PATH
+	if [ -x "$venv/bin/python3" ] && "$venv/bin/python3" -c 'import sys, mako, yaml, packaging; sys.exit(sys.version_info < (3, 10))' 2>/dev/null &&
+		[ -x "$venv/bin/meson" ]; then return; fi
+	if python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null &&
+		python3 -c 'import mako, yaml, packaging' 2>/dev/null && command -v meson >/dev/null; then return; fi
+	say "setting up Python $PYVER and the build tools in $venv (one time)"
+	local ub; ub="$(python3 -m site --user-base 2>/dev/null)/bin"; PATH="$PATH:$ub"
+	command -v uv >/dev/null || python3 -m pip install --user -q uv || die "pip install uv failed"
+	uv venv -q --python "$PYVER" "$venv" || die "uv could not set up Python $PYVER"
+	uv pip install -q --python "$venv/bin/python3" meson ninja pkgconf mako pyyaml packaging cmake ||
+		die "installing the build tools into $venv failed"
+	"$venv/bin/python3" --version
+}
+
 check_tools() {
+	ensure_python
 	say "checking tools"
 	local miss=()
 	# pip --user installs (meson, ninja, pkgconf) land here; no Homebrew or sudo needed.
@@ -64,7 +86,6 @@ patch_tree() {
 
 # RADV's BVH shaders need glslangValidator at build time. Without Homebrew there is none on macOS,
 # so build it once from source (cmake from pip, no SPIRV-Tools) into $TOOLS.
-TOOLS="$HOME/navi48-native/tools"
 GLSLANG_TAG=16.4.0
 ensure_glslang() {
 	PATH="$TOOLS/bin:$PATH"; export PATH
@@ -86,6 +107,7 @@ configure() {
 	if [ "$(uname -m)" != x86_64 ]; then cross=(--cross-file "$MESA_DIR/cross-x86_64.ini"); fi
 	ensure_glslang
 	if [ -f "$MESA_DIR/$BUILD/build.ninja" ]; then return; fi
+	rm -rf "$MESA_DIR/$BUILD"   # a failed earlier setup leaves a half-made build dir
 	local note=""; [ ${#cross[@]} -eq 0 ] || note=", cross to x86_64"
 	say "configuring ($(uname -m) host$note)"
 	# RADV only, ACO only (no LLVM), no GL/EGL/GBM/X11/Wayland: the only consumer is the Metal
