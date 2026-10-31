@@ -124,4 +124,23 @@ struct N33FenceReport {
 };
 kern_return_t navi33_fence_copy_tests(DeviceContext &dev, N33FenceReport &rep, uint32_t timeoutUs = 100000);
 
+// ---- stage 8: real data — the live screen ----
+//
+// The copy engine works on the actual console framebuffer the firmware left in VRAM:
+//  1. copies the whole screen to a backup area in VRAM (real pixels, verified by the CPU),
+//  2. paints a white band over the top 1/16 of the screen (CONSTANT_FILL) — visible,
+//  3. holds it for holdMs, then copies the band back from the backup (restored, verified).
+// Each step is one IB + FENCE on SDMA0, continuing the ring where stage 7 left it.
+struct N33ScreenReport {
+	uint64_t fbOff, fbLen, backupOff, bandLen;
+	uint32_t backupMismatches;   // sampled dwords where backup != screen after step 1
+	uint32_t bandMismatches;     // sampled band dwords that are not white after step 2
+	uint32_t restoreMismatches;  // sampled band dwords != backup after step 3
+	uint32_t backupUs, bandUs, restoreUs;
+	bool     passed;
+	const char *stage;
+};
+kern_return_t navi33_screen_test(DeviceContext &dev, uint64_t fbOff, uint64_t fbLen, N33ScreenReport &rep,
+                                 uint32_t holdMs = 3000, uint32_t timeoutUs = 2000000);
+
 } // namespace amdgpu

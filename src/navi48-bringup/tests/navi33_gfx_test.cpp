@@ -95,6 +95,11 @@ struct Rig {
 								std::memmove(&vram[dst], &vram[src], (size_t)q[1] + 1);
 								d += 28;
 							}
+							else if ((q[0] & 0xFF) == 11) {   // CONSTANT_FILL: dst, dst_hi, data, count-1
+								const uint64_t dst = (((uint64_t)q[2] << 32) | q[1]) - kMcBase;
+								for (uint64_t b = 0; b + 4 <= (uint64_t)q[4] + 1; b += 4) std::memcpy(&vram[dst + b], &q[3], 4);
+								d += 20;
+							}
 							else d += 4;
 						}
 						return 24;
@@ -214,6 +219,19 @@ int main() {
 		      "stage 7: SDMA 4 KiB copy + FENCE, gfx RELEASE_MEM fence");
 		check(fr.copyBadDwords == 0 && fr.sdmaFence == kN33FenceSeq && fr.cpFence == kN33FenceSeq, "  ...copy exact, both fences = seq");
 		check(k.r(kGc0, 0x0085) == 192 && k.r(kGc0, 0x1df4) == 768, "  ...wptrs continue: SDMA 192 bytes, CP 768 dwords");
+
+		// stage 8: a fake 1 MiB "screen" at vram+0 with a pattern
+		const uint64_t fbOff = 0, fbLen = 1u << 20;
+		for (uint64_t i = 0; i < fbLen / 4; i++) { const uint32_t v = 0x11000000u | (uint32_t)i; std::memcpy(&k.vram[fbOff + i * 4], &v, 4); }
+		N33ScreenReport sr {};
+		check(navi33_screen_test(k.dev, fbOff, fbLen, sr, 1) == kIOReturnSuccess && std::strcmp(sr.stage, "screen-ok") == 0,
+		      "stage 8: backup, white band, restore");
+		check(sr.backupOff >= k.dev.vramBase + (32u << 20), "  ...backup lands outside the bring-up span");
+		check(std::memcmp(&k.vram[sr.backupOff], &k.vram[fbOff], fbLen) == 0, "  ...screen fully restored == backup");
+		uint32_t px; std::memcpy(&px, &k.vram[fbOff + 4 * 5], 4);
+		check(px == (0x11000000u | 5), "  ...first pixels are the original ones again");
+		N33ScreenReport none {};
+		check(navi33_screen_test(k.dev, ~0ull, 0, none, 1) == kIOReturnNotFound, "  ...no console FB -> skipped");
 	}
 	{
 		Rig k(true);

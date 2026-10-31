@@ -801,4 +801,125 @@ kern_return_t navi33_fence_copy_tests(DeviceContext &dev, N33FenceReport &rep, u
 	return rep.sdmaPassed && rep.cpPassed ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
+// ============================================================================
+// Stage 8 — real data: the live console framebuffer
+// ============================================================================
+namespace {
+constexpr uint32_t kSDMA_OP_CONST_FILL = 11, kFILLSIZE_DWORD = 2u << 30;   // sdma_v6_0_0_pkt_open.h
+constexpr uint64_t kS8IbOff    = 0xA000;   // three 32-byte-aligned IBs, 0x100 apart
+constexpr uint64_t kS8FenceOff = 0x7200;
+constexpr uint32_t kBandColor  = 0xFFFFFFFFu;   // white: identical in every byte, so fill width can't matter
+constexpr uint64_t kOneMiB     = 1ull << 20;
+constexpr uint64_t kSpan       = 32ull << 20;   // the bring-up span starting at vramBase
+
+// One IB + FENCE on SDMA0, appended at the current hardware wptr. Waits for the fence.
+bool sdmaSubmit(DeviceContext &dev, uint64_t ibOff, uint32_t ibDw, uint32_t seq, uint32_t timeoutUs, uint32_t &waitedUs) {
+	const uint64_t base = slot(dev);
+	const uint64_t ibMc = dev.vramMC(base + ibOff), f = dev.vramMC(base + kS8FenceOff);
+	WBAR0_32(dev, base + kS8FenceOff, 0);
+	const uint32_t wpDw = RREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR)) / 4;
+	uint32_t pkt[16] = {};
+	uint32_t n = (2u - wpDw) & 7u;
+	pkt[n++] = kSDMA_OP_INDIRECT;
+	pkt[n++] = (uint32_t)ibMc & 0xFFFFFFE0u;
+	pkt[n++] = (uint32_t)(ibMc >> 32);
+	pkt[n++] = ibDw;
+	pkt[n++] = 0;
+	pkt[n++] = 0;
+	pkt[n++] = kSDMA_OP_FENCE | (3u << 16);
+	pkt[n++] = (uint32_t)f;
+	pkt[n++] = (uint32_t)(f >> 32);
+	pkt[n++] = seq;
+	const uint32_t total = (n + 15u) & ~15u;
+	for (uint32_t i = 0; i < total; i++)
+		WBAR0_32(dev, base + kRingOff + (uint64_t)((wpDw + i) % (kRingBytes / 4)) * 4, i < 16 ? pkt[i] : 0);
+	const uint32_t nwp = ((wpDw + total) % (kRingBytes / 4)) * 4;
+	WBAR0_64(dev, base + kWptrOff, nwp);
+	amdgpu_hdp_flush(dev);
+	WREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR), nwp);
+	WREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR_HI), 0);
+	for (waitedUs = 0; waitedUs < timeoutUs; waitedUs += 10) {
+		if (RBAR0_32(dev, base + kS8FenceOff) == seq) return true;
+		IODelay(10);
+	}
+	return false;
+}
+
+uint32_t copyIb(DeviceContext &dev, uint64_t at, uint64_t srcMc, uint64_t dstMc, uint64_t bytes) {
+	const uint32_t ib[8] = { kSDMA_OP_COPY | (kSDMA_SUBOP_COPY_LINEAR << 8), (uint32_t)(bytes - 1), 0,
+	                         (uint32_t)srcMc, (uint32_t)(srcMc >> 32), (uint32_t)dstMc, (uint32_t)(dstMc >> 32), 0 };
+	bar0_memcpy_to_vram(dev, slot(dev) + at, ib, sizeof(ib));
+	return 8;
+}
+
+// Compares up to 4096 dwords spread over [0, len) of two VRAM ranges (b == ~0: against a constant).
+uint32_t sampleCompare(DeviceContext &dev, uint64_t a, uint64_t b, uint64_t len, uint32_t constant) {
+	const uint64_t n = len / 4 < 4096 ? len / 4 : 4096;
+	const uint64_t step = n ? (len / 4) / n : 1;
+	uint32_t bad = 0;
+	for (uint64_t i = 0; i < n; i++) {
+		const uint64_t o = i * step * 4;
+		const uint32_t want = b == ~0ull ? constant : RBAR0_32(dev, b + o);
+		if (RBAR0_32(dev, a + o) != want) bad++;
+	}
+	return bad;
+}
+} // namespace
+
+kern_return_t navi33_screen_test(DeviceContext &dev, uint64_t fbOff, uint64_t fbLen, N33ScreenReport &rep,
+                                 uint32_t holdMs, uint32_t timeoutUs) {
+	rep = N33ScreenReport{};
+	rep.fbOff = fbOff; rep.fbLen = fbLen;
+	rep.stage = "screen";
+	if (fbOff == ~0ull || fbLen < 4096 || fbOff + fbLen > dev.vramLimit) { rep.stage = "no-console-fb"; return kIOReturnNotFound; }
+	fbLen &= ~3ull;
+	rep.fbLen = fbLen;
+	if (fbLen >= (1ull << 30)) { rep.stage = "fb-too-large"; return kIOReturnNoSpace; }
+
+	// Backup: first 1 MiB-aligned spot that misses both the screen and the bring-up span.
+	auto overlaps = [](uint64_t a, uint64_t al, uint64_t b, uint64_t bl) { return a < b + bl && b < a + al; };
+	const uint64_t cands[2] = { (dev.vramBase + kSpan + kOneMiB - 1) & ~(kOneMiB - 1),
+	                            (fbOff + fbLen + kOneMiB - 1) & ~(kOneMiB - 1) };
+	rep.backupOff = ~0ull;
+	for (uint64_t c : cands)
+		if (c + fbLen <= dev.vramLimit && !overlaps(c, fbLen, fbOff, fbLen) && !overlaps(c, fbLen, dev.vramBase, kSpan)) {
+			rep.backupOff = c; break;
+		}
+	if (rep.backupOff == ~0ull) { rep.stage = "no-room-for-backup"; return kIOReturnNoSpace; }
+
+	const uint64_t fbMc = dev.vramMC(fbOff), bkMc = dev.vramMC(rep.backupOff);
+	rep.bandLen = (fbLen / 16) & ~3ull;
+
+	// 1. screen -> backup
+	copyIb(dev, kS8IbOff, fbMc, bkMc, fbLen);
+	if (!sdmaSubmit(dev, kS8IbOff, 8, 8, timeoutUs, rep.backupUs)) { rep.stage = "backup-copy-timeout"; return kIOReturnTimeout; }
+	rep.backupMismatches = sampleCompare(dev, rep.backupOff, fbOff, fbLen, 0);
+	if (rep.backupMismatches > 8) {   // the console may scroll a line meanwhile; a real failure misses everywhere
+		rep.stage = "backup-copy-wrong-data"; return kIOReturnIOError;
+	}
+
+	// 2. white band over the top 1/16 of the screen
+	{
+		const uint32_t ib[8] = { kSDMA_OP_CONST_FILL | kFILLSIZE_DWORD, (uint32_t)fbMc, (uint32_t)(fbMc >> 32),
+		                         kBandColor, (uint32_t)(rep.bandLen - 1), 0, 0, 0 };
+		bar0_memcpy_to_vram(dev, slot(dev) + kS8IbOff + 0x100, ib, sizeof(ib));
+	}
+	if (!sdmaSubmit(dev, kS8IbOff + 0x100, 8, 9, timeoutUs, rep.bandUs)) { rep.stage = "band-fill-timeout"; return kIOReturnTimeout; }
+	rep.bandMismatches = sampleCompare(dev, fbOff, ~0ull, rep.bandLen, kBandColor);
+	IOSleep(holdMs);
+
+	// 3. band <- backup
+	copyIb(dev, kS8IbOff + 0x200, bkMc, fbMc, rep.bandLen);
+	const bool restored = sdmaSubmit(dev, kS8IbOff + 0x200, 8, 10, timeoutUs, rep.restoreUs);
+	rep.restoreMismatches = sampleCompare(dev, fbOff, rep.backupOff, rep.bandLen, 0);
+	if (!restored) { rep.stage = "restore-timeout"; return kIOReturnTimeout; }
+	rep.passed = rep.bandMismatches == 0 && rep.restoreMismatches <= 8;
+	rep.stage = rep.passed ? "screen-ok" : (rep.bandMismatches ? "band-wrong-data" : "restore-wrong-data");
+	UCODE_LOG("navi33-gfx: screen test %s — FB vram+%#llx (%llu KiB), backup vram+%#llx in %u us (%u bad), band %llu KiB in %u us (%u bad), restore %u us (%u bad)",
+	          rep.stage, (unsigned long long)fbOff, (unsigned long long)(fbLen >> 10), (unsigned long long)rep.backupOff,
+	          rep.backupUs, rep.backupMismatches, (unsigned long long)(rep.bandLen >> 10), rep.bandUs, rep.bandMismatches,
+	          rep.restoreUs, rep.restoreMismatches);
+	return rep.passed ? kIOReturnSuccess : kIOReturnIOError;
+}
+
 } // namespace amdgpu
