@@ -44,6 +44,7 @@ struct Rig {
 	std::atomic<bool> stop { false };
 	bool engineAlive = true;
 	bool cpAlive = true;
+	bool ibSeen = false, ibAligned = false;
 	uint64_t cpDone = 0;
 	std::thread sdma;
 
@@ -73,14 +74,28 @@ struct Rig {
 				const uint64_t ring = (((uint64_t)r(kGc0, 0x0082) << 40) | ((uint64_t)r(kGc0, 0x0081) << 8)) - kMcBase;
 				const uint64_t poll = (((uint64_t)r(kGc0, 0x00b2) << 32) | r(kGc0, 0x00b3)) - kMcBase;
 				uint64_t wptr; std::memcpy(&wptr, &vram[poll], 8);
-				while (done < wptr) {
-					uint32_t p[5]; std::memcpy(p, &vram[ring + done], 20);
+				auto exec = [&](uint64_t at) -> uint64_t {   // returns bytes consumed
+					uint32_t p[6]; std::memcpy(p, &vram[at], 24);
 					if ((p[0] & 0xFF) == 2 && ((p[0] >> 8) & 0xFF) == 0) {
 						const uint64_t dst = (((uint64_t)p[2] << 32) | p[1]) - kMcBase;
 						std::memcpy(&vram[dst], &p[4], 4);
-						done += 20;
-					} else done += 4;   // NOP
-				}
+						return 20;
+					}
+					if ((p[0] & 0xFF) == 4) {   // INDIRECT: base, base_hi, length
+						ibSeen = true;
+						ibAligned = (p[1] & 0x1F) == 0 && ((at - ring) / 4 + 6) % 8 == 0;
+						const uint64_t ib = (((uint64_t)p[2] << 32) | p[1]) - kMcBase;
+						uint64_t d = 0;
+						while (d < (uint64_t)p[3] * 4) {
+							uint32_t q[5]; std::memcpy(q, &vram[ib + d], 20);
+							if ((q[0] & 0xFF) == 2) { const uint64_t dst = (((uint64_t)q[2] << 32) | q[1]) - kMcBase; std::memcpy(&vram[dst], &q[4], 4); d += 20; }
+							else d += 4;
+						}
+						return 24;
+					}
+					return 4;   // NOP
+				};
+				while (done < wptr) done += exec(ring + done);
 				const uint64_t rp = (((uint64_t)r(kGc0, 0x0088) << 32) | r(kGc0, 0x0089)) - kMcBase;
 				std::memcpy(&vram[rp], &done, 8);
 				r(kGc0, 0x0083) = (uint32_t)done;
@@ -103,6 +118,15 @@ struct Rig {
 			if (op == 0x79) {
 				uint32_t a[2]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 8);
 				regs[0xC000 + a[0]] = a[1];
+			}
+			if (op == 0x3F) {   // INDIRECT_BUFFER -> WRITE_DATA(dst_sel 5)
+				uint32_t a[3]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 12);
+				const uint64_t ib = (((uint64_t)a[1] << 32) | a[0]) - kMcBase;
+				uint32_t q[5]; std::memcpy(q, &vram[ib], 20);
+				if (((q[0] >> 8) & 0xFF) == 0x37 && ((q[1] >> 8) & 0xF) == 5 && (a[2] & 0xFFFFF) == 5) {
+					const uint64_t dst = (((uint64_t)q[3] << 32) | q[2]) - kMcBase;
+					std::memcpy(&vram[dst], &q[4], 4);
+				}
 			}
 			cpDone += n + 2;
 		}
@@ -159,6 +183,11 @@ int main() {
 		check(k.r(kGc0, 0x1df4) == 256 && cp.rbRptr == 256, "wptr/rptr = 256 dwords");
 		check((k.r(kGc1, 0x0803) & ((1u << 26) | (1u << 28))) == 0, "PFP/ME unhalted");
 		check((k.r(kGc0, 0x1e8d) & (1u << 30)) == 0 && k.r(kGc0, 0x1df1) == 0, "no doorbell, VMID 0");
+
+		N33IbReport ib {};
+		check(navi33_ib_tests(k.dev, ib) == kIOReturnSuccess && ib.sdmaPassed && ib.cpPassed, "IB tests: SDMA and CP both write through an IB");
+		check(k.ibSeen && k.ibAligned, "SDMA IB packet 32-byte base, ends on an 8-dword boundary");
+		check(k.r(kGc0, 0x0085) == 128 && k.r(kGc0, 0x1df4) == 512, "wptrs continue: SDMA 128 bytes, CP 512 dwords");
 	}
 	{
 		Rig k(true);

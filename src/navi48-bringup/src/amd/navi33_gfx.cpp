@@ -604,4 +604,96 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	return rep.passed ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
+// ============================================================================
+// Stage 6 — indirect buffers on both rings
+// ============================================================================
+namespace {
+constexpr uint64_t kIbSdmaOff     = 0x6000;   // 32-byte aligned (SDMA requirement)
+constexpr uint64_t kIbSdmaDstOff  = 0x6100;
+constexpr uint64_t kIbCpOff       = 0x6200;
+constexpr uint64_t kIbCpDstOff    = 0x6300;
+constexpr uint32_t kSdmaWptrAfterS4 = 64;     // bytes: navi33_sdma_ring_test's 16 dwords
+constexpr uint32_t kCpWptrAfterS5   = kCpPad; // dwords: navi33_cp_gfx_ring_test's 256
+constexpr uint32_t kSDMA_OP_INDIRECT = 4;     // sdma_v6_0_0_pkt_open.h
+constexpr uint32_t kPKT3_INDIRECT_BUFFER = 0x3F, kPKT3_WRITE_DATA = 0x37;   // nvd.h
+constexpr uint32_t kWRITE_DATA_DST_SEL_MEM = 5u << 8, kWR_CONFIRM = 1u << 20;
+} // namespace
+
+kern_return_t navi33_ib_tests(DeviceContext &dev, N33IbReport &rep, uint32_t timeoutUs) {
+	const uint64_t base = slot(dev);
+	auto mc = [&](uint64_t off) { return dev.vramMC(base + off); };
+
+	WBAR0_32(dev, base + kIbSdmaDstOff, 0xCAFEDEADu);
+	WBAR0_32(dev, base + kIbCpDstOff, 0xCAFEDEADu);
+
+	// SDMA IB: WRITE_LINEAR + 3 NOPs, length 8 (sdma_v6_0_ring_test_ib).
+	{
+		const uint64_t dst = mc(kIbSdmaDstOff);
+		uint32_t ib[8] = { kSDMA_OP_WRITE | (kSDMA_SUBOP_WRITE_LINEAR << 8), (uint32_t)dst, (uint32_t)(dst >> 32), 0,
+		                   kN33SdmaTestValue, 0, 0, 0 };
+		bar0_memcpy_to_vram(dev, base + kIbSdmaOff, ib, sizeof(ib));
+	}
+	// gfx IB: WRITE_DATA to memory with confirm (gfx_v11_0_ring_test_ib).
+	{
+		const uint64_t dst = mc(kIbCpDstOff);
+		uint32_t ib[5] = { pkt3(kPKT3_WRITE_DATA, 3), kWRITE_DATA_DST_SEL_MEM | kWR_CONFIRM, (uint32_t)dst,
+		                   (uint32_t)(dst >> 32), kN33SdmaTestValue };
+		bar0_memcpy_to_vram(dev, base + kIbCpOff, ib, sizeof(ib));
+	}
+
+	// SDMA ring: at dword 16, NOPs so the 6-dword IB packet ends on an 8-dword boundary
+	// ((2 - wptr) & 7 = 2), the packet, then NOPs to the 16-dword commit alignment.
+	{
+		const uint64_t ibMc = mc(kIbSdmaOff);
+		uint32_t pkt[16] = {};
+		pkt[2] = kSDMA_OP_INDIRECT | (0u << 16);       // VMID 0
+		pkt[3] = (uint32_t)ibMc & 0xFFFFFFE0u;
+		pkt[4] = (uint32_t)(ibMc >> 32);
+		pkt[5] = 8;                                   // length_dw
+		pkt[6] = 0; pkt[7] = 0;                       // CSA: none for VMID 0
+		bar0_memcpy_to_vram(dev, base + kRingOff + kSdmaWptrAfterS4, pkt, sizeof(pkt));
+	}
+	// gfx ring: at dword 256, INDIRECT_BUFFER (VMID 0, length 5), then NOPs to 512.
+	{
+		const uint64_t ibMc = mc(kIbCpOff);
+		uint32_t ring[kCpPad];
+		for (uint32_t i = 0; i < kCpPad; i++) ring[i] = kGfxNop;
+		ring[0] = pkt3(kPKT3_INDIRECT_BUFFER, 2);
+		ring[1] = (uint32_t)ibMc;
+		ring[2] = (uint32_t)(ibMc >> 32);
+		ring[3] = 5u | (0u << 24);
+		bar0_memcpy_to_vram(dev, base + kCpRingOff + kCpWptrAfterS5 * 4, ring, sizeof(ring));
+	}
+	amdgpu_hdp_flush(dev);
+
+	const uint64_t sdmaW = kSdmaWptrAfterS4 + 64;      // bytes
+	const uint32_t cpW   = kCpWptrAfterS5 + kCpPad;    // dwords
+	WBAR0_64(dev, base + kWptrOff, sdmaW);
+	WBAR0_64(dev, base + kCpWptrOff, cpW);
+	amdgpu_hdp_flush(dev);
+	WREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR), (uint32_t)sdmaW);
+	WREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR_HI), 0);
+	WREG32(dev, gc0(dev, C::CP_RB0_WPTR), cpW);
+	WREG32(dev, gc0(dev, C::CP_RB0_WPTR_HI), 0);
+
+	rep.sdmaPassed = rep.cpPassed = false;
+	rep.sdmaWaitedUs = rep.cpWaitedUs = timeoutUs;
+	for (uint32_t us = 0; us < timeoutUs && !(rep.sdmaPassed && rep.cpPassed); us += 10) {
+		if (!rep.sdmaPassed && RBAR0_32(dev, base + kIbSdmaDstOff) == kN33SdmaTestValue) { rep.sdmaPassed = true; rep.sdmaWaitedUs = us; }
+		if (!rep.cpPassed && RBAR0_32(dev, base + kIbCpDstOff) == kN33SdmaTestValue) { rep.cpPassed = true; rep.cpWaitedUs = us; }
+		IODelay(10);
+	}
+	rep.sdmaValue   = RBAR0_32(dev, base + kIbSdmaDstOff);
+	rep.cpValue     = RBAR0_32(dev, base + kIbCpDstOff);
+	rep.sdmaRptr    = RREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_RPTR));
+	rep.cpRptr      = RREG32(dev, gc0(dev, C::CP_RB0_RPTR));
+	rep.faultStatus = RREG32(dev, gc0(dev, R::GCVM_L2_PROTECTION_FAULT_STATUS));
+	rep.stage = rep.sdmaPassed && rep.cpPassed ? "ib-ok" :
+	            rep.sdmaPassed ? "ib-sdma-ok-cp-timeout" : rep.cpPassed ? "ib-cp-ok-sdma-timeout" : "ib-timeout";
+	UCODE_LOG("navi33-gfx: IB tests — SDMA %s (%#x, %u us, rptr %#x), CP %s (%#x, %u us, rptr %#x), VM fault %#x",
+	          rep.sdmaPassed ? "ok" : "FAILED", rep.sdmaValue, rep.sdmaWaitedUs, rep.sdmaRptr,
+	          rep.cpPassed ? "ok" : "FAILED", rep.cpValue, rep.cpWaitedUs, rep.cpRptr, rep.faultStatus);
+	return rep.sdmaPassed && rep.cpPassed ? kIOReturnSuccess : kIOReturnTimeout;
+}
+
 } // namespace amdgpu

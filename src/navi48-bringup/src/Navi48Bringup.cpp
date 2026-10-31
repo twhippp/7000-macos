@@ -564,6 +564,7 @@ void Navi48Bringup::publishNavi33Summary() {
 		num("CP,Scratch", v); num("CP,WaitedUs", us);
 		add(" | S5 %s (read 0x%08x after %llu us)", s5, (uint32_t)v, (unsigned long long)us);
 	}
+	if (const char *s6 = str("IB,Stage6")) add(" | S6 %s", s6);
 	setProperty("N33,Summary", sum);
 	setProperty("N33,Warnings", w ? warn : "none");
 	N48LOG("navi33: %s | warnings: %s", sum, w ? warn : "none");
@@ -699,7 +700,7 @@ void Navi48Bringup::navi33SmuFeatures() {
 // feature enable (navi33SmuFeatures; navi33-smu-basic=1 skips it), and the read-only wait
 // for the RLC autoload to finish (gfx_v11_0_hw_init). navi33-psp=4 adds the first command
 // (GFXHUB VMID 0 + SDMA0 ring test, navi33_gfx.cpp); navi33-psp=5 the graphics CP ring
-// test. Stops before any
+// test; navi33-psp=6 indirect-buffer tests on both rings. Stops before any
 // CP/GFX ring programming. Every step publishes its own property, so one boot shows
 // exactly where it stopped. Like Linux, a non-zero PSP status at 3+ is recorded and the
 // sequence carries on; only a PSP that stops answering ends it.
@@ -933,6 +934,22 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	setProperty("CP,ME_CNTL_After", static_cast<uint64_t>(c.meCntlAfter), 32);
 	setProperty("CP,Stage5", c.stage);
 	N48LOG("psp-stage5: %s", c.stage);
+	if (level < 6) return;
+	if (!c.passed) { setProperty("IB,Stage6", "skipped-cp-failed"); return; }
+
+	// 10. Stage 6 — indirect buffers, the way all real work is submitted: each ring jumps
+	//     to a small command buffer in VRAM that writes 0xDEADBEEF.
+	amdgpu::N33IbReport ib {};
+	(void)amdgpu::navi33_ib_tests(dev, ib);
+	setProperty("IB,SdmaValue", static_cast<uint64_t>(ib.sdmaValue), 32);
+	setProperty("IB,CpValue", static_cast<uint64_t>(ib.cpValue), 32);
+	setProperty("IB,SdmaWaitedUs", static_cast<uint64_t>(ib.sdmaWaitedUs), 32);
+	setProperty("IB,CpWaitedUs", static_cast<uint64_t>(ib.cpWaitedUs), 32);
+	setProperty("IB,SdmaRptr", static_cast<uint64_t>(ib.sdmaRptr), 32);
+	setProperty("IB,CpRptr", static_cast<uint64_t>(ib.cpRptr), 32);
+	setProperty("IB,FaultStatus", static_cast<uint64_t>(ib.faultStatus), 32);
+	setProperty("IB,Stage6", ib.stage);
+	N48LOG("psp-stage6: %s", ib.stage);
 }
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware

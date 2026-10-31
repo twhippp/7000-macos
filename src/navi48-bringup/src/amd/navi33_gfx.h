@@ -91,4 +91,19 @@ bool navi33_cp_fw_from_blobs(const uint8_t *pfp, size_t pfpSize, const uint8_t *
 kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33CpReport &rep,
                                       uint32_t timeoutUs = 100000);
 
+// ---- stage 6: indirect buffers (the path all real work takes) ----
+//
+// gfx_v11_0_ring_test_ib + sdma_v6_0_ring_test_ib: each ring gets an INDIRECT_BUFFER
+// packet pointing at a small command buffer in VRAM, and that buffer writes 0xDEADBEEF
+// into a VRAM slot. Continues each ring where stages 4 and 5 left it.
+struct N33IbReport {
+	bool     sdmaPassed, cpPassed;
+	uint32_t sdmaValue, cpValue;
+	uint32_t sdmaWaitedUs, cpWaitedUs;
+	uint32_t sdmaRptr, cpRptr;
+	uint32_t faultStatus;
+	const char *stage;
+};
+kern_return_t navi33_ib_tests(DeviceContext &dev, N33IbReport &rep, uint32_t timeoutUs = 100000);
+
 } // namespace amdgpu
