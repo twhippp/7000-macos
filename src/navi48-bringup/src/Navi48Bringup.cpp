@@ -4,6 +4,7 @@
 //
 #include "Navi48Bringup.hpp"
 #include "amd/navi33_fw.h"
+#include "amd/navi33_gfx.h"
 #include "apple/Navi48Ttl.hpp"
 #include "apple/AppleTtlHook.hpp"
 #include "apple/AppleHardwareHook.hpp"
@@ -636,7 +637,8 @@ void Navi48Bringup::navi33SmuFeatures() {
 // a PMFW-centralised part (MP0 13.0.7): ring_create, tmr_init, load_smu_fw, tmr_load.
 // navi33-psp=3 (or higher): + every GFX/SDMA/MES/IMU/RLC firmware, AUTOLOAD_RLC, the SMU
 // feature enable (navi33SmuFeatures; navi33-smu-basic=1 skips it), and the read-only wait
-// for the RLC autoload to finish (gfx_v11_0_hw_init). Stops before any
+// for the RLC autoload to finish (gfx_v11_0_hw_init). navi33-psp=4 adds the first command
+// (GFXHUB VMID 0 + SDMA0 ring test, navi33_gfx.cpp). Stops before any
 // CP/GFX ring programming. Every step publishes its own property, so one boot shows
 // exactly where it stopped. Like Linux, a non-zero PSP status at 3+ is recorded and the
 // sequence carries on; only a PSP that stops answering ends it.
@@ -814,6 +816,36 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	                               : "autoload-not-complete");
 	N48LOG("psp-stage3: %u/%u firmware accepted, autoload %s (CP_STAT 0x%08x, BOOTLOAD 0x%08x)",
 	       rep.accepted, rep.total, done ? "COMPLETE" : "not complete", cpStat, bootload);
+	if (level < 4) return;
+	if (!done) { setProperty("SDMA,Stage4", "skipped-autoload-not-complete"); return; }
+
+	// 8. Stage 4 — the first command (navi33_gfx.cpp): GFXHUB VMID 0, SDMA0 queue 0, and
+	//    Linux's SDMA ring test (WRITE_LINEAR 0xDEADBEEF into VRAM).
+	//    Keep the GFX block powered for it: Linux holds GFXOFF off during init
+	//    (gfx_off_req_count starts at 1); say so explicitly to the PMFW.
+	setProperty("SDMA,Stage4", "requested");
+	setProperty("SMU,DisallowGfxOffResp",
+	            static_cast<uint64_t>(smuMailbox(0x29 /* PPSMC_MSG_DisallowGfxOff */, 0, nullptr, 2000)), 32);
+	amdgpu::N33GfxReport g {};
+	r = amdgpu::navi33_gfxhub_enable(dev, g);
+	setProperty("GFXHUB,FbStart", g.fbStart, 64);
+	setProperty("GFXHUB,FbOffset", g.fbOffset, 64);
+	setProperty("GFXHUB,PrevL1TlbCntl", static_cast<uint64_t>(g.prevL1TlbCntl), 32);
+	setProperty("GFXHUB,PrevSysApLow", static_cast<uint64_t>(g.prevSysApLow), 32);
+	setProperty("GFXHUB,TlbFlushAcked", g.tlbFlushAcked);
+	if (r != kIOReturnSuccess) { setProperty("SDMA,Stage4", g.stage); return; }
+	r = amdgpu::navi33_sdma_ring_test(dev, g);
+	setProperty("SDMA,TestValue", static_cast<uint64_t>(g.testValue), 32);
+	setProperty("SDMA,WaitedUs", static_cast<uint64_t>(g.waitedUs), 32);
+	setProperty("SDMA,RptrWriteback", g.rptrWriteback, 64);
+	setProperty("SDMA,RB_RPTR", static_cast<uint64_t>(g.rbRptr), 32);
+	setProperty("SDMA,STATUS", static_cast<uint64_t>(g.statusReg), 32);
+	setProperty("SDMA,F32Before", static_cast<uint64_t>(g.f32CntlBefore), 32);
+	setProperty("SDMA,F32After", static_cast<uint64_t>(g.f32CntlAfter), 32);
+	setProperty("GFXHUB,FaultStatus", static_cast<uint64_t>(g.faultStatus), 32);
+	setProperty("GFXHUB,FaultAddr", g.faultAddr, 64);
+	setProperty("SDMA,Stage4", g.stage);
+	N48LOG("psp-stage4: %s", g.stage);
 }
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware

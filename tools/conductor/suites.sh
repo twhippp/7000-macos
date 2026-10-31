@@ -77,6 +77,7 @@ run psp_gen clang++ $W $SAN -I src/navi48-bringup/hosttest/shim -I src/navi48-br
 # SETUP_TMR (boot_time_tmr=false upstream) with the upstream buffer/physical addresses; 14.0.3 still skips it.
 run psp_ring clang++ $W $SAN -pthread -I src/navi48-bringup/hosttest/shim -I src/navi48-bringup/src -I src/navi48-bringup/src/amd $T/psp_ring_test.cpp -- src/navi48-bringup/src/amd/psp_v14_0.cpp src/navi48-bringup/src/amd/amdgpu_mmhub.cpp
 run navi33_fw clang++ $W $SAN -pthread -I src/navi48-bringup/hosttest/shim -I src/navi48-bringup/src -I src/navi48-bringup/src/amd $T/navi33_fw_test.cpp -- src/navi48-bringup/src/amd/navi33_fw.cpp src/navi48-bringup/src/amd/amdgpu_ucode_extract.cpp src/navi48-bringup/src/amd/psp_v14_0.cpp src/navi48-bringup/src/amd/amdgpu_mmhub.cpp
+run navi33_gfx clang++ $W $SAN -pthread -I src/navi48-bringup/hosttest/shim -I src/navi48-bringup/src -I src/navi48-bringup/src/amd $T/navi33_gfx_test.cpp -- src/navi48-bringup/src/amd/navi33_gfx.cpp
 run ctx_latch clang++ $W $SAN -I $A $T/ctx_latch_test.cpp --
 run dcn_liveraster clang++ $W $SAN -I $A -I src/navi48-bringup/src/dcn -I src/dcn41 -x c++ $T/dcn_liveraster_test.cpp src/dcn41/dcn41_core.c src/dcn41/dcn41_otg.c -- src/navi48-bringup/src/dcn/navi48_dcn.cpp src/navi48-bringup/src/Navi48Bringup.cpp $A/DisplayPipeGuard.cpp
 run display_pipe_guard clang++ $Wn -I $A $T/display_pipe_guard_test.cpp --

@@ -37,6 +37,11 @@ static inline void IOSleep(unsigned milliseconds) {
     usleep(milliseconds * 1000u);
 }
 
+// IODelay(unsigned microseconds) -> usleep.
+static inline void IODelay(unsigned microseconds) {
+    usleep(microseconds);
+}
+
 // IOMalloc/IOFree -> malloc/free (kernel signature takes a size on free too;
 // the host allocator doesn't need it, so it's just ignored).
 static inline void *IOMalloc(size_t size) {
