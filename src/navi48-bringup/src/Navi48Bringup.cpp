@@ -588,6 +588,11 @@ void Navi48Bringup::publishNavi33Summary() {
 		num("SHADER,Width", w); num("SHADER,Height", h); num("SHADER,WaitedUs", us);
 		add(" | S10 %s (%llux%llu in %llu us)", s10, (unsigned long long)w, (unsigned long long)h, (unsigned long long)us);
 	}
+	if (const char *s11 = str("GFXSTATE,Stage11")) {
+		uint64_t rp = 0, us = 0;
+		num("GFXSTATE,Rptr", rp); num("GFXSTATE,WaitedUs", us);
+		add(" | S11 %s (rptr %llu after %llu us)", s11, (unsigned long long)rp, (unsigned long long)us);
+	}
 	setProperty("N33,Summary", sum);
 
 	// N33,Result: the first stage that did not reach its success state.
@@ -603,6 +608,7 @@ void Navi48Bringup::publishNavi33Summary() {
 		{ "SCREEN,Stage8", "screen-ok", "off" },
 		{ "GFXQ,Stage9",   "gfx-queue-ok", nullptr },
 		{ "SHADER,Stage10", "shader-ok", nullptr },
+		{ "GFXSTATE,Stage11", "gfx-state-ok", nullptr },
 	};
 	uint64_t cap = 99;
 	num("N33,StopAfter", cap);
@@ -1111,6 +1117,22 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	setProperty("SHADER,FirstBadValue", static_cast<uint64_t>(sr.firstBadValue), 32);
 	setProperty("SHADER,Stage10", sr.stage);
 	N48LOG("psp-stage10: %s", sr.stage);
+	if (level < 11) return;
+
+	// 15. Stage 11 — finish the graphics engine setup the way Linux leaves it for Mesa:
+	//     golden regs, per-VMID SH_MEM/GDS, the RLC clear-state buffer + SRM, and the
+	//     clear-state preamble on the gfx queue, checked by a marker write behind it.
+	amdgpu::N33StateReport st {};
+	(void)amdgpu::navi33_gfx_state_init(dev, st);
+	setProperty("GFXSTATE,CsbDwords", static_cast<uint64_t>(st.csbDwords), 32);
+	setProperty("GFXSTATE,SrmCntl", static_cast<uint64_t>(st.srmCntl), 32);
+	setProperty("GFXSTATE,WptrBefore", static_cast<uint64_t>(st.gfxWptrBefore), 32);
+	setProperty("GFXSTATE,WptrAfter", static_cast<uint64_t>(st.gfxWptrAfter), 32);
+	setProperty("GFXSTATE,Rptr", static_cast<uint64_t>(st.gfxRptr), 32);
+	setProperty("GFXSTATE,Scratch", static_cast<uint64_t>(st.scratch), 32);
+	setProperty("GFXSTATE,WaitedUs", static_cast<uint64_t>(st.waitedUs), 32);
+	setProperty("GFXSTATE,Stage11", st.stage);
+	N48LOG("psp-stage11: %s", st.stage);
 }
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware

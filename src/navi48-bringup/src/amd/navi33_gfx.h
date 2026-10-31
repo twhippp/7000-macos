@@ -27,7 +27,7 @@
 namespace amdgpu {
 
 constexpr uint64_t kN33GfxVramOffset = 0x1A00000;   // from dev.vramBase (26 MiB; fw_buf is 16-24 MiB)
-constexpr uint64_t kN33GfxVramSize   = 0x10000;     // 64 KiB
+constexpr uint64_t kN33GfxVramSize   = 0x20000;     // 128 KiB
 constexpr uint32_t kN33SdmaTestValue = 0xDEADBEEFu;
 
 struct N33GfxReport {
@@ -204,5 +204,25 @@ struct N33ShaderReport {
 kern_return_t navi33_shader_test(DeviceContext &dev, uint64_t fbOff, uint64_t fbLen, uint64_t fbRowBytes,
                                  uint32_t fbWidth, uint32_t fbHeight, bool toScreen, N33ShaderReport &rep,
                                  uint32_t timeoutUs = 2000000);
+
+// ---- stage 11: the graphics engine's base state, the way Linux leaves it for Mesa ----
+//
+// What the kernel driver does before userspace draws (gfx_v11_0_hw_init, the parts the
+// queue tests did not need): golden registers (golden_settings_gc_11_0), constants_init
+// (GRBM read timeout, SH_MEM_CONFIG/BASES for every VMID, GDS/GWS/OA closed for VMIDs
+// 1-15), rlc_resume on the PSP path (the clear-state buffer from clearstate_gfx11.h at
+// RLC_CSIB_*, SRM on), and cp_gfx_start's clear-state preamble on the gfx queue
+// (PREAMBLE begin, CONTEXT_CONTROL, every context register, END, CLEAR_STATE). A register
+// write after the preamble proves the engine accepted all of it.
+struct N33StateReport {
+	uint32_t csbDwords;
+	uint32_t srmCntl;            // RLC_SRM_CNTL after enabling
+	uint32_t gfxWptrBefore, gfxWptrAfter, gfxRptr;
+	uint32_t scratch;
+	uint32_t waitedUs;
+	bool     passed;
+	const char *stage;
+};
+kern_return_t navi33_gfx_state_init(DeviceContext &dev, N33StateReport &rep, uint32_t timeoutUs = 200000);
 
 } // namespace amdgpu

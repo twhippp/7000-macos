@@ -131,16 +131,20 @@ struct Rig {
 	}
 
 	// The gfx queue programmed through its HQD registers (doorbell 0x116).
+	std::vector<uint32_t> gfxPreamble; uint32_t gfxCtxRegs = 0, gfxClearState = 0;
 	void runKiq() {
 		if (!(r(kGc0, 0x1e80) & 1u)) return;
 		const uint64_t gfxRingNow = ((((uint64_t)r(kGc0, 0x1e87)) << 32 | r(kGc0, 0x1e86)) << 8) - kMcBase;
 		uint64_t gw; std::memcpy(&gw, &db[0x116 * 4], 8);
 		while (gfxDone < gw) {
-			uint32_t h; std::memcpy(&h, &vram[gfxRingNow + gfxDone * 4], 4);
+			auto at = [&](uint64_t i) { uint32_t v; std::memcpy(&v, &vram[gfxRingNow + (i % 2048) * 4], 4); return v; };
+			const uint32_t h = at(gfxDone);
 			const uint32_t op = (h >> 8) & 0xFF, n = (h >> 16) & 0x3FFF;
 			if (op == 0x10 && n == 0x3FFF) { gfxDone += 1; continue; }
-			uint32_t a[2]; std::memcpy(a, &vram[gfxRingNow + (gfxDone + 1) * 4], 8);
-			if (op == 0x79) regs[0xC000 + a[0]] = a[1];
+			if (op == 0x4A) gfxPreamble.push_back(at(gfxDone + 1));
+			if (op == 0x69) gfxCtxRegs += n;
+			if (op == 0x12) gfxClearState++;
+			if (op == 0x79 && gfxPreamble.size() != 1) regs[0xC000 + at(gfxDone + 1)] = at(gfxDone + 2);
 			gfxDone += n + 2;
 		}
 		r(kGc0, 0x1e88) = (uint32_t)gfxDone;
@@ -321,7 +325,7 @@ int main() {
 		check(gq.gfxHqdActive == 1 && gq.gfxRptr == 256, "  ...gfx HQD active, rptr 256");
 		check(((k.r(kGc0, 0x1e8d) >> 2) & 0x3FFFFFF) == 0x116 && (k.r(kGc0, 0x1e8d) & (1u << 30)), "  ...gfx doorbell 0x116 enabled");
 		const uint64_t gb = ((((uint64_t)k.r(kGc0, 0x1e87)) << 32) | k.r(kGc0, 0x1e86)) << 8;
-		check(gb == kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0xD000, "  ...gfx HQD base = the gfx ring");
+		check(gb == kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0x10000, "  ...gfx HQD base = the gfx ring");
 		check(k.r(kGc0, 0x1e7e) == (uint32_t)(kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0xF000), "  ...CP_GFX_MQD_BASE_ADDR = the MQD");
 		N33ShaderReport sr {};
 		const uint64_t fbOff = 0, fbW = 640, fbH = 64, fbRow = 704 * 4;   // a pitched fake console
@@ -332,6 +336,16 @@ int main() {
 		N33ShaderReport on {};
 		check(navi33_shader_test(k.dev, fbOff, fbRow * fbH, fbRow, fbW, fbH, true, on) == kIOReturnSuccess &&
 		      on.onScreen && on.targetOff == fbOff, "  ...navi33-draw-screen paints the console itself");
+		N33StateReport st {};
+		check(navi33_gfx_state_init(k.dev, st) == kIOReturnSuccess && std::strcmp(st.stage, "gfx-state-ok") == 0,
+		      "stage 11: clear-state preamble accepted on the gfx queue");
+		check(st.csbDwords == 960 && k.r(kGc1, 0x989) == 960 && (st.srmCntl & 3u) == 3u, "  ...CSB 960 dwords, CSIB length, SRM on");
+		const uint64_t csbMc = ((uint64_t)k.r(kGc1, 0x988) << 32) | k.r(kGc1, 0x987);
+		check(csbMc == kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0x12000, "  ...CSIB address = the CSB");
+		check(k.gfxPreamble.size() == 2 && k.gfxPreamble[0] == (2u << 28) && k.gfxPreamble[1] == (3u << 28) &&
+		      k.gfxCtxRegs == 934 + 1 && k.gfxClearState == 1, "  ...begin, 935 context regs, end, CLEAR_STATE");
+		check(st.gfxWptrBefore == 256 && st.gfxWptrAfter == 1280 && st.gfxRptr == 1280, "  ...gfx wptr 256 -> 1280, rptr caught up");
+		check(k.r(kGc0, 0xda0) & 0xFFu, "  ...GRBM read timeout set");
 		N33GfxQReport none {};
 		DeviceContext d2 = k.dev; d2.bar2 = nullptr;
 		check(navi33_gfx_queue_test(d2, none) == kIOReturnNotReady, "  ...no BAR2 -> refuses");

@@ -6,6 +6,7 @@
 #include "navi33_gfx.h"
 #include "amdgpu_log.h"
 #include "amdgpu_ucode_psp.h"
+#include "navi33_clearstate.h"
 
 namespace amdgpu {
 
@@ -1194,7 +1195,9 @@ kern_return_t navi33_screen_test(DeviceContext &dev, uint64_t fbOff, uint64_t fb
 // ============================================================================
 namespace {
 constexpr uint32_t kCpWptrAfterS7 = kCpWptrAfterS6 + kCpPad;            // dwords on the compute queue
-constexpr uint64_t kGfxRingOff = 0xD000;                                // 4 KiB
+constexpr uint64_t kGfxRingOff = 0x10000;                               // 8 KiB = 2048 dwords
+constexpr uint32_t kGfxRingBytes = 0x2000;
+constexpr uint64_t kCsbOff = 0x12000;                                   // 4 KiB clear-state buffer
 constexpr uint64_t kGfxMqdOff  = 0xF000;                                // 2 KiB
 constexpr uint64_t kGfxRptrOff = 0xF810, kGfxWptrOff = 0xF818;
 static_assert(kGfxWptrOff + 8 <= kN33GfxVramSize, "stage 9 stays inside the slot");
@@ -1225,6 +1228,8 @@ constexpr F GMQD_VMID { 0x0, 0x0000000F }, GMQD_PRIV_STATE { 0x8, 0x00000100 }, 
 constexpr F GQ_QUANTUM_EN { 0x0, 0x00000001 }, GQ_PRIORITY_LEVEL { 0x0, 0x0000000F };
 constexpr F GHQD_RB_BUFSZ { 0x0, 0x0000003F }, GHQD_RB_BLKSZ { 0x8, 0x00003F00 }, GHQD_KMD_QUEUE { 0x1d, 0x20000000 };
 constexpr F RBDB_OFFSET { 0x2, 0x0FFFFFFC }, RBDB_EN { 0x1e, 0x40000000 };
+
+uint32_t gGfxWptrDw = 0;   // the gfx queue's wptr (dwords) after the last commit
 
 void ring64(DeviceContext &dev, uint32_t doorbell, uint64_t v) {
 	if (!gfxDoorbellReady(dev)) return;
@@ -1280,7 +1285,7 @@ kern_return_t navi33_gfx_queue_test(DeviceContext &dev, N33GfxQReport &rep, uint
 	}
 
 	// ---- 2. the gfx queue's MQD (gfx_v11_0_gfx_mqd_init) ----
-	bar0_memset_vram(dev, base + kGfxRingOff, kGfxNop, 0x1000);
+	bar0_memset_vram(dev, base + kGfxRingOff, kGfxNop, kGfxRingBytes);
 	bar0_memset_vram(dev, base + kGfxMqdOff, 0u, 0x800);
 	WBAR0_64(dev, base + kGfxRptrOff, 0);
 	WBAR0_64(dev, base + kGfxWptrOff, 0);
@@ -1299,7 +1304,8 @@ kern_return_t navi33_gfx_queue_test(DeviceContext &dev, N33GfxQReport &rep, uint
 	q[GM::rptr_addr_hi] = (uint32_t)(grptr >> 32) & 0xffffu;
 	q[GM::wptr_poll_lo] = (uint32_t)gwptr & 0xfffffffcu;
 	q[GM::wptr_poll_hi] = (uint32_t)(gwptr >> 32) & 0xffffu;
-	constexpr uint32_t bufsz = 9;                       // order_base_2(4096 / 4) - 1
+	constexpr uint32_t bufsz = 10;                      // order_base_2(8192 / 4) - 1
+	static_assert(kGfxRingBytes / 4 == (2u << bufsz), "gfx HQD RB_BUFSZ");
 	q[GM::hqd_cntl] = setf(setf(setf(kGFX_HQD_CNTL_DEFAULT, GHQD_RB_BUFSZ, bufsz), GHQD_RB_BLKSZ, bufsz - 2), GHQD_KMD_QUEUE, 1);
 	q[GM::rb_doorbell_control] = setf(setf(kRB_DOORBELL_CONTROL_DEFAULT, RBDB_OFFSET, kGfxDoorbell), RBDB_EN, 1);
 	q[GM::rptr] = 0;
@@ -1340,6 +1346,7 @@ kern_return_t navi33_gfx_queue_test(DeviceContext &dev, N33GfxQReport &rep, uint
 	WBAR0_64(dev, base + kGfxWptrOff, kCpPad);
 	amdgpu_hdp_flush(dev);
 	ring64(dev, kGfxDoorbell, kCpPad);
+	gGfxWptrDw = kCpPad;
 	uint32_t us = 0;
 	for (; us < timeoutUs; us += 10) {
 		if (RREG32(dev, scratch) == 0xDEADBEEFu) { rep.passed = true; break; }
@@ -1496,6 +1503,128 @@ kern_return_t navi33_shader_test(DeviceContext &dev, uint64_t fbOff, uint64_t fb
 	          rep.width, rep.height, (unsigned long long)rep.targetOff, rep.onScreen ? " (screen)" : "",
 	          rep.fence, us, rep.mismatches, rep.sampled, rep.stage);
 	return rep.passed ? kIOReturnSuccess : kIOReturnIOError;
+}
+
+// ============================================================================
+// Stage 11 — base graphics state (golden, constants, CSB/SRM, clear-state preamble)
+// ============================================================================
+namespace {
+constexpr uint32_t kPKT3_CLEAR_STATE = 0x12, kPKT3_CONTEXT_CONTROL = 0x28, kPKT3_PREAMBLE_CNTL = 0x4A;
+constexpr uint32_t kPKT3_SET_CONTEXT_REG = 0x69, kSET_CONTEXT_REG_START = 0xa000;
+constexpr uint32_t kPREAMBLE_BEGIN_CLEAR_STATE = 2u << 28, kPREAMBLE_END_CLEAR_STATE = 3u << 28;
+namespace K {   // gc_11_0_0_offset.h
+	constexpr uint32_t GRBM_CNTL = 0x0da0, GDS_VMID0_BASE = 0x20a0, GDS_VMID0_SIZE = 0x20a1;   // BASE_IDX 0
+	constexpr uint32_t GDS_GWS_VMID0 = 0x20c0, GDS_OA_VMID0 = 0x20d0;                         // BASE_IDX 0
+	constexpr uint32_t RLC_CSIB_ADDR_LO = 0x0987, RLC_CSIB_ADDR_HI = 0x0988, RLC_CSIB_LENGTH = 0x0989;   // 1
+	constexpr uint32_t RLC_SRM_CNTL = 0x4c80, TCP_CNTL = 0x19a2, PA_SC_TILE_STEERING_OVERRIDE = 0x00d7;   // 1
+}
+constexpr uint32_t kSRM_ENABLE = 0x1, kSRM_AUTO_INCR_ADDR = 0x2;
+// gfx_v11_0_get_csb_size: 2 + 3 + sum(2 + count) + 3 + 2 + 2
+uint32_t csbSize() {
+	uint32_t n = 5 + 3 + 4;
+	for (const auto &e : n33cs::kContext) n += 2 + e.count;
+	return n;
+}
+constexpr uint32_t kCsbMaxDwords = 1000;   // 960 today; ring block is 1024 incl. marker
+
+// gfx_v11_0_get_csb_buffer (amdgpu_gfx_csb_preamble_start / data_parser / preamble_end)
+uint32_t buildCsb(const DeviceContext &dev, uint32_t *b) {
+	uint32_t c = 0;
+	b[c++] = pkt3(kPKT3_PREAMBLE_CNTL, 0);
+	b[c++] = kPREAMBLE_BEGIN_CLEAR_STATE;
+	b[c++] = pkt3(kPKT3_CONTEXT_CONTROL, 1);
+	b[c++] = 0x80000000u;
+	b[c++] = 0x80000000u;
+	for (const auto &e : n33cs::kContext) {
+		b[c++] = pkt3(kPKT3_SET_CONTEXT_REG, e.count);
+		b[c++] = e.regIndex - kSET_CONTEXT_REG_START;
+		for (uint32_t i = 0; i < e.count; i++) b[c++] = e.values[i];
+	}
+	b[c++] = pkt3(kPKT3_SET_CONTEXT_REG, 1);
+	b[c++] = gc1(dev, K::PA_SC_TILE_STEERING_OVERRIDE) - kSET_CONTEXT_REG_START;
+	b[c++] = 0;                                         // pa_sc_tile_steering_override (constants_init)
+	b[c++] = pkt3(kPKT3_PREAMBLE_CNTL, 0);
+	b[c++] = kPREAMBLE_END_CLEAR_STATE;
+	b[c++] = pkt3(kPKT3_CLEAR_STATE, 0);
+	b[c++] = 0;
+	return c;
+}
+} // namespace
+
+kern_return_t navi33_gfx_state_init(DeviceContext &dev, N33StateReport &rep, uint32_t timeoutUs) {
+	rep = N33StateReport{};
+	rep.stage = "gfx-state";
+	if (!gfxDoorbellReady(dev) || gGfxWptrDw == 0) { rep.stage = "no-gfx-queue"; return kIOReturnNotReady; }
+	const uint64_t base = slot(dev);
+	auto g0 = [&](uint32_t r) { return gc0(dev, r); };
+	auto g1 = [&](uint32_t r) { return gc1(dev, r); };
+
+	// golden_settings_gc_11_0: TCP_CNTL bit 29
+	WREG32(dev, g1(K::TCP_CNTL), (RREG32(dev, g1(K::TCP_CNTL)) & ~0x20000000u) | 0x20000000u);
+
+	// gfx_v11_0_constants_init
+	WREG32(dev, g0(K::GRBM_CNTL), (RREG32(dev, g0(K::GRBM_CNTL)) & ~0xFFu) | 0xFFu);   // READ_TIMEOUT
+	for (uint32_t vmid = 0; vmid < 16; vmid++) {
+		grbm_select(dev, 0, 0, 0, vmid);
+		WREG32(dev, g1(S::SH_MEM_CONFIG), kDefaultShMemConfig);
+		if (vmid)   // private aperture 0x1000_0000_0000_0000, shared 0x2000_... (gmc_v11_0), >> 48
+			WREG32(dev, g1(S::SH_MEM_BASES), 0x1000u | (0x2000u << 16));
+	}
+	grbm_select(dev, 0, 0, 0, 0);
+	for (uint32_t vmid = 1; vmid < 16; vmid++) {             // gfx_v11_0_init_gds_vmid
+		WREG32(dev, g0(K::GDS_VMID0_BASE) + 2 * vmid, 0);
+		WREG32(dev, g0(K::GDS_VMID0_SIZE) + 2 * vmid, 0);
+		WREG32(dev, g0(K::GDS_GWS_VMID0) + vmid, 0);
+		WREG32(dev, g0(K::GDS_OA_VMID0) + vmid, 0);
+	}
+
+	// gfx_v11_0_rlc_resume (PSP): init_csb + rlc_enable_srm
+	if (csbSize() > kCsbMaxDwords) { rep.stage = "csb-too-big"; return kIOReturnNoSpace; }
+	static uint32_t csb[kCsbMaxDwords];
+	rep.csbDwords = buildCsb(dev, csb);
+	bar0_memcpy_to_vram(dev, base + kCsbOff, csb, rep.csbDwords * 4);
+	amdgpu_hdp_flush(dev);
+	const uint64_t csbMc = dev.vramMC(base + kCsbOff);
+	WREG32(dev, g1(K::RLC_CSIB_ADDR_HI), (uint32_t)(csbMc >> 32));
+	WREG32(dev, g1(K::RLC_CSIB_ADDR_LO), (uint32_t)csbMc & 0xfffffffcu);
+	WREG32(dev, g1(K::RLC_CSIB_LENGTH), rep.csbDwords);
+	WREG32(dev, g1(K::RLC_SRM_CNTL), RREG32(dev, g1(K::RLC_SRM_CNTL)) | kSRM_AUTO_INCR_ADDR | kSRM_ENABLE);
+	rep.srmCntl = RREG32(dev, g1(K::RLC_SRM_CNTL));
+
+	// gfx_v11_0_cp_gfx_start: the clear-state preamble on the gfx queue, then a marker.
+	const uint32_t scratch = g1(C::SCRATCH_REG0);
+	WREG32(dev, scratch, 0xCAFEDEADu);
+	constexpr uint32_t kBlock = 1024;                          // 960 + marker, padded with NOPs
+	static_assert(kCsbMaxDwords + 3 <= kBlock, "preamble block");
+	static uint32_t blk[kBlock];
+	for (uint32_t i = 0; i < kBlock; i++) blk[i] = kGfxNop;
+	for (uint32_t i = 0; i < rep.csbDwords; i++) blk[i] = csb[i];
+	blk[rep.csbDwords + 0] = pkt3(kPKT3_SET_UCONFIG_REG, 1);
+	blk[rep.csbDwords + 1] = scratch - kSET_UCONFIG_REG_START;
+	blk[rep.csbDwords + 2] = 0x5747E0CEu;
+	rep.gfxWptrBefore = gGfxWptrDw;
+	for (uint32_t i = 0; i < kBlock; i++)
+		WBAR0_32(dev, base + kGfxRingOff + (uint64_t)((gGfxWptrDw + i) % (kGfxRingBytes / 4)) * 4, blk[i]);
+	const uint32_t nw = gGfxWptrDw + kBlock;
+	WBAR0_64(dev, base + kGfxWptrOff, nw);
+	amdgpu_hdp_flush(dev);
+	ring64(dev, kGfxDoorbell, nw);
+	gGfxWptrDw = nw;
+	rep.gfxWptrAfter = nw;
+
+	uint32_t us = 0;
+	for (; us < timeoutUs; us += 10) {
+		if (RREG32(dev, scratch) == 0x5747E0CEu) { rep.passed = true; break; }
+		IODelay(10);
+	}
+	rep.waitedUs = us;
+	rep.scratch = RREG32(dev, scratch);
+	grbm_select(dev, 0, 0, 0, 0);
+	rep.gfxRptr = RREG32(dev, g0(G::CP_GFX_HQD_RPTR));
+	rep.stage = rep.passed ? "gfx-state-ok" : "gfx-state-timeout";
+	UCODE_LOG("navi33-gfx: base state — CSB %u dwords, SRM %#x, preamble on gfx queue %u->%u, rptr %u, scratch %#x after %u us -> %s",
+	          rep.csbDwords, rep.srmCntl, rep.gfxWptrBefore, rep.gfxWptrAfter, rep.gfxRptr, rep.scratch, us, rep.stage);
+	return rep.passed ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
 } // namespace amdgpu
