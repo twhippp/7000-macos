@@ -972,6 +972,7 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	amdgpu::N33CpReport c {};
 	(void)amdgpu::navi33_cp_gfx_ring_test(dev, cpfw, c);
 	setProperty("CP,DoorbellUsed", c.doorbellUsed);
+	setProperty("CP,HqdActive", static_cast<uint64_t>(c.hqdActive), 32);
 	setProperty("CP,DoorbellAperBefore", static_cast<uint64_t>(c.aperEnBefore), 32);
 	setProperty("CP,S2A0Before", static_cast<uint64_t>(c.s2a0Before), 32);
 	setProperty("CP,S2A3Before", static_cast<uint64_t>(c.s2a3Before), 32);

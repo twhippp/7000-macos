@@ -402,27 +402,14 @@ kern_return_t navi33_sdma_ring_test(DeviceContext &dev, N33GfxReport &rep, uint3
 namespace {
 namespace C {   // gc_11_0_0_offset.h: register, BASE_IDX
 	constexpr uint32_t CP_RB0_RPTR           = 0x0f60;  // 0
-	constexpr uint32_t CP_RB_WPTR_DELAY      = 0x0f61;  // 0
 	constexpr uint32_t CP_STAT               = 0x0f40;  // 0
 	constexpr uint32_t GRBM_STATUS           = 0x0da4;  // 0
-	constexpr uint32_t CP_RB0_BASE           = 0x1de0;  // 0
-	constexpr uint32_t CP_RB0_CNTL           = 0x1de1;  // 0
-	constexpr uint32_t CP_RB0_RPTR_ADDR      = 0x1de3;  // 0
-	constexpr uint32_t CP_RB0_RPTR_ADDR_HI   = 0x1de4;  // 0
 	constexpr uint32_t CP_DEVICE_ID          = 0x1deb;  // 0
-	constexpr uint32_t CP_RB_VMID            = 0x1df1;  // 0
-	constexpr uint32_t CP_RB0_WPTR           = 0x1df4;  // 0
-	constexpr uint32_t CP_RB0_WPTR_HI        = 0x1df5;  // 0
 	constexpr uint32_t CP_PFP_PRGRM_CNTR_START = 0x1e44; // 0
 	constexpr uint32_t CP_ME_PRGRM_CNTR_START  = 0x1e45; // 0
 	constexpr uint32_t CP_MAX_CONTEXT        = 0x1e4e;  // 0
-	constexpr uint32_t CP_RB0_BASE_HI        = 0x1e51;  // 0
 	constexpr uint32_t CP_PFP_PRGRM_CNTR_START_HI = 0x1e59; // 0
 	constexpr uint32_t CP_ME_PRGRM_CNTR_START_HI  = 0x1e79; // 0
-	constexpr uint32_t CP_RB_WPTR_POLL_ADDR_LO = 0x1e8b; // 0
-	constexpr uint32_t CP_RB_WPTR_POLL_ADDR_HI = 0x1e8c; // 0
-	constexpr uint32_t CP_RB_DOORBELL_CONTROL  = 0x1e8d; // 0
-	constexpr uint32_t CP_RB_ACTIVE          = 0x1f40;  // 0
 	constexpr uint32_t CP_ME_CNTL            = 0x0803;  // 1
 	constexpr uint32_t GRBM_GFX_CNTL         = 0x0900;  // 1
 	constexpr uint32_t SCRATCH_REG0          = 0x2040;  // 1
@@ -464,15 +451,10 @@ constexpr F MEC_PIPE0_RESET    { 0x10, 0x00010000 };
 constexpr F MEC_PIPE1_RESET    { 0x11, 0x00020000 };
 constexpr F MEC_PIPE2_RESET    { 0x12, 0x00040000 };
 constexpr F MEC_PIPE3_RESET    { 0x13, 0x00080000 };
-constexpr F RB0_BUFSZ          { 0x0,  0x0000003F };
-constexpr F RB0_BLKSZ          { 0x8,  0x00003F00 };
-constexpr F RB0_KMD_QUEUE      { 0x1d, 0x20000000 };
-constexpr F RBDB_DOORBELL_EN   { 0x1e, 0x40000000 };
 constexpr F GFXC_PIPEID        { 0x0,  0x00000003 };
 constexpr F GFXC_MEID          { 0x2,  0x0000000C };
 constexpr F GFXC_VMID          { 0x4,  0x000000F0 };
 constexpr F GFXC_QUEUEID       { 0x8,  0x00000700 };
-constexpr uint32_t kRB_RPTR_ADDR_HI_MASK = 0x0000FFFFu;
 
 // nvd.h
 constexpr uint32_t pkt3(uint32_t op, uint32_t n) { return (3u << 30) | ((n & 0x3FFFu) << 16) | ((op & 0xFFu) << 8); }
@@ -489,6 +471,47 @@ constexpr uint32_t kCpPad      = 256;      // gfx ring align_mask 0xff
 // Indices are in 32-bit doorbell units; the gfx ring's 64-bit doorbell is gfx_ring0 << 1.
 constexpr uint32_t kDbKiq = 0x000, kDbUserqueueEnd = 0x08A, kDbGfxRing0 = 0x08B, kDbGfxUserqueueEnd = 0x0FF;
 constexpr uint32_t kGfxDoorbell = kDbGfxRing0 << 1;              // ring->doorbell_index
+constexpr uint32_t kDbMecRing0 = 0x003;
+constexpr uint32_t kMecDoorbell = kDbMecRing0 << 1;              // compute ring 0 (me 1, pipe 0, queue 0)
+
+// The compute queue's MQD + EOP buffer in the slot.
+constexpr uint64_t kMqdOff = 0xB000;  constexpr uint32_t kMqdBytes = 2048;   // v11_compute_mqd: 512 dwords
+constexpr uint64_t kEopOff = 0xB800;  constexpr uint32_t kEopBytes = 2048;   // GFX11_MEC_HPD_SIZE, 256-byte aligned
+namespace M {   // v11_structs.h struct v11_compute_mqd, dword indices
+	enum : uint32_t {
+		header = 0, pipelinestat = 11, stm_se0 = 23, stm_se1 = 24, stm_se2 = 26, stm_se3 = 27,
+		misc_reserved = 32, stm_se4 = 44, stm_se5 = 45, stm_se6 = 46, stm_se7 = 47,
+		mqd_base_lo = 128, mqd_base_hi = 129, active = 130, vmid = 131, persistent_state = 132,
+		pipe_priority = 133, queue_priority = 134, quantum = 135, pq_base_lo = 136, pq_base_hi = 137,
+		pq_rptr = 138, rptr_report_lo = 139, rptr_report_hi = 140, wptr_poll_lo = 141, wptr_poll_hi = 142,
+		pq_doorbell_control = 143, pq_control = 145, ib_control = 149, dequeue_request = 152,
+		mqd_control = 162, eop_base_lo = 165, eop_base_hi = 166, eop_control = 167,
+		pq_wptr_lo = 182, pq_wptr_hi = 183, kCount = 512,
+	};
+}
+namespace H {   // gc_11_0_0_offset.h, BASE_IDX 0; HQD registers are banked by GRBM_GFX_CNTL
+	constexpr uint32_t CP_PQ_STATUS = 0x1e58, CP_PQ_WPTR_POLL_CNTL = 0x1e23;
+	constexpr uint32_t CP_MQD_BASE_ADDR = 0x1fa9, CP_MQD_BASE_ADDR_HI = 0x1faa, CP_HQD_ACTIVE = 0x1fab, CP_HQD_VMID = 0x1fac;
+	constexpr uint32_t CP_HQD_PERSISTENT_STATE = 0x1fad, CP_HQD_PQ_BASE = 0x1fb1, CP_HQD_PQ_BASE_HI = 0x1fb2;
+	constexpr uint32_t CP_HQD_PQ_RPTR = 0x1fb3, CP_HQD_PQ_RPTR_REPORT_ADDR = 0x1fb4, CP_HQD_PQ_RPTR_REPORT_ADDR_HI = 0x1fb5;
+	constexpr uint32_t CP_HQD_PQ_WPTR_POLL_ADDR = 0x1fb6, CP_HQD_PQ_WPTR_POLL_ADDR_HI = 0x1fb7, CP_HQD_PQ_DOORBELL_CONTROL = 0x1fb8;
+	constexpr uint32_t CP_HQD_PQ_CONTROL = 0x1fba, CP_HQD_DEQUEUE_REQUEST = 0x1fc1, CP_MQD_CONTROL = 0x1fcb;
+	constexpr uint32_t CP_HQD_EOP_BASE_ADDR = 0x1fce, CP_HQD_EOP_BASE_ADDR_HI = 0x1fcf, CP_HQD_EOP_CONTROL = 0x1fd0;
+	constexpr uint32_t CP_HQD_PQ_WPTR_LO = 0x1fdf, CP_HQD_PQ_WPTR_HI = 0x1fe0;
+}
+// gc_11_0_0_default.h
+constexpr uint32_t kHQD_EOP_CONTROL_DEFAULT = 0x00000006, kHQD_PQ_DOORBELL_CONTROL_DEFAULT = 0x00000000;
+constexpr uint32_t kMQD_CONTROL_DEFAULT = 0x00000100, kHQD_PQ_CONTROL_DEFAULT = 0x00308509;
+constexpr uint32_t kHQD_PERSISTENT_STATE_DEFAULT = 0x0be05501, kHQD_IB_CONTROL_DEFAULT = 0x00300000;
+// gc_11_0_0_sh_mask.h
+constexpr F HQD_EOP_SIZE { 0x0, 0x0000003F };
+constexpr F HQD_DB_OFFSET { 0x2, 0x0FFFFFFC }, HQD_DB_SOURCE { 0x1c, 0x10000000 }, HQD_DB_EN { 0x1e, 0x40000000 }, HQD_DB_HIT { 0x1f, 0x80000000 };
+constexpr F MQD_VMID { 0x0, 0x0000000F };
+constexpr F PQ_QUEUE_SIZE { 0x0, 0x0000003F }, PQ_RPTR_BLOCK_SIZE { 0x8, 0x00003F00 }, PQ_UNORD_DISPATCH { 0x1c, 0x10000000 };
+constexpr F PQ_TUNNEL_DISPATCH { 0x1d, 0x20000000 }, PQ_PRIV_STATE { 0x1e, 0x40000000 }, PQ_KMD_QUEUE { 0x1f, 0x80000000 };
+constexpr F PERSIST_PRELOAD_SIZE { 0x8, 0x0003FF00 }, IB_MIN_AVAIL_SIZE { 0x14, 0x00300000 };
+constexpr F QUANTUM_EN { 0x0, 0x00000001 }, QUANTUM_SCALE { 0x4, 0x00000010 }, QUANTUM_DURATION { 0x8, 0x00003F00 };
+constexpr F PQ_POLL_EN { 0x1f, 0x80000000 }, PQ_STATUS_DOORBELL_ENABLE { 0x1, 0x00000002 };
 namespace D {   // gc_11_0_0_offset.h (BASE_IDX 0) / nbio_4_3_0_offset.h
 	constexpr uint32_t CP_RB_DOORBELL_RANGE_LOWER  = 0x1dfa;
 	constexpr uint32_t CP_RB_DOORBELL_RANGE_UPPER  = 0x1dfb;
@@ -498,19 +521,15 @@ namespace D {   // gc_11_0_0_offset.h (BASE_IDX 0) / nbio_4_3_0_offset.h
 	constexpr uint32_t S2A_DOORBELL_ENTRY_0_CTRL   = 0x4f7640;   // NBIO BASE_IDX 3 (indirect)
 	constexpr uint32_t S2A_DOORBELL_ENTRY_3_CTRL   = 0x4f7643;
 }
-constexpr F RBDB_DOORBELL_OFFSET { 0x2, 0x0FFFFFFC };
 
 bool gfxDoorbellReady(const DeviceContext &d) { return d.bar2 && d.bar2Size >= (kGfxDoorbell + 2) * 4ull; }
 
-// gfx_v11_0_ring_set_wptr_gfx: wptr into the poll slot, then the doorbell (WDOORBELL64);
-// the CP_RB0_WPTR register is written as well (the non-doorbell path) — harmless either way.
+// gfx_v11_0_ring_set_wptr_compute: wptr into the poll slot, then the 64-bit doorbell.
 void cpCommit(DeviceContext &dev, uint64_t wptrPollVramOff, uint32_t wptrDw) {
 	WBAR0_64(dev, wptrPollVramOff, wptrDw);
 	amdgpu_hdp_flush(dev);
-	WREG32(dev, SOC15_REG_OFFSET_BIDX(dev, IPBlock::GC, 0, 0x1df4 /*CP_RB0_WPTR*/), wptrDw);
-	WREG32(dev, SOC15_REG_OFFSET_BIDX(dev, IPBlock::GC, 0, 0x1df5 /*CP_RB0_WPTR_HI*/), 0);
 	if (gfxDoorbellReady(dev)) {
-		*reinterpret_cast<volatile uint64_t *>(dev.bar2 + (uint64_t)kGfxDoorbell * 4) = wptrDw;
+		*reinterpret_cast<volatile uint64_t *>(dev.bar2 + (uint64_t)kMecDoorbell * 4) = wptrDw;
 		storeFence();
 	}
 }
@@ -706,34 +725,14 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	WREG32(dev, g0(D::CP_MEC_DOORBELL_RANGE_LOWER), (kDbKiq * 2) << 2);
 	WREG32(dev, g0(D::CP_MEC_DOORBELL_RANGE_UPPER), (kDbUserqueueEnd * 2) << 2);
 
-	// gfx_v11_0_cp_gfx_resume — ring 0, pipe 0, VMID 0, doorbell when BAR2 is mapped
-	bar0_memset_vram(dev, base + kCpRingOff, kGfxNop, kCpRingBytes);
-	WBAR0_64(dev, base + kCpRptrOff, 0);
-	WBAR0_64(dev, base + kCpWptrOff, 0);
-	WREG32(dev, g0(C::CP_RB_WPTR_DELAY), 0);
-	WREG32(dev, g0(C::CP_RB_VMID), 0);
-	grbm_select(dev, 0, 0, 0, 0);                      // cp_gfx_switch_pipe(PIPE_ID0)
-	constexpr uint32_t bufsz = 9;                      // order_base_2(4096 / 8)
-	static_assert(kCpRingBytes / 8 == (1u << bufsz), "RB_BUFSZ");
-	uint32_t rb = setf(setf(setf(0, RB0_BUFSZ, bufsz), RB0_BLKSZ, bufsz - 2), RB0_KMD_QUEUE, 1);
-	WREG32(dev, g0(C::CP_RB0_CNTL), rb);
-	WREG32(dev, g0(C::CP_RB0_WPTR), 0);
-	WREG32(dev, g0(C::CP_RB0_WPTR_HI), 0);
-	WREG32(dev, g0(C::CP_RB0_RPTR_ADDR), (uint32_t)rptrMc);
-	WREG32(dev, g0(C::CP_RB0_RPTR_ADDR_HI), (uint32_t)(rptrMc >> 32) & kRB_RPTR_ADDR_HI_MASK);
-	WREG32(dev, g0(C::CP_RB_WPTR_POLL_ADDR_LO), (uint32_t)wptrMc);
-	WREG32(dev, g0(C::CP_RB_WPTR_POLL_ADDR_HI), (uint32_t)(wptrMc >> 32));
-	IOSleep(1);
-	WREG32(dev, g0(C::CP_RB0_CNTL), rb);
-	WREG32(dev, g0(C::CP_RB0_BASE), (uint32_t)(ringMc >> 8));
-	WREG32(dev, g0(C::CP_RB0_BASE_HI), (uint32_t)((ringMc >> 8) >> 32));
-	WREG32(dev, g0(C::CP_RB_ACTIVE), 1);
-	t = RREG32(dev, g0(C::CP_RB_DOORBELL_CONTROL));   // gfx_v11_0_cp_gfx_set_doorbell
-	if (rep.doorbellUsed) t = setf(setf(t, RBDB_DOORBELL_OFFSET, kGfxDoorbell), RBDB_DOORBELL_EN, 1);
-	else                  t = setf(t, RBDB_DOORBELL_EN, 0);
-	WREG32(dev, g0(C::CP_RB_DOORBELL_CONTROL), t);
+	// The gfx ring through CP_RB0_* does not run on RS64 firmware (two hardware runs: the
+	// PFP never fetched; Navi 48 saw the same and the RS64 firmware wanting a queue
+	// descriptor). Linux itself only drives RS64 queues from MQDs. So the first CP command
+	// goes to a COMPUTE queue, programmed straight into the hardware queue registers the
+	// way gfx_v11_0_kiq_init_register does it (me 1, pipe 0, queue 0, VMID 0, doorbell).
 
-	// gfx_v11_0_cp_gfx_start (without the clear-state preamble): init the CP, unhalt.
+	// gfx_v11_0_cp_gfx_start minus the ring: init the CP and unhalt PFP/ME (the async
+	// path unhalts before any gfx queue exists).
 	WREG32(dev, g0(C::CP_MAX_CONTEXT), 8 - 1);         // max_hw_contexts 8
 	WREG32(dev, g0(C::CP_DEVICE_ID), 1);
 	t = RREG32(dev, g1(C::CP_ME_CNTL));
@@ -747,7 +746,89 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	}
 	rep.meCntlAfter = RREG32(dev, g1(C::CP_ME_CNTL));
 
-	// gfx_v11_0_ring_test_ring
+	// ---- gfx_v11_0_compute_mqd_init (v11_compute_mqd, written to VRAM) ----
+	const uint64_t mqdMc = dev.vramMC(base + kMqdOff), eopMc = dev.vramMC(base + kEopOff);
+	bar0_memset_vram(dev, base + kMqdOff, 0u, kMqdBytes);
+	bar0_memset_vram(dev, base + kEopOff, 0u, kEopBytes);
+	bar0_memset_vram(dev, base + kCpRingOff, kGfxNop, kCpRingBytes);
+	WBAR0_64(dev, base + kCpRptrOff, 0);
+	WBAR0_64(dev, base + kCpWptrOff, 0);
+	uint32_t m[M::kCount] = {};
+	m[M::header] = 0xC0310800u;
+	m[M::pipelinestat] = 1;
+	m[M::stm_se0] = m[M::stm_se1] = m[M::stm_se2] = m[M::stm_se3] = 0xFFFFFFFFu;
+	m[M::stm_se4] = m[M::stm_se5] = m[M::stm_se6] = m[M::stm_se7] = 0xFFFFFFFFu;
+	m[M::misc_reserved] = 7;
+	m[M::eop_base_lo] = (uint32_t)(eopMc >> 8);
+	m[M::eop_base_hi] = (uint32_t)((eopMc >> 8) >> 32);
+	m[M::eop_control] = setf(kHQD_EOP_CONTROL_DEFAULT, HQD_EOP_SIZE, 8);      // order_base_2(2048/4) - 1
+	uint32_t db = kHQD_PQ_DOORBELL_CONTROL_DEFAULT;
+	if (rep.doorbellUsed)
+		db = setf(setf(setf(setf(db, HQD_DB_OFFSET, kMecDoorbell), HQD_DB_EN, 1), HQD_DB_SOURCE, 0), HQD_DB_HIT, 0);
+	else
+		db = setf(db, HQD_DB_EN, 0);
+	m[M::pq_doorbell_control] = db;
+	m[M::mqd_base_lo] = (uint32_t)mqdMc & 0xfffffffcu;
+	m[M::mqd_base_hi] = (uint32_t)(mqdMc >> 32);
+	m[M::mqd_control] = setf(kMQD_CONTROL_DEFAULT, MQD_VMID, 0);
+	m[M::pq_base_lo] = (uint32_t)(ringMc >> 8);
+	m[M::pq_base_hi] = (uint32_t)((ringMc >> 8) >> 32);
+	uint32_t pq = kHQD_PQ_CONTROL_DEFAULT;
+	pq = setf(pq, PQ_QUEUE_SIZE, 9);                   // order_base_2(4096/4) - 1
+	pq = setf(pq, PQ_RPTR_BLOCK_SIZE, 9);              // order_base_2(4096/4) - 1 (GPU page)
+	pq = setf(pq, PQ_UNORD_DISPATCH, 1);
+	pq = setf(pq, PQ_TUNNEL_DISPATCH, 0);
+	pq = setf(setf(pq, PQ_PRIV_STATE, 1), PQ_KMD_QUEUE, 1);
+	m[M::pq_control] = pq;
+	m[M::rptr_report_lo] = (uint32_t)rptrMc & 0xfffffffcu;
+	m[M::rptr_report_hi] = (uint32_t)(rptrMc >> 32) & 0xffffu;
+	m[M::wptr_poll_lo] = (uint32_t)wptrMc & 0xfffffffcu;
+	m[M::wptr_poll_hi] = (uint32_t)(wptrMc >> 32) & 0xffffu;
+	m[M::pq_rptr] = 0;
+	m[M::vmid] = 0;
+	m[M::persistent_state] = setf(kHQD_PERSISTENT_STATE_DEFAULT, PERSIST_PRELOAD_SIZE, 0x55);
+	m[M::ib_control] = setf(kHQD_IB_CONTROL_DEFAULT, IB_MIN_AVAIL_SIZE, 3);
+	m[M::quantum] = setf(setf(setf(0, QUANTUM_EN, 1), QUANTUM_SCALE, 1), QUANTUM_DURATION, 1);
+	m[M::active] = 1;
+	bar0_memcpy_to_vram(dev, base + kMqdOff, m, sizeof(m));
+
+	// ---- gfx_v11_0_kiq_init_register, under grbm_select(1, 0, 0) ----
+	grbm_select(dev, 1, 0, 0, 0);
+	WREG32(dev, g0(H::CP_PQ_WPTR_POLL_CNTL), setf(RREG32(dev, g0(H::CP_PQ_WPTR_POLL_CNTL)), PQ_POLL_EN, 0));
+	WREG32(dev, g0(H::CP_HQD_EOP_BASE_ADDR), m[M::eop_base_lo]);
+	WREG32(dev, g0(H::CP_HQD_EOP_BASE_ADDR_HI), m[M::eop_base_hi]);
+	WREG32(dev, g0(H::CP_HQD_EOP_CONTROL), m[M::eop_control]);
+	WREG32(dev, g0(H::CP_HQD_PQ_DOORBELL_CONTROL), m[M::pq_doorbell_control]);
+	if (RREG32(dev, g0(H::CP_HQD_ACTIVE)) & 1u) {
+		WREG32(dev, g0(H::CP_HQD_DEQUEUE_REQUEST), 1);
+		for (uint32_t j = 0; j < 100000 && (RREG32(dev, g0(H::CP_HQD_ACTIVE)) & 1u); j++) IODelay(1);
+		WREG32(dev, g0(H::CP_HQD_DEQUEUE_REQUEST), 0);
+		WREG32(dev, g0(H::CP_HQD_PQ_RPTR), 0);
+		WREG32(dev, g0(H::CP_HQD_PQ_WPTR_LO), 0);
+		WREG32(dev, g0(H::CP_HQD_PQ_WPTR_HI), 0);
+	}
+	WREG32(dev, g0(H::CP_MQD_BASE_ADDR), m[M::mqd_base_lo]);
+	WREG32(dev, g0(H::CP_MQD_BASE_ADDR_HI), m[M::mqd_base_hi]);
+	WREG32(dev, g0(H::CP_MQD_CONTROL), m[M::mqd_control]);
+	WREG32(dev, g0(H::CP_HQD_PQ_BASE), m[M::pq_base_lo]);
+	WREG32(dev, g0(H::CP_HQD_PQ_BASE_HI), m[M::pq_base_hi]);
+	WREG32(dev, g0(H::CP_HQD_PQ_CONTROL), m[M::pq_control]);
+	WREG32(dev, g0(H::CP_HQD_PQ_RPTR_REPORT_ADDR), m[M::rptr_report_lo]);
+	WREG32(dev, g0(H::CP_HQD_PQ_RPTR_REPORT_ADDR_HI), m[M::rptr_report_hi]);
+	WREG32(dev, g0(H::CP_HQD_PQ_WPTR_POLL_ADDR), m[M::wptr_poll_lo]);
+	WREG32(dev, g0(H::CP_HQD_PQ_WPTR_POLL_ADDR_HI), m[M::wptr_poll_hi]);
+	WREG32(dev, g0(H::CP_HQD_PQ_DOORBELL_CONTROL), m[M::pq_doorbell_control]);
+	WREG32(dev, g0(H::CP_HQD_PQ_WPTR_LO), 0);
+	WREG32(dev, g0(H::CP_HQD_PQ_WPTR_HI), 0);
+	WREG32(dev, g0(H::CP_HQD_VMID), 0);
+	WREG32(dev, g0(H::CP_HQD_PERSISTENT_STATE), m[M::persistent_state]);
+	WREG32(dev, g0(H::CP_HQD_ACTIVE), 1);
+	if (rep.doorbellUsed)
+		WREG32(dev, g0(H::CP_PQ_STATUS), setf(RREG32(dev, g0(H::CP_PQ_STATUS)), PQ_STATUS_DOORBELL_ENABLE, 1));
+	rep.hqdActive = RREG32(dev, g0(H::CP_HQD_ACTIVE));
+	grbm_select(dev, 0, 0, 0, 0);
+
+	// gfx_v11_0_ring_test_ring on the compute queue: SET_UCONFIG_REG SCRATCH_REG0.
 	const uint32_t scratch = g1(C::SCRATCH_REG0);       // absolute dword index
 	WREG32(dev, scratch, 0xCAFEDEADu);
 	uint32_t ring[kCpPad];
@@ -756,7 +837,7 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	ring[1] = scratch - kSET_UCONFIG_REG_START;
 	ring[2] = 0xDEADBEEFu;
 	bar0_memcpy_to_vram(dev, base + kCpRingOff, ring, sizeof(ring));
-	cpCommit(dev, base + kCpWptrOff, kCpPad);           // gfx wptr is in dwords
+	cpCommit(dev, base + kCpWptrOff, kCpPad);           // compute wptr is in dwords
 
 	rep.passed = false;
 	uint32_t us = 0;
@@ -766,7 +847,10 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	}
 	rep.waitedUs      = us;
 	rep.scratch       = RREG32(dev, scratch);
-	rep.rbRptr        = RREG32(dev, g0(C::CP_RB0_RPTR));
+	grbm_select(dev, 1, 0, 0, 0);
+	rep.rbRptr        = RREG32(dev, g0(H::CP_HQD_PQ_RPTR));
+	rep.hqdActive     = RREG32(dev, g0(H::CP_HQD_ACTIVE));
+	grbm_select(dev, 0, 0, 0, 0);
 	rep.rptrWriteback = RBAR0_64(dev, base + kCpRptrOff);
 	rep.grbmStatus    = RREG32(dev, g0(C::GRBM_STATUS));
 	if (!rep.passed) rep.cpStat = RREG32(dev, g0(C::CP_STAT));
@@ -777,7 +861,7 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	rep.stalled2 = RREG32(dev, g0(C2::CP_STALLED_STAT2));
 	rep.stalled3 = RREG32(dev, g0(C2::CP_STALLED_STAT3));
 	rep.busyStat = RREG32(dev, g0(C2::CP_BUSY_STAT));
-	UCODE_LOG("navi33-gfx: CP gfx ring test %s after %u us (SCRATCH %#x, RB0_RPTR %#x, rptr wb %#llx, CP_STAT %#x, GRBM %#x, ME_CNTL %#x->%#x)",
+	UCODE_LOG("navi33-gfx: CP compute queue test %s after %u us (SCRATCH %#x, HQD_PQ_RPTR %#x, rptr wb %#llx, CP_STAT %#x, GRBM %#x, ME_CNTL %#x->%#x)",
 	          rep.passed ? "PASSED" : "FAILED", us, rep.scratch, rep.rbRptr, (unsigned long long)rep.rptrWriteback,
 	          rep.cpStat, rep.grbmStatus, rep.meCntlBefore, rep.meCntlAfter);
 	rep.stage = rep.passed ? "cp-write-ok" : (rep.cpIdleAfterUnhalt ? "cp-timeout" : "cp-not-idle");
@@ -841,7 +925,7 @@ kern_return_t navi33_ib_tests(DeviceContext &dev, N33IbReport &rep, uint32_t tim
 		ring[0] = pkt3(kPKT3_INDIRECT_BUFFER, 2);
 		ring[1] = (uint32_t)ibMc;
 		ring[2] = (uint32_t)(ibMc >> 32);
-		ring[3] = 5u | (0u << 24);
+		ring[3] = (1u << 23) /*INDIRECT_BUFFER_VALID*/ | 5u | (0u << 24);   // ring_emit_ib_compute
 		bar0_memcpy_to_vram(dev, base + kCpRingOff + kCpWptrAfterS5 * 4, ring, sizeof(ring));
 	}
 	amdgpu_hdp_flush(dev);

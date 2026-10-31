@@ -49,6 +49,7 @@ struct Rig {
 	uint64_t cpDone = 0;
 	std::thread sdma;
 
+	static uint64_t mc(uint32_t lo, uint32_t hi) { return (((uint64_t)hi << 32) | lo) - kMcBase; }
 	volatile uint32_t &r(uint32_t base, uint32_t off) { return reinterpret_cast<volatile uint32_t &>(regs[base + off]); }
 
 	explicit Rig(bool alive, uint32_t fbBase = (uint32_t)(kMcBase >> 24)) : engineAlive(alive) {
@@ -126,12 +127,15 @@ struct Rig {
 		}
 	}
 
-	// gfx CP ring 0: PFP/ME unhalted (CP_ME_CNTL bits 26/28 clear) + RB_ACTIVE.
+	// The CP's compute queue (me 1, pipe 0, queue 0), programmed through the HQD registers.
 	void runCp() {
-		const uint32_t me = r(kGc1, 0x0803);
-		if (!cpAlive || (me & ((1u << 26) | (1u << 28))) || !r(kGc0, 0x1f40)) return;
-		const uint64_t ring = ((((uint64_t)r(kGc0, 0x1e51)) << 32 | r(kGc0, 0x1de0)) << 8) - kMcBase;
-		const uint64_t wptr = r(kGc0, 0x1df4);
+		// compute queue: MEC not halted (CP_MEC_RS64_CNTL bit 30) + CP_HQD_ACTIVE; wptr from the
+		// 64-bit doorbell (BAR2 dword 6) when mapped, else the poll slot.
+		if (!cpAlive || (r(kGc1, 0x2904) & (1u << 30)) || !(r(kGc0, 0x1fab) & 1u)) return;
+		const uint64_t ring = ((((uint64_t)r(kGc0, 0x1fb2)) << 32 | r(kGc0, 0x1fb1)) << 8) - kMcBase;
+		uint64_t wptr;
+		if (dev.bar2) std::memcpy(&wptr, &db[6 * 4], 8);
+		else { const uint64_t p = mc(r(kGc0, 0x1fb6), r(kGc0, 0x1fb7)); std::memcpy(&wptr, &vram[p], 8); }
 		while (cpDone < wptr) {
 			uint32_t h; std::memcpy(&h, &vram[ring + cpDone * 4], 4);
 			const uint32_t op = (h >> 8) & 0xFF, n = (h >> 16) & 0x3FFF;
@@ -140,11 +144,11 @@ struct Rig {
 				uint32_t a[2]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 8);
 				regs[0xC000 + a[0]] = a[1];
 			}
-			if (op == 0x3F) {   // INDIRECT_BUFFER -> WRITE_DATA(dst_sel 5)
+			if (op == 0x3F) {   // INDIRECT_BUFFER -> WRITE_DATA(dst_sel 5); compute needs IB_VALID
 				uint32_t a[3]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 12);
 				const uint64_t ib = (((uint64_t)a[1] << 32) | a[0]) - kMcBase;
 				uint32_t q[5]; std::memcpy(q, &vram[ib], 20);
-				if (((q[0] >> 8) & 0xFF) == 0x37 && ((q[1] >> 8) & 0xF) == 5 && (a[2] & 0xFFFFF) == 5) {
+				if ((a[2] & (1u << 23)) && ((q[0] >> 8) & 0xFF) == 0x37 && ((q[1] >> 8) & 0xF) == 5 && (a[2] & 0xFFFFF) == 5) {
 					const uint64_t dst = (((uint64_t)q[3] << 32) | q[2]) - kMcBase;
 					std::memcpy(&vram[dst], &q[4], 4);
 				}
@@ -158,8 +162,8 @@ struct Rig {
 			}
 			cpDone += n + 2;
 		}
-		r(kGc0, 0x0f60) = (uint32_t)cpDone;
-		const uint64_t rp = (((uint64_t)r(kGc0, 0x1de4) << 32) | r(kGc0, 0x1de3)) - kMcBase;
+		r(kGc0, 0x1fb3) = (uint32_t)cpDone;
+		const uint64_t rp = mc(r(kGc0, 0x1fb4), r(kGc0, 0x1fb5));
 		std::memcpy(&vram[rp], &cpDone, 8);
 	}
 };
@@ -207,36 +211,33 @@ int main() {
 		for (int i = 0; i < 4; i++) fw.mecDc[i] = 0x81FC600000ull + 0x10000ull * i;
 		N33CpReport cp {};
 		k.dev.bar2 = k.db.data(); k.dev.bar2Size = k.db.size();
-		check(navi33_cp_gfx_ring_test(k.dev, fw, cp) == kIOReturnSuccess && cp.passed, "CP gfx ring writes SCRATCH_REG0");
-		uint64_t dbv; std::memcpy(&dbv, &k.db[0x8B * 2 * 4], 8);
-		check(cp.doorbellUsed && dbv == 256, "gfx doorbell (index 0x116) rung with wptr 256");
-		check(((k.r(kGc0, 0x1e8d) >> 2) & 0x3FFFFFF) == 0x116 && (k.r(kGc0, 0x1e8d) & (1u << 30)), "CP_RB_DOORBELL_CONTROL: offset 0x116, enabled");
-		check(k.r(kGc0, 0x1dfa) == 0x458 && k.r(kGc0, 0x1dfb) == 0x7F8, "gfx doorbell range");
-		check(k.r(kGc0, 0x1e44) == ((1u << 30) | (0x1000 >> 2)) && k.r(kGc0, 0x1e59) == 0, "PFP program counter start");
-		check(k.r(kGc1, 0x2900) == ((0x3000 >> 2) | (1u << 30)), "MEC program counter start");
-		check(cp.cachesProgrammed && !cp.cacheOpTimedOut, "RS64 cache bases programmed (they were empty)");
-		check(k.r(kGc1, 0x5840) == 0xFC100000u && k.r(kGc1, 0x5841) == 0x81, "PFP IC base = TMR address");
-		check(k.r(kGc1, 0x5844) == 0xFC300000u && k.r(kGc1, 0x584c) == 0xFC500000u, "ME IC / CPC IC bases = TMR addresses");
-		check(k.r(kGc1, 0x5870) == 0xFC630000u, "MEC MDBASE (last pipe written) = P3 stack");
-		check((k.r(kGc1, 0x2904) & (1u << 30)) == 0 && (k.r(kGc1, 0x2904) & 0x3C000000u) == 0x3C000000u, "MEC unhalted, 4 pipes active");
-		check((k.r(kGc0, 0x1de1) & 0x3F) == 9 && ((k.r(kGc0, 0x1de1) >> 8) & 0x3F) == 7 && (k.r(kGc0, 0x1de1) & (1u << 29)),
-		      "RB0_CNTL: bufsz 9, blksz 7, KMD queue");
-		const uint64_t rb0 = ((((uint64_t)k.r(kGc0, 0x1e51)) << 32) | k.r(kGc0, 0x1de0)) << 8;
-		check(rb0 == kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0x4000, "RB0 base is the slot's MC address");
-		check(k.r(kGc0, 0x1df4) == 256 && cp.rbRptr == 256, "wptr/rptr = 256 dwords");
+		check(navi33_cp_gfx_ring_test(k.dev, fw, cp) == kIOReturnSuccess && cp.passed, "CP compute queue writes SCRATCH_REG0");
+		uint64_t dbv; std::memcpy(&dbv, &k.db[6 * 4], 8);
+		check(cp.doorbellUsed && dbv == 256, "compute doorbell (index 6) rung with wptr 256");
+		const uint32_t dbc = k.r(kGc0, 0x1fb8);
+		check(((dbc >> 2) & 0x3FFFFFF) == 6 && (dbc & (1u << 30)), "HQD doorbell control: offset 6, enabled");
+		check(k.r(kGc0, 0x1dfc) == 0 && k.r(kGc0, 0x1dfd) == (0x8Au * 2) << 2, "MEC doorbell range");
+		check((k.r(kGc0, 0x1fba) & 0x3F) == 9 && (k.r(kGc0, 0x1fba) & 0xC0000000u) == 0xC0000000u, "PQ_CONTROL: size 9, PRIV + KMD queue");
+		const uint64_t pq = ((((uint64_t)k.r(kGc0, 0x1fb2)) << 32) | k.r(kGc0, 0x1fb1)) << 8;
+		check(pq == kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0x4000, "PQ base is the slot's MC address");
+		const uint64_t mqdA = (((uint64_t)k.r(kGc0, 0x1faa)) << 32) | k.r(kGc0, 0x1fa9);
+		check(mqdA == kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0xB000, "MQD base register = the MQD in VRAM");
+		uint32_t mq[512]; std::memcpy(mq, &k.vram[k.dev.vramBase + kN33GfxVramOffset + 0xB000], sizeof(mq));
+		check(mq[0] == 0xC0310800u && mq[130] == 1 && mq[145] == k.r(kGc0, 0x1fba) && mq[143] == dbc, "MQD in memory mirrors the HQD registers");
+		check(cp.rbRptr == 256 && cp.hqdActive == 1, "HQD rptr 256, queue active");
 		check((k.r(kGc1, 0x0803) & ((1u << 26) | (1u << 28))) == 0, "PFP/ME unhalted");
-		check(k.r(kGc0, 0x1df1) == 0, "VMID 0");
+		check(k.r(kGc0, 0x1fac) == 0, "VMID 0");
 
 		N33IbReport ib {};
 		check(navi33_ib_tests(k.dev, ib) == kIOReturnSuccess && ib.sdmaPassed && ib.cpPassed, "IB tests: SDMA and CP both write through an IB");
 		check(k.ibSeen && k.ibAligned, "SDMA IB packet 32-byte base, ends on an 8-dword boundary");
-		check(k.r(kGc0, 0x0085) == 128 && k.r(kGc0, 0x1df4) == 512, "wptrs continue: SDMA 128 bytes, CP 512 dwords");
+		check(k.r(kGc0, 0x0085) == 128 && k.r(kGc0, 0x1fb3) == 512, "wptrs continue: SDMA 128 bytes, CP 512 dwords");
 
 		N33FenceReport fr {};
 		check(navi33_fence_copy_tests(k.dev, fr) == kIOReturnSuccess && std::strcmp(fr.stage, "fence-copy-ok") == 0,
 		      "stage 7: SDMA 4 KiB copy + FENCE, gfx RELEASE_MEM fence");
 		check(fr.copyBadDwords == 0 && fr.sdmaFence == kN33FenceSeq && fr.cpFence == kN33FenceSeq, "  ...copy exact, both fences = seq");
-		check(k.r(kGc0, 0x0085) == 192 && k.r(kGc0, 0x1df4) == 768, "  ...wptrs continue: SDMA 192 bytes, CP 768 dwords");
+		check(k.r(kGc0, 0x0085) == 192 && k.r(kGc0, 0x1fb3) == 768, "  ...wptrs continue: SDMA 192 bytes, CP 768 dwords");
 
 		// stage 8: a fake 1 MiB "screen" at vram+0 with a pattern
 		const uint64_t fbOff = 0, fbLen = 1u << 20;

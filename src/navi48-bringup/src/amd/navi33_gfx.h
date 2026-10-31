@@ -96,6 +96,7 @@ struct N33CpReport {
 	bool     doorbellUsed;
 	uint32_t aperEnBefore;          // RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN
 	uint32_t s2a0Before, s2a3Before;   // NBIO S2A_DOORBELL_ENTRY_0/3_CTRL (gc_doorbell_init)
+	uint32_t hqdActive;                // CP_HQD_ACTIVE of the compute queue
 };
 
 // Reads the start addresses out of the three firmware files; false if any header is bad.
