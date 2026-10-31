@@ -40,7 +40,9 @@ ensure_python() {
 	if python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null &&
 		python3 -c 'import mako, yaml, packaging' 2>/dev/null && command -v meson >/dev/null; then return; fi
 	say "setting up Python $PYVER and the build tools in $venv (one time)"
-	local ub; ub="$(python3 -m site --user-base 2>/dev/null)/bin"; PATH="$PATH:$ub"
+	# `python3 -m site --user-base` exits non-zero when user site-packages are off (inside any venv),
+	# which set -e would turn into a silent exit; hence || true.
+	local ub; ub="$(python3 -m site --user-base 2>/dev/null || true)/bin"; PATH="$PATH:$ub"
 	command -v uv >/dev/null || python3 -m pip install --user -q uv || die "pip install uv failed"
 	uv venv -q --python "$PYVER" "$venv" || die "uv could not set up Python $PYVER"
 	uv pip install -q --python "$venv/bin/python3" meson ninja pkgconf mako pyyaml packaging cmake ||
@@ -52,8 +54,6 @@ check_tools() {
 	ensure_python
 	say "checking tools"
 	local miss=()
-	# pip --user installs (meson, ninja, pkgconf) land here; no Homebrew or sudo needed.
-	PATH="$(python3 -m site --user-base 2>/dev/null)/bin:$PATH"; export PATH
 	for t in git clang meson ninja python3; do command -v "$t" >/dev/null || miss+=("$t"); done
 	[ ${#miss[@]} -eq 0 ] || die "missing: ${miss[*]}  (xcode-select --install; pip3 install --user meson ninja pkgconf)"
 	python3 -c 'import mako, yaml, packaging' 2>/dev/null ||
