@@ -5,6 +5,7 @@
 #include "Navi48Bringup.hpp"
 #include "amd/navi33_fw.h"
 #include "amd/navi33_gfx.h"
+#include "amd/navi33_native.h"
 #include "apple/Navi48Ttl.hpp"
 #include "apple/AppleTtlHook.hpp"
 #include "apple/AppleHardwareHook.hpp"
@@ -1153,6 +1154,11 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	setProperty("VM,WaitedUs", static_cast<uint64_t>(vm.waitedUs), 32);
 	setProperty("VM,Stage12", vm.stage);
 	N48LOG("psp-stage12: %s", vm.stage);
+	// The app door: with VMID 8 proven, the N48N user client runs on this card (navi33_native.cpp).
+	if (vm.passed) {
+		amdgpu::n33n_attach(dev, bootFbOff, bootFbLen);
+		setProperty("N33,Native", amdgpu::n33n_available() ? "ready" : "not-ready");
+	}
 }
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware

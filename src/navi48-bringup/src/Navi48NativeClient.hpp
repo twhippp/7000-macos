@@ -44,6 +44,8 @@ private:
 	task_t         task   { nullptr };
 	bool           opened { false };   // this object owns the (single) native session
 	bool           privileged { false };
+	bool           n33 { false };          // this session runs on the Navi 33 engine (navi33_native.cpp)
+	void           closeEngine(const char *how);
 	bool           adminClient { false };   // 0.0.612: admitted as an administrator (root). false = admitted by the uid-88 rule: it reaches only the selectors of n48native::policy::selector_allowed
 };
 

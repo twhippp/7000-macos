@@ -5,6 +5,7 @@
 #include "Navi48Bringup.hpp"
 #include "amd/amdgpu_init.h"
 #include "amd/native_s1c.h"
+#include "amd/navi33_native.h"
 #include "amd/native_open_policy_pure.h"   // 0.0.612: the open decision (uid 88 behind navi48-metal-ws=1)
 #include "amd/amdgpu_log.h"
 #include "dcn/navi48_dcn.hpp"
@@ -31,12 +32,13 @@ IOReturn IOAccelNavi48NativeClient::create(Navi48Bringup *owner, task_t owningTa
 		return kIOReturnNotPrivileged;   // non-root (the contract maps it to -EACCES)
 	}
 	uc->owner = owner;
+	uc->n33 = amdgpu::n33n_available();   // Navi 33: the gfx11 engine (stages 1-12 passed this boot)
 	// The gate, exclusivity and the fresh tree. Nothing has been attached yet, so a refusal is a plain release.
-	const IOReturn rc = amdgpu::n1c_open(*owner->bringupContext());
+	const IOReturn rc = uc->n33 ? amdgpu::n33n_open() : amdgpu::n1c_open(*owner->bringupContext());
 	if (rc != kIOReturnSuccess) { uc->release(); return rc; }
 	uc->opened = true;
-	if (!uc->attach(owner)) { amdgpu::n1c_close("attach failed"); uc->opened = false; uc->release(); return kIOReturnInternalError; }
-	if (!uc->start(owner))  { uc->detach(owner); amdgpu::n1c_close("start failed"); uc->opened = false; uc->release(); return kIOReturnInternalError; }
+	if (!uc->attach(owner)) { uc->closeEngine("attach failed"); uc->opened = false; uc->release(); return kIOReturnInternalError; }
+	if (!uc->start(owner))  { uc->detach(owner); uc->closeEngine("start failed"); uc->opened = false; uc->release(); return kIOReturnInternalError; }
 	*handler = uc;
 	return kIOReturnSuccess;
 }
@@ -58,7 +60,7 @@ bool IOAccelNavi48NativeClient::initWithTask(task_t owningTask, void *securityID
 	if (gMetalWsLatch == n48native::policy::kLatchUnset) latchBootArgs();
 	const bool admin = clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
 	const uint32_t uid = (uint32_t)kauth_cred_getuid(kauth_cred_get());
-	const n48native::policy::OpenDecision d = n48native::policy::open_decision(admin, uid, n48native::policy::latch_is_on(gMetalWsLatch), amdgpu::n1c_is_open());
+	const n48native::policy::OpenDecision d = n48native::policy::open_decision(admin, uid, n48native::policy::latch_is_on(gMetalWsLatch), amdgpu::n1c_is_open() || amdgpu::n33n_is_open());
 	if (!d.admit) {
 		NCLOG("open refused: uid %u, reason: %s", uid, n48native::policy::open_reason_text(d.reason));
 		return false;
@@ -77,12 +79,12 @@ bool IOAccelNavi48NativeClient::start(IOService *provider) {
 
 // Cleanup is idempotent (n1c_close), and runs from every path the contract names: clientClose, clientDied (which calls clientClose) and stop.
 void IOAccelNavi48NativeClient::stop(IOService *provider) {
-	if (opened) { n48disp_on_ws_client_closed(adminClient); amdgpu::n1c_close("stop"); opened = false; }   // 0.0.617 (K1)
+	if (opened) { n48disp_on_ws_client_closed(adminClient); closeEngine("stop"); opened = false; }   // 0.0.617 (K1)
 	super::stop(provider);
 }
 
 IOReturn IOAccelNavi48NativeClient::clientClose() {
-	if (opened) { n48disp_on_ws_client_closed(adminClient); amdgpu::n1c_close("clientClose"); opened = false; terminate(); }   // 0.0.617 (K1): the uid-88 client's close disarms an armed display pipe FIRST, with no lock held
+	if (opened) { n48disp_on_ws_client_closed(adminClient); closeEngine("clientClose"); opened = false; terminate(); }   // 0.0.617 (K1): the uid-88 client's close disarms an armed display pipe FIRST, with no lock held
 	return kIOReturnSuccess;
 }
 
@@ -90,7 +92,7 @@ IOReturn IOAccelNavi48NativeClient::clientMemoryForType(UInt32 type, IOOptionBit
 	if (!memory) return kIOReturnBadArgument;
 	*memory = nullptr;
 	if (!opened) return kIOReturnNotReady;
-	return amdgpu::n1c_memory_for_handle((uint32_t)type, options, memory);
+	return n33 ? amdgpu::n33n_memory_for_handle((uint32_t)type, options, memory) : amdgpu::n1c_memory_for_handle((uint32_t)type, options, memory);
 }
 
 // Every selector's shape is checked here, exactly: scalar counts, struct input/output sizes, and that nothing arrives out of line.
@@ -112,39 +114,42 @@ IOReturn IOAccelNavi48NativeClient::externalMethod(uint32_t selector, IOExternal
 		if (gSelRefusedLogged < 16u && OSIncrementAtomic((volatile SInt32 *)&gSelRefusedLogged) < 16) NCLOG("selector %u refused: not permitted for a uid-88 (non-administrator) client", selector);
 		return kIOReturnNotPrivileged;
 	}
+	// Navi 33: selectors 0..8 run on the gfx11 engine; scanout, DAL, mode, Metal nub and host import are not there yet.
+#define N33(fn) (n33 ? amdgpu::n33n_##fn : amdgpu::n1c_##fn)
+	if (n33 && selector > N48N_SEL_WAITSEQ) return kIOReturnUnsupported;
 	switch (selector) {
 	case N48N_SEL_HELLO:
 		if (!shape(2, 4, 0, 0)) return kIOReturnBadArgument;
-		return amdgpu::n1c_hello(si[0], si[1], so);
+		return N33(hello)(si[0], si[1], so);
 	case N48N_SEL_QUERYINFO:
 		if (!shape(0, 0, 0, sizeof(n48n_info))) return kIOReturnBadArgument;
-		return amdgpu::n1c_query_info(static_cast<n48n_info *>(args->structureOutput));
+		return N33(query_info)(static_cast<n48n_info *>(args->structureOutput));
 	case N48N_SEL_READREGS: {
 		if (sic != 3 || soc != 0 || sis != 0) return kIOReturnBadArgument;
 		if (si[1] < 1 || si[1] > 16 || sos != (uint32_t)si[1] * 4u || args->structureOutput == nullptr) return kIOReturnBadArgument;
-		return amdgpu::n1c_read_regs(si[0], si[1], si[2], static_cast<uint32_t *>(args->structureOutput));
+		return N33(read_regs)(si[0], si[1], si[2], static_cast<uint32_t *>(args->structureOutput));
 	}
 	case N48N_SEL_BOCREATE:
 		if (!shape(0, 4, sizeof(n48n_gem_create_in), 0)) return kIOReturnBadArgument;
-		return amdgpu::n1c_bo_create(static_cast<const n48n_gem_create_in *>(args->structureInput), so);
+		return N33(bo_create)(static_cast<const n48n_gem_create_in *>(args->structureInput), so);
 	case N48N_SEL_BOFREE:
 		if (!shape(1, 0, 0, 0)) return kIOReturnBadArgument;
-		return amdgpu::n1c_bo_free(si[0]);
+		return N33(bo_free)(si[0]);
 	case N48N_SEL_GEMVA:
 		if (!shape(0, 0, sizeof(n48n_gem_va), 0)) return kIOReturnBadArgument;
-		return amdgpu::n1c_gem_va(static_cast<const n48n_gem_va *>(args->structureInput));
+		return N33(gem_va)(static_cast<const n48n_gem_va *>(args->structureInput));
 	case N48N_SEL_CTX:
 		if (!shape(0, 0, sizeof(n48n_ctx), sizeof(n48n_ctx))) return kIOReturnBadArgument;
-		return amdgpu::n1c_ctx(static_cast<const n48n_ctx *>(args->structureInput), static_cast<n48n_ctx *>(args->structureOutput));
+		return N33(ctx)(static_cast<const n48n_ctx *>(args->structureInput), static_cast<n48n_ctx *>(args->structureOutput));
 	case N48N_SEL_SUBMIT: {
 		// 32 + 32*n bytes: the size is checked against num_ibs inside the parser; here only the shape and the ceiling.
 		if (sic != 0 || soc != 1 || sos != 0 || sis < 32u + 32u || sis > 32u + 32u * N48N_MAX_IBS || args->structureInput == nullptr)
 			return kIOReturnBadArgument;
-		return amdgpu::n1c_submit(static_cast<const uint8_t *>(args->structureInput), sis, so);
+		return N33(submit)(static_cast<const uint8_t *>(args->structureInput), sis, so);
 	}
 	case N48N_SEL_WAITSEQ:
 		if (!shape(3, 3, 0, 0)) return kIOReturnBadArgument;
-		return amdgpu::n1c_wait(si[0], si[1], so);
+		return N33(wait)(si[0], si[1], so);
 	// ---- ABI 1.1 (0.0.603): the scanout selectors. bind() arms the display layer (idempotent; it writes no register) - on a native boot no
 	// accel verb ever does, so the first scanout call is what binds it.
 	case N48N_SEL_SCAN_QUERY:
@@ -211,5 +216,10 @@ IOReturn IOAccelNavi48NativeClient::externalMethod(uint32_t selector, IOExternal
 	default:
 		break;
 	}
+#undef N33
 	return kIOReturnBadArgument;   // an unknown selector on the native client: nothing falls through to IOUserClient's dispatch
+}
+
+void IOAccelNavi48NativeClient::closeEngine(const char *how) {
+	if (n33) amdgpu::n33n_close(how); else amdgpu::n1c_close(how);
 }

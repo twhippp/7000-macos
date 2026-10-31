@@ -244,4 +244,12 @@ struct N33VmReport {
 };
 kern_return_t navi33_vm_test(DeviceContext &dev, N33VmReport &rep, uint32_t timeoutUs = 200000);
 
+// ---- services for the native engine (valid once stage 12 passed) ----
+bool     navi33_queues_ready();
+uint64_t navi33_slot_off(const DeviceContext &d);                  // VRAM offset of the 128 KiB kernel slot
+uint32_t navi33_gc_reg(const DeviceContext &d, uint32_t off, uint32_t baseIdx);
+uint32_t navi33_release_mem_dw1();
+bool     navi33_flush_vmid(DeviceContext &dev, uint32_t vmid, uint32_t timeoutUs = 200000);
+bool     navi33_gfx_emit(DeviceContext &dev, const uint32_t *dw, uint32_t n);
+
 } // namespace amdgpu

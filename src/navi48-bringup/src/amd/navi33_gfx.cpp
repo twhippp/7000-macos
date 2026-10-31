@@ -1655,6 +1655,7 @@ constexpr uint64_t kVaIb = 0x100000000ull, kVaA = kVaIb + 0x1000, kVaB = kVaIb +
 constexpr uint32_t kValA = 0x5612A001u, kValB = 0x5612B002u, kMarker12 = 0x56120C0Du;
 } // namespace
 
+extern bool gN33VmOk;
 kern_return_t navi33_vm_test(DeviceContext &dev, N33VmReport &rep, uint32_t timeoutUs) {
 	rep = N33VmReport{};
 	rep.stage = "vm";
@@ -1701,41 +1702,7 @@ kern_return_t navi33_vm_test(DeviceContext &dev, N33VmReport &rep, uint32_t time
 	rep.ctxCntl = RREG32(dev, g0(V::CNTL));
 
 	// ---- 3. flush VMID 8's TLB through the compute queue (MMIO flushes are never acked here) ----
-	{
-		const uint32_t s1 = g1(G::SCRATCH_REG1);
-		WREG32(dev, s1, 0);
-		uint32_t req = 0;
-		req = setf(req, INV_PER_VMID_INVALIDATE_REQ, 1u << V::kVmid);
-		req = setf(req, INV_FLUSH_TYPE, 0);
-		req = setf(req, INV_INVALIDATE_L2_PTES, 1);
-		req = setf(req, INV_INVALIDATE_L2_PDE0, 1);
-		req = setf(req, INV_INVALIDATE_L2_PDE1, 1);
-		req = setf(req, INV_INVALIDATE_L2_PDE2, 1);
-		req = setf(req, INV_INVALIDATE_L1_PTES, 1);
-		uint32_t fp[kCpPad];
-		for (uint32_t i = 0; i < kCpPad; i++) fp[i] = kGfxNop;
-		uint32_t k = 0;
-		fp[k++] = pkt3(kPKT3_WAIT_REG_MEM, 5);
-		fp[k++] = 3u | (0u << 4) | (1u << 6) | (0u << 8);
-		fp[k++] = g0(R::GCVM_INVALIDATE_ENG17_REQ);
-		fp[k++] = g0(R::GCVM_INVALIDATE_ENG17_ACK);
-		fp[k++] = req;
-		fp[k++] = 1u << V::kVmid;
-		fp[k++] = 0x20;
-		fp[k++] = pkt3(kPKT3_WRITE_DATA, 3);
-		fp[k++] = kWR_CONFIRM;
-		fp[k++] = s1;
-		fp[k++] = 0;
-		fp[k++] = 0x7B1F1008u;
-		const uint32_t wp = gCpWptrDw;
-		for (uint32_t i = 0; i < kCpPad; i++)
-			WBAR0_32(dev, base + kCpRingOff + (uint64_t)((wp + i) % (kCpRingBytes / 4)) * 4, fp[i]);
-		cpCommit(dev, base + kCpWptrOff, wp + kCpPad);
-		for (uint32_t us = 0; us < timeoutUs; us += 10) {
-			if (RREG32(dev, s1) == 0x7B1F1008u) { rep.tlbFlushOk = true; break; }
-			IODelay(10);
-		}
-	}
+	rep.tlbFlushOk = navi33_flush_vmid(dev, V::kVmid, timeoutUs);
 
 	// ---- 4. the IB on the gfx queue with vmid 8 (gfx_v11_0_ring_emit_ib_gfx), then a marker ----
 	const uint32_t scratch = g1(C::SCRATCH_REG0);
@@ -1770,6 +1737,7 @@ kern_return_t navi33_vm_test(DeviceContext &dev, N33VmReport &rep, uint32_t time
 	grbm_select(dev, 0, 0, 0, 0);
 	rep.gfxRptr = RREG32(dev, g0(G::CP_GFX_HQD_RPTR));
 	rep.passed = rep.got0 == kValA && rep.got1 == kValB;
+	gN33VmOk = rep.passed;
 	rep.stage = rep.passed ? "vm-ok" :
 	            RREG32(dev, scratch) != kMarker12 ? "vm-timeout" :
 	            (rep.got0 == 0xDEADBEEFu && rep.got1 == 0xDEADBEEFu) ? "vm-writes-lost" : "vm-wrong-data";
@@ -1777,6 +1745,79 @@ kern_return_t navi33_vm_test(DeviceContext &dev, N33VmReport &rep, uint32_t time
 	          V::kVmid, (unsigned long long)rep.rootPa, rep.ctxCntl, rep.tlbFlushOk ? "ok" : "NOT acked",
 	          rep.got0, rep.got1, us, rep.gfxRptr, rep.stage);
 	return rep.passed ? kIOReturnSuccess : kIOReturnIOError;
+}
+
+// ============================================================================
+// Services for the native engine (navi33_native.cpp), valid once stage 12 passed
+// ============================================================================
+bool gN33VmOk = false;
+bool navi33_queues_ready() { return gN33VmOk; }
+uint64_t navi33_slot_off(const DeviceContext &d) { return slot(d); }
+uint32_t navi33_gc_reg(const DeviceContext &d, uint32_t off, uint32_t baseIdx) { return baseIdx ? gc1(d, off) : gc0(d, off); }
+uint32_t navi33_release_mem_dw1() { return kRM_DW1; }
+
+// gmc_v11_0_flush_gpu_tlb for one VMID, done the way stage 9 proved: a write-wait-write on the
+// compute queue (the CPU's MMIO request is never acked on this part), then a marker.
+bool navi33_flush_vmid(DeviceContext &dev, uint32_t vmid, uint32_t timeoutUs) {
+	if (gCpWptrDw == 0) return false;
+	const uint64_t base = slot(dev);
+	const uint32_t s1 = gc1(dev, G::SCRATCH_REG1);
+	static uint32_t gFlushSeq = 0x7B1F2000u;
+	const uint32_t mark = ++gFlushSeq;
+	uint32_t req = 0;
+	req = setf(req, INV_PER_VMID_INVALIDATE_REQ, 1u << vmid);
+	req = setf(req, INV_FLUSH_TYPE, 0);
+	req = setf(req, INV_INVALIDATE_L2_PTES, 1);
+	req = setf(req, INV_INVALIDATE_L2_PDE0, 1);
+	req = setf(req, INV_INVALIDATE_L2_PDE1, 1);
+	req = setf(req, INV_INVALIDATE_L2_PDE2, 1);
+	req = setf(req, INV_INVALIDATE_L1_PTES, 1);
+	uint32_t fp[16];
+	uint32_t k = 0;
+	fp[k++] = pkt3(kPKT3_WAIT_REG_MEM, 5);
+	fp[k++] = 3u | (0u << 4) | (1u << 6) | (0u << 8);
+	fp[k++] = gc0(dev, R::GCVM_INVALIDATE_ENG17_REQ);
+	fp[k++] = gc0(dev, R::GCVM_INVALIDATE_ENG17_ACK);
+	fp[k++] = req;
+	fp[k++] = 1u << vmid;
+	fp[k++] = 0x20;
+	fp[k++] = pkt3(kPKT3_WRITE_DATA, 3);
+	fp[k++] = kWR_CONFIRM;
+	fp[k++] = s1;
+	fp[k++] = 0;
+	fp[k++] = mark;
+	const uint32_t wp = gCpWptrDw;
+	for (uint32_t i = 0; i < k; i++)
+		WBAR0_32(dev, base + kCpRingOff + (uint64_t)((wp + i) % (kCpRingBytes / 4)) * 4, fp[i]);
+	cpCommit(dev, base + kCpWptrOff, wp + k);
+	for (uint32_t us = 0; us < timeoutUs; us += 5) {
+		if (RREG32(dev, s1) == mark) return true;
+		IODelay(5);
+	}
+	return false;
+}
+
+// Append dwords to the gfx queue and ring its doorbell. Waits (bounded) for room.
+bool navi33_gfx_emit(DeviceContext &dev, const uint32_t *dw, uint32_t n) {
+	constexpr uint32_t kRing = kGfxRingBytes / 4;
+	if (gGfxWptrDw == 0 || n == 0 || n > kRing / 2) return false;
+	const uint64_t base = slot(dev);
+	for (uint32_t us = 0;; us += 10) {
+		grbm_select(dev, 0, 0, 0, 0);
+		const uint32_t rptr = RREG32(dev, gc0(dev, G::CP_GFX_HQD_RPTR)) % kRing;
+		const uint32_t used = (gGfxWptrDw % kRing - rptr + kRing) % kRing;
+		if (used + n + 16 < kRing) break;
+		if (us >= 200000) return false;
+		IODelay(10);
+	}
+	for (uint32_t i = 0; i < n; i++)
+		WBAR0_32(dev, base + kGfxRingOff + (uint64_t)((gGfxWptrDw + i) % kRing) * 4, dw[i]);
+	const uint32_t nw = gGfxWptrDw + n;
+	WBAR0_64(dev, base + kGfxWptrOff, nw);
+	amdgpu_hdp_flush(dev);
+	ring64(dev, kGfxDoorbell, nw);
+	gGfxWptrDw = nw;
+	return true;
 }
 
 } // namespace amdgpu
