@@ -512,6 +512,61 @@ bool Navi48Bringup::runPspChain(const uint8_t *fw, size_t fwSize, int genInt) {
 void Navi48Bringup::stagePSPNavi33() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("navi33-psp", &on, sizeof(on)) || on == 0) return;
+	stagePSPNavi33Body();
+	publishNavi33Summary();
+}
+
+// Condenses the PSP,* / FW,* / GFX,* / SMU,* / SDMA,* / GFXHUB,* properties into two short
+// strings, so one `ioreg -l | grep '"N33,'` shows where the bring-up got to. The detailed
+// properties stay published for diagnosis.
+void Navi48Bringup::publishNavi33Summary() {
+	auto str = [&](const char *k) -> const char * {
+		OSString *s = OSDynamicCast(OSString, getProperty(k));
+		return s ? s->getCStringNoCopy() : nullptr;
+	};
+	auto num = [&](const char *k, uint64_t &v) -> bool {
+		OSNumber *n = OSDynamicCast(OSNumber, getProperty(k));
+		if (!n) return false;
+		v = n->unsigned64BitValue();
+		return true;
+	};
+	auto yes = [&](const char *k) { return getProperty(k) == kOSBooleanTrue; };
+
+	char sum[256] = {}, warn[192] = {};
+	size_t n = 0, w = 0;
+	auto add = [&](const char *fmt, auto... a) {
+		if (n < sizeof(sum)) n += (size_t)snprintf(sum + n, sizeof(sum) - n, fmt, a...);
+	};
+	auto addw = [&](const char *t) {
+		if (w < sizeof(warn)) w += (size_t)snprintf(warn + w, sizeof(warn) - w, "%s%s", w ? ", " : "", t);
+	};
+
+	const char *s1 = str("PSP,Stage");
+	add("S1 %s", s1 ? s1 : "not-run");
+	if (const char *s2 = str("PSP,Stage2")) add(" | S2 %s", s2);
+	if (const char *s3 = str("PSP,Stage3")) {
+		uint64_t acc = 0, tot = 0;
+		num("FW,Accepted", acc); num("FW,Total", tot);
+		add(" | S3 %s (fw %llu/%llu)", s3, (unsigned long long)acc, (unsigned long long)tot);
+		if (acc != tot) addw("firmware-rejected");
+	}
+	if (const char *smu = str("SMU,Setup")) add(" | SMU %s", smu);
+	if (const char *s4 = str("SDMA,Stage4")) {
+		uint64_t v = 0, us = 0;
+		num("SDMA,TestValue", v); num("SDMA,WaitedUs", us);
+		add(" | S4 %s (read 0x%08x after %llu us)", s4, (uint32_t)v, (unsigned long long)us);
+		if (getProperty("GFXHUB,TlbFlushAcked") && !yes("GFXHUB,TlbFlushAcked")) addw("tlb-flush-not-acked");
+		uint64_t fault = 0;
+		if (num("GFXHUB,FaultStatus", fault) && (uint32_t)fault) addw("gpu-vm-fault");
+	}
+	setProperty("N33,Summary", sum);
+	setProperty("N33,Warnings", w ? warn : "none");
+	N48LOG("navi33: %s | warnings: %s", sum, w ? warn : "none");
+}
+
+void Navi48Bringup::stagePSPNavi33Body() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("navi33-psp", &on, sizeof(on)) || on == 0) return;
 	N48LOG("psp-stage: navi33-psp=1 — PSP 13.0.7 chain; this WRITES to VRAM and the PSP mailbox");
 	setProperty("PSP,Stage", "requested");
 	if (fw_psp_13_0_7_sos_size == 0) {
