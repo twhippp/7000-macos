@@ -130,39 +130,16 @@ struct Rig {
 		}
 	}
 
-	// The KIQ (RLC_CP_SCHEDULERS designated, doorbell 0) and the gfx queue it maps (doorbell 0x116).
+	// The gfx queue programmed through its HQD registers (doorbell 0x116).
 	void runKiq() {
-		if ((r(kGc1, 0x098a) & 0xFF) != (0x80 | (1u << 5) | (3u << 3)) || !(r(kGc0, 0x1fab) & 1u)) return;
-		const uint64_t ring = ((((uint64_t)r(kGc0, 0x1fb2)) << 32 | r(kGc0, 0x1fb1)) << 8) - kMcBase;
-		uint64_t wptr; std::memcpy(&wptr, &db[0], 8);
-		while (kiqDone < wptr) {
-			uint32_t h; std::memcpy(&h, &vram[ring + kiqDone * 4], 4);
-			const uint32_t op = (h >> 8) & 0xFF, n = (h >> 16) & 0x3FFF;
-			if (op == 0x10 && n == 0x3FFF) { kiqDone += 1; continue; }
-			uint32_t a[8]; std::memcpy(a, &vram[ring + (kiqDone + 1) * 4], 32);
-			if (op == 0xA2 && ((a[0] >> 26) & 7) == 4 && (a[1] >> 2) == 0x116) {   // MAP_QUEUES gfx
-				const uint64_t mqd = mc(a[2], a[3]);
-				uint32_t q[512]; std::memcpy(q, &vram[mqd], sizeof(q));
-				gfxRing = ((((uint64_t)q[137]) << 32 | q[136]) << 8) - kMcBase;
-				r(kGc0, 0x1e7e) = a[2];
-				r(kGc0, 0x1e80) = q[130];
-				kiqMapped = true;
-			}
-			if (op == 0x37 && (a[0] & 0xF00) == 0) regs[a[1]] = a[3];          // WRITE_DATA to a register
-			if (op == 0x3C && (a[0] & 0x40)) {                                   // WAIT_REG_MEM write-wait-write
-				regs[a[1]] = a[3];
-				r(kGc0, 0x16ce) = 1;   // the hub acks
-				if ((regs[a[2]] & a[4]) != a[4]) break;
-			}
-			kiqDone += n + 2;
-		}
-		if (!kiqMapped) return;
+		if (!(r(kGc0, 0x1e80) & 1u)) return;
+		const uint64_t gfxRingNow = ((((uint64_t)r(kGc0, 0x1e87)) << 32 | r(kGc0, 0x1e86)) << 8) - kMcBase;
 		uint64_t gw; std::memcpy(&gw, &db[0x116 * 4], 8);
 		while (gfxDone < gw) {
-			uint32_t h; std::memcpy(&h, &vram[gfxRing + gfxDone * 4], 4);
+			uint32_t h; std::memcpy(&h, &vram[gfxRingNow + gfxDone * 4], 4);
 			const uint32_t op = (h >> 8) & 0xFF, n = (h >> 16) & 0x3FFF;
 			if (op == 0x10 && n == 0x3FFF) { gfxDone += 1; continue; }
-			uint32_t a[2]; std::memcpy(a, &vram[gfxRing + (gfxDone + 1) * 4], 8);
+			uint32_t a[2]; std::memcpy(a, &vram[gfxRingNow + (gfxDone + 1) * 4], 8);
 			if (op == 0x79) regs[0xC000 + a[0]] = a[1];
 			gfxDone += n + 2;
 		}
@@ -194,6 +171,14 @@ struct Rig {
 					const uint64_t dst = (((uint64_t)q[3] << 32) | q[2]) - kMcBase;
 					std::memcpy(&vram[dst], &q[4], 4);
 				}
+			}
+			if (op == 0x3C) {   // WAIT_REG_MEM write-wait-write: the hub acks
+				uint32_t a[4]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 16);
+				if (a[0] & 0x40) { regs[a[1]] = a[3]; r(kGc0, 0x16ce) = 1; }
+			}
+			if (op == 0x37) {   // WRITE_DATA to a register (dst_sel 0)
+				uint32_t a[4]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 16);
+				if ((a[0] & 0xF00) == 0) regs[a[1]] = a[3];
 			}
 			if (op == 0x49) {   // RELEASE_MEM: dw1 event, dw2 sel, addr lo/hi, data lo/hi
 				uint32_t a[6]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 24);
@@ -295,19 +280,30 @@ int main() {
 		check(navi33_screen_test(k.dev, ~0ull, 0, none, 1) == kIOReturnNotFound, "  ...no console FB -> skipped");
 	}
 	{
+		// stage 9 runs after stages 4-7 (it continues the compute queue for the TLB flush)
 		Rig k(true);
 		k.kiqSim = true;
 		k.dev.bar2 = k.db.data(); k.dev.bar2Size = k.db.size();
 		N33GfxReport rep {};
 		navi33_gfxhub_enable(k.dev, rep);
+		navi33_sdma_ring_test(k.dev, rep);
+		N33CpFw fw {};
+		N33CpReport cp {};
+		navi33_cp_gfx_ring_test(k.dev, fw, cp);
+		N33IbReport ib {};
+		navi33_ib_tests(k.dev, ib);
+		N33FenceReport fr {};
+		navi33_fence_copy_tests(k.dev, fr);
+		k.r(kGc0, 0x16ce) = 0;
 		N33GfxQReport gq {};
 		check(navi33_gfx_queue_test(k.dev, gq) == kIOReturnSuccess && std::strcmp(gq.stage, "gfx-queue-ok") == 0,
-		      "stage 9: KIQ maps the gfx queue, gfx ring writes SCRATCH_REG0");
-		check(gq.kiqActive && gq.kiqProcessed && gq.gfxHqdActive == 1 && gq.gfxRptr == 256, "  ...KIQ ran, gfx HQD active, gfx rptr 256");
-		check((k.r(kGc1, 0x098a) & 0xFF) == 0xB8, "  ...RLC_CP_SCHEDULERS = KIQ me1 pipe3 queue0");
-		check(gq.kiqTlbFlushOk && k.r(kGc0, 0x16bc) != 0, "  ...GFXHUB TLB flush through the KIQ (WAIT_REG_MEM on ENG17) acked");
-		uint32_t gq128[2]; std::memcpy(gq128, &k.vram[k.dev.vramBase + kN33GfxVramOffset + 0xF000 + 128 * 4], 8);
-		check(gq128[0] == (uint32_t)(kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0xF000), "  ...gfx MQD points at itself");
+		      "stage 9: gfx queue from its MQD, gfx ring writes SCRATCH_REG0");
+		check(gq.tlbFlushOk && k.r(kGc0, 0x16bc) != 0, "  ...GFXHUB TLB flush through the compute queue acked");
+		check(gq.gfxHqdActive == 1 && gq.gfxRptr == 256, "  ...gfx HQD active, rptr 256");
+		check(((k.r(kGc0, 0x1e8d) >> 2) & 0x3FFFFFF) == 0x116 && (k.r(kGc0, 0x1e8d) & (1u << 30)), "  ...gfx doorbell 0x116 enabled");
+		const uint64_t gb = ((((uint64_t)k.r(kGc0, 0x1e87)) << 32) | k.r(kGc0, 0x1e86)) << 8;
+		check(gb == kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0xD000, "  ...gfx HQD base = the gfx ring");
+		check(k.r(kGc0, 0x1e7e) == (uint32_t)(kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0xF000), "  ...CP_GFX_MQD_BASE_ADDR = the MQD");
 		N33GfxQReport none {};
 		DeviceContext d2 = k.dev; d2.bar2 = nullptr;
 		check(navi33_gfx_queue_test(d2, none) == kIOReturnNotReady, "  ...no BAR2 -> refuses");

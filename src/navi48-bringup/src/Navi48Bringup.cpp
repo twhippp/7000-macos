@@ -557,8 +557,8 @@ void Navi48Bringup::publishNavi33Summary() {
 		add(" | S4 %s (read 0x%08x after %llu us)", s4, (uint32_t)v, (unsigned long long)us);
 		// The CPU's MMIO flush in stage 4 is never acked on this card; the KIQ flush in stage 9
 		// (Linux's normal path) is the one that counts once it has run.
-		if (getProperty("GFXQ,KiqTlbFlushOk")) {
-			if (!yes("GFXQ,KiqTlbFlushOk")) addw("tlb-flush-not-acked-via-kiq");
+		if (getProperty("GFXQ,TlbFlushOk")) {
+			if (!yes("GFXQ,TlbFlushOk")) addw("tlb-flush-not-acked-via-cp");
 		} else if (getProperty("GFXHUB,TlbFlushAcked") && !yes("GFXHUB,TlbFlushAcked")) {
 			addw("tlb-flush-not-acked");
 		}
@@ -1067,22 +1067,21 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	}
 	if (level < 9) return;
 
-	// 13. Stage 9 — the graphics queue: the KIQ maps a gfx queue described by a v11_gfx_mqd,
-	//     then the gfx ring test runs on it. This is the queue all drawing will use.
+	// 13. Stage 9 — the graphics queue, programmed from its v11_gfx_mqd (AMD's RDNA3
+	//     bring-up path), plus the GFXHUB TLB flush through the compute queue; then the gfx
+	//     ring test on it. This is the queue all drawing will use.
 	amdgpu::N33GfxQReport gq {};
 	(void)amdgpu::navi33_gfx_queue_test(dev, gq);
-	setProperty("GFXQ,KiqActive", gq.kiqActive);
-	setProperty("GFXQ,KiqProcessed", gq.kiqProcessed);
-	setProperty("GFXQ,KiqWaitedUs", static_cast<uint64_t>(gq.kiqWaitedUs), 32);
+	setProperty("GFXQ,TlbFlushOk", gq.tlbFlushOk);
+	setProperty("GFXQ,TlbFlushUs", static_cast<uint64_t>(gq.tlbFlushUs), 32);
+	setProperty("GFXQ,TlbAckAfter", static_cast<uint64_t>(gq.tlbAckAfter), 32);
 	setProperty("GFXQ,HqdActive", static_cast<uint64_t>(gq.gfxHqdActive), 32);
-	setProperty("GFXQ,MqdBaseLo", static_cast<uint64_t>(gq.gfxMqdBaseLo), 32);
 	setProperty("GFXQ,Rptr", static_cast<uint64_t>(gq.gfxRptr), 32);
+	setProperty("GFXQ,RptrWriteback", gq.rptrWriteback, 64);
 	setProperty("GFXQ,Scratch", static_cast<uint64_t>(gq.scratch), 32);
 	setProperty("GFXQ,WaitedUs", static_cast<uint64_t>(gq.gfxWaitedUs), 32);
 	setProperty("GFXQ,PfpPC", static_cast<uint64_t>(gq.pfpPc), 32);
-	setProperty("GFXQ,KiqTlbFlushOk", gq.kiqTlbFlushOk);
-	setProperty("GFXQ,KiqTlbFlushUs", static_cast<uint64_t>(gq.kiqTlbFlushUs), 32);
-	setProperty("GFXQ,TlbAckAfter", static_cast<uint64_t>(gq.tlbAckAfter), 32);
+	setProperty("GFXQ,MePC", static_cast<uint64_t>(gq.mePc), 32);
 	setProperty("GFXQ,Stage9", gq.stage);
 	N48LOG("psp-stage9: %s", gq.stage);
 }

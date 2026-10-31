@@ -1188,17 +1188,21 @@ kern_return_t navi33_screen_test(DeviceContext &dev, uint64_t fbOff, uint64_t fb
 // Stage 9 — the gfx queue via the KIQ
 // ============================================================================
 namespace {
-constexpr uint64_t kKiqRingOff = 0xC000, kGfxRingOff = 0xD000;          // 4 KiB each
-constexpr uint64_t kKiqMqdOff  = 0xE000, kKiqEopOff = 0xE800, kGfxMqdOff = 0xF000;   // 2 KiB each
-constexpr uint64_t kKiqRptrOff = 0xF800, kKiqWptrOff = 0xF808, kGfxRptrOff = 0xF810, kGfxWptrOff = 0xF818;
+constexpr uint32_t kCpWptrAfterS7 = kCpWptrAfterS6 + kCpPad;            // dwords on the compute queue
+constexpr uint64_t kGfxRingOff = 0xD000;                                // 4 KiB
+constexpr uint64_t kGfxMqdOff  = 0xF000;                                // 2 KiB
+constexpr uint64_t kGfxRptrOff = 0xF810, kGfxWptrOff = 0xF818;
 static_assert(kGfxWptrOff + 8 <= kN33GfxVramSize, "stage 9 stays inside the slot");
-constexpr uint32_t kKiqMe = 1, kKiqPipe = 3, kKiqQueue = 0;
-constexpr uint32_t kKiqDoorbell = kDbKiq << 1;                           // 0
 
-constexpr uint32_t kPKT3_SET_RESOURCES = 0xA0, kPKT3_MAP_QUEUES = 0xA2, kPKT3_WAIT_REG_MEM = 0x3C;
+constexpr uint32_t kPKT3_WAIT_REG_MEM = 0x3C;
 namespace G {   // gc_11_0_0_offset.h, BASE_IDX 0 (gfx HQD, banked by GRBM_GFX_CNTL)
-	constexpr uint32_t CP_GFX_MQD_BASE_ADDR = 0x1e7e, CP_GFX_HQD_ACTIVE = 0x1e80, CP_GFX_HQD_RPTR = 0x1e88;
-	constexpr uint32_t RLC_CP_SCHEDULERS = 0x098a;   // BASE_IDX 1
+	constexpr uint32_t CP_GFX_MQD_BASE_ADDR = 0x1e7e, CP_GFX_MQD_BASE_ADDR_HI = 0x1e7f, CP_GFX_HQD_ACTIVE = 0x1e80;
+	constexpr uint32_t CP_GFX_HQD_VMID = 0x1e81, CP_GFX_HQD_QUEUE_PRIORITY = 0x1e84, CP_GFX_HQD_QUANTUM = 0x1e85;
+	constexpr uint32_t CP_GFX_HQD_BASE = 0x1e86, CP_GFX_HQD_BASE_HI = 0x1e87, CP_GFX_HQD_RPTR = 0x1e88;
+	constexpr uint32_t CP_GFX_HQD_RPTR_ADDR = 0x1e89, CP_GFX_HQD_RPTR_ADDR_HI = 0x1e8a;
+	constexpr uint32_t CP_RB_WPTR_POLL_ADDR_LO = 0x1e8b, CP_RB_WPTR_POLL_ADDR_HI = 0x1e8c, CP_RB_DOORBELL_CONTROL = 0x1e8d;
+	constexpr uint32_t CP_GFX_HQD_CNTL = 0x1e8f, CP_GFX_HQD_WPTR = 0x1e91, CP_GFX_HQD_WPTR_HI = 0x1e92;
+	constexpr uint32_t CP_GFX_MQD_CONTROL = 0x1e9a;
 	constexpr uint32_t SCRATCH_REG1 = 0x2041;        // BASE_IDX 1
 }
 namespace GM {  // v11_structs.h struct v11_gfx_mqd, dword indices
@@ -1233,82 +1237,48 @@ kern_return_t navi33_gfx_queue_test(DeviceContext &dev, N33GfxQReport &rep, uint
 	auto g0 = [&](uint32_t r) { return gc0(dev, r); };
 	auto g1 = [&](uint32_t r) { return gc1(dev, r); };
 
-	bar0_memset_vram(dev, base + kKiqRingOff, kGfxNop, 0x1000);
-	bar0_memset_vram(dev, base + kGfxRingOff, kGfxNop, 0x1000);
-	bar0_memset_vram(dev, base + kKiqMqdOff, 0u, 0x2000);   // KIQ MQD + EOP
-	bar0_memset_vram(dev, base + kGfxMqdOff, 0u, 0x800);
-	bar0_memset_vram(dev, base + kKiqRptrOff, 0u, 0x20);
-
-	// ---- KIQ: gfx_v11_0_kiq_setting + compute_mqd_init + kiq_init_register ----
-	uint32_t t = RREG32(dev, g1(G::RLC_CP_SCHEDULERS)) & 0xffffff00u;
-	t |= (kKiqMe << 5) | (kKiqPipe << 3) | kKiqQueue;
-	WREG32(dev, g1(G::RLC_CP_SCHEDULERS), t | 0x80u);
-
-	uint32_t m[M::kCount] = {};
-	const uint64_t kmqd = mc(kKiqMqdOff), keop = mc(kKiqEopOff), kring = mc(kKiqRingOff);
-	const uint64_t krptr = mc(kKiqRptrOff), kwptr = mc(kKiqWptrOff);
-	m[M::header] = 0xC0310800u;
-	m[M::pipelinestat] = 1;
-	m[M::stm_se0] = m[M::stm_se1] = m[M::stm_se2] = m[M::stm_se3] = 0xFFFFFFFFu;
-	m[M::stm_se4] = m[M::stm_se5] = m[M::stm_se6] = m[M::stm_se7] = 0xFFFFFFFFu;
-	m[M::misc_reserved] = 7;
-	m[M::eop_base_lo] = (uint32_t)(keop >> 8);
-	m[M::eop_base_hi] = (uint32_t)((keop >> 8) >> 32);
-	m[M::eop_control] = setf(kHQD_EOP_CONTROL_DEFAULT, HQD_EOP_SIZE, 8);
-	m[M::pq_doorbell_control] = setf(setf(setf(setf(kHQD_PQ_DOORBELL_CONTROL_DEFAULT, HQD_DB_OFFSET, kKiqDoorbell),
-	                                           HQD_DB_EN, 1), HQD_DB_SOURCE, 0), HQD_DB_HIT, 0);
-	m[M::mqd_base_lo] = (uint32_t)kmqd & 0xfffffffcu;
-	m[M::mqd_base_hi] = (uint32_t)(kmqd >> 32);
-	m[M::mqd_control] = setf(kMQD_CONTROL_DEFAULT, MQD_VMID, 0);
-	m[M::pq_base_lo] = (uint32_t)(kring >> 8);
-	m[M::pq_base_hi] = (uint32_t)((kring >> 8) >> 32);
-	m[M::pq_control] = setf(setf(setf(setf(setf(setf(kHQD_PQ_CONTROL_DEFAULT, PQ_QUEUE_SIZE, 9), PQ_RPTR_BLOCK_SIZE, 9),
-	                                            PQ_UNORD_DISPATCH, 1), PQ_TUNNEL_DISPATCH, 0), PQ_PRIV_STATE, 1), PQ_KMD_QUEUE, 1);
-	m[M::rptr_report_lo] = (uint32_t)krptr & 0xfffffffcu;
-	m[M::rptr_report_hi] = (uint32_t)(krptr >> 32) & 0xffffu;
-	m[M::wptr_poll_lo] = (uint32_t)kwptr & 0xfffffffcu;
-	m[M::wptr_poll_hi] = (uint32_t)(kwptr >> 32) & 0xffffu;
-	m[M::persistent_state] = setf(kHQD_PERSISTENT_STATE_DEFAULT, PERSIST_PRELOAD_SIZE, 0x55);
-	m[M::ib_control] = setf(kHQD_IB_CONTROL_DEFAULT, IB_MIN_AVAIL_SIZE, 3);
-	m[M::quantum] = setf(setf(setf(0, QUANTUM_EN, 1), QUANTUM_SCALE, 1), QUANTUM_DURATION, 1);
-	m[M::active] = 1;
-	bar0_memcpy_to_vram(dev, base + kKiqMqdOff, m, sizeof(m));
-
-	grbm_select(dev, kKiqMe, kKiqPipe, kKiqQueue, 0);
-	WREG32(dev, g0(H::CP_PQ_WPTR_POLL_CNTL), setf(RREG32(dev, g0(H::CP_PQ_WPTR_POLL_CNTL)), PQ_POLL_EN, 0));
-	WREG32(dev, g0(H::CP_HQD_EOP_BASE_ADDR), m[M::eop_base_lo]);
-	WREG32(dev, g0(H::CP_HQD_EOP_BASE_ADDR_HI), m[M::eop_base_hi]);
-	WREG32(dev, g0(H::CP_HQD_EOP_CONTROL), m[M::eop_control]);
-	WREG32(dev, g0(H::CP_HQD_PQ_DOORBELL_CONTROL), m[M::pq_doorbell_control]);
-	if (RREG32(dev, g0(H::CP_HQD_ACTIVE)) & 1u) {
-		WREG32(dev, g0(H::CP_HQD_DEQUEUE_REQUEST), 1);
-		for (uint32_t j = 0; j < 100000 && (RREG32(dev, g0(H::CP_HQD_ACTIVE)) & 1u); j++) IODelay(1);
-		WREG32(dev, g0(H::CP_HQD_DEQUEUE_REQUEST), 0);
-		WREG32(dev, g0(H::CP_HQD_PQ_RPTR), 0);
-		WREG32(dev, g0(H::CP_HQD_PQ_WPTR_LO), 0);
-		WREG32(dev, g0(H::CP_HQD_PQ_WPTR_HI), 0);
+	// ---- 1. GFXHUB TLB flush through the compute queue (stages 5-7 left it at dword 768) ----
+	{
+		const uint32_t s1 = g1(G::SCRATCH_REG1);
+		WREG32(dev, s1, 0);
+		uint32_t req = 0;
+		req = setf(req, INV_PER_VMID_INVALIDATE_REQ, 1u << 0);
+		req = setf(req, INV_FLUSH_TYPE, 0);
+		req = setf(req, INV_INVALIDATE_L2_PTES, 1);
+		req = setf(req, INV_INVALIDATE_L2_PDE0, 1);
+		req = setf(req, INV_INVALIDATE_L2_PDE1, 1);
+		req = setf(req, INV_INVALIDATE_L2_PDE2, 1);
+		req = setf(req, INV_INVALIDATE_L1_PTES, 1);
+		uint32_t fp[kCpPad];
+		for (uint32_t i = 0; i < kCpPad; i++) fp[i] = kGfxNop;
+		uint32_t k = 0;
+		fp[k++] = pkt3(kPKT3_WAIT_REG_MEM, 5);              // ring_emit_reg_write_reg_wait (compute: ME)
+		fp[k++] = 3u /*equal*/ | (0u << 4) /*register*/ | (1u << 6) /*write, wait*/ | (0u << 8);
+		fp[k++] = g0(R::GCVM_INVALIDATE_ENG17_REQ);
+		fp[k++] = g0(R::GCVM_INVALIDATE_ENG17_ACK);
+		fp[k++] = req;
+		fp[k++] = 1u << 0;
+		fp[k++] = 0x20;
+		fp[k++] = pkt3(kPKT3_WRITE_DATA, 3);                // ring_emit_wreg on a compute ring
+		fp[k++] = kWR_CONFIRM;
+		fp[k++] = s1;
+		fp[k++] = 0;
+		fp[k++] = 0x7B1F1005u;
+		static_assert(kCpWptrAfterS7 + kCpPad <= kCpRingBytes / 4, "stage 9 flush must not wrap the compute ring");
+		bar0_memcpy_to_vram(dev, base + kCpRingOff + kCpWptrAfterS7 * 4, fp, sizeof(fp));
+		cpCommit(dev, base + kCpWptrOff, kCpWptrAfterS7 + kCpPad);
+		for (rep.tlbFlushUs = 0; rep.tlbFlushUs < timeoutUs; rep.tlbFlushUs += 10) {
+			if (RREG32(dev, s1) == 0x7B1F1005u) { rep.tlbFlushOk = true; break; }
+			IODelay(10);
+		}
+		rep.tlbAckAfter = RREG32(dev, g0(R::GCVM_INVALIDATE_ENG17_ACK));
 	}
-	WREG32(dev, g0(H::CP_MQD_BASE_ADDR), m[M::mqd_base_lo]);
-	WREG32(dev, g0(H::CP_MQD_BASE_ADDR_HI), m[M::mqd_base_hi]);
-	WREG32(dev, g0(H::CP_MQD_CONTROL), m[M::mqd_control]);
-	WREG32(dev, g0(H::CP_HQD_PQ_BASE), m[M::pq_base_lo]);
-	WREG32(dev, g0(H::CP_HQD_PQ_BASE_HI), m[M::pq_base_hi]);
-	WREG32(dev, g0(H::CP_HQD_PQ_CONTROL), m[M::pq_control]);
-	WREG32(dev, g0(H::CP_HQD_PQ_RPTR_REPORT_ADDR), m[M::rptr_report_lo]);
-	WREG32(dev, g0(H::CP_HQD_PQ_RPTR_REPORT_ADDR_HI), m[M::rptr_report_hi]);
-	WREG32(dev, g0(H::CP_HQD_PQ_WPTR_POLL_ADDR), m[M::wptr_poll_lo]);
-	WREG32(dev, g0(H::CP_HQD_PQ_WPTR_POLL_ADDR_HI), m[M::wptr_poll_hi]);
-	WREG32(dev, g0(H::CP_HQD_PQ_DOORBELL_CONTROL), m[M::pq_doorbell_control]);
-	WREG32(dev, g0(H::CP_HQD_PQ_WPTR_LO), 0);
-	WREG32(dev, g0(H::CP_HQD_PQ_WPTR_HI), 0);
-	WREG32(dev, g0(H::CP_HQD_VMID), 0);
-	WREG32(dev, g0(H::CP_HQD_PERSISTENT_STATE), m[M::persistent_state]);
-	WREG32(dev, g0(H::CP_HQD_ACTIVE), 1);
-	WREG32(dev, g0(H::CP_PQ_STATUS), setf(RREG32(dev, g0(H::CP_PQ_STATUS)), PQ_STATUS_DOORBELL_ENABLE, 1));
-	rep.kiqActive = RREG32(dev, g0(H::CP_HQD_ACTIVE)) & 1u;
-	grbm_select(dev, 0, 0, 0, 0);
 
-	// ---- the gfx queue's MQD: gfx_v11_0_gfx_mqd_init ----
+	// ---- 2. the gfx queue's MQD (gfx_v11_0_gfx_mqd_init) ----
+	bar0_memset_vram(dev, base + kGfxRingOff, kGfxNop, 0x1000);
+	bar0_memset_vram(dev, base + kGfxMqdOff, 0u, 0x800);
+	WBAR0_64(dev, base + kGfxRptrOff, 0);
+	WBAR0_64(dev, base + kGfxWptrOff, 0);
 	uint32_t q[GM::kCount] = {};
 	const uint64_t gmqd = mc(kGfxMqdOff), gring = mc(kGfxRingOff), grptr = mc(kGfxRptrOff), gwptr = mc(kGfxWptrOff);
 	q[GM::wptr] = 0; q[GM::wptr_hi] = 0;
@@ -1331,90 +1301,29 @@ kern_return_t navi33_gfx_queue_test(DeviceContext &dev, N33GfxQReport &rep, uint
 	q[GM::active] = 1;
 	bar0_memcpy_to_vram(dev, base + kGfxMqdOff, q, sizeof(q));
 
-	// ---- KIQ packets: SET_RESOURCES, MAP_QUEUES(gfx), then a marker write ----
-	const uint32_t s1 = g1(G::SCRATCH_REG1);
-	WREG32(dev, s1, 0);
-	uint32_t kp[kCpPad];
-	for (uint32_t i = 0; i < kCpPad; i++) kp[i] = kGfxNop;
-	uint32_t n = 0;
-	kp[n++] = pkt3(kPKT3_SET_RESOURCES, 6);
-	kp[n++] = (0u << 0) | (0xAu << 16) | (0u << 29);      // vmid_mask 0, unmap latency 0xa, queue_type KIQ
-	kp[n++] = 1u;                                         // queue mask lo: me 1 pipe 0 queue 0 (stage 5's queue)
-	kp[n++] = 0;
-	kp[n++] = 0; kp[n++] = 0;                             // cleaner shader: none
-	kp[n++] = 0;                                          // oac mask
-	kp[n++] = 0;                                          // gds heap
-	kp[n++] = pkt3(kPKT3_MAP_QUEUES, 5);
-	kp[n++] = (0u << 4) | (0u << 8) | (0u << 13) /*queue*/ | (0u << 16) /*pipe*/ | (0u << 18) /*me*/ |
-	          (0u << 21) | (0u << 24) | (4u << 26) /*engine_sel gfx*/ | (1u << 29);
-	kp[n++] = kGfxDoorbell << 2;
-	kp[n++] = (uint32_t)gmqd;
-	kp[n++] = (uint32_t)(gmqd >> 32);
-	kp[n++] = (uint32_t)gwptr;
-	kp[n++] = (uint32_t)(gwptr >> 32);
-	kp[n++] = pkt3(kPKT3_WRITE_DATA, 3);                  // gfx_v11_0_ring_emit_wreg on a KIQ: no address increment
-	kp[n++] = 1u << 16;
-	kp[n++] = s1;
-	kp[n++] = 0;
-	kp[n++] = 0x900DF00Du;
-	bar0_memcpy_to_vram(dev, base + kKiqRingOff, kp, sizeof(kp));
-	WBAR0_64(dev, base + kKiqWptrOff, kCpPad);
-	amdgpu_hdp_flush(dev);
-	ring64(dev, kKiqDoorbell, kCpPad);
-
-	uint32_t us = 0;
-	for (; us < timeoutUs; us += 10) {
-		if (RREG32(dev, s1) == 0x900DF00Du) { rep.kiqProcessed = true; break; }
-		IODelay(10);
-	}
-	rep.kiqWaitedUs = us;
-
-	// ---- GFXHUB TLB flush through the KIQ (stage 4's MMIO flush was never acked) ----
-	if (rep.kiqProcessed) {
-		uint32_t req = 0;
-		req = setf(req, INV_PER_VMID_INVALIDATE_REQ, 1u << 0);
-		req = setf(req, INV_FLUSH_TYPE, 0);
-		req = setf(req, INV_INVALIDATE_L2_PTES, 1);
-		req = setf(req, INV_INVALIDATE_L2_PDE0, 1);
-		req = setf(req, INV_INVALIDATE_L2_PDE1, 1);
-		req = setf(req, INV_INVALIDATE_L2_PDE2, 1);
-		req = setf(req, INV_INVALIDATE_L1_PTES, 1);
-		uint32_t fp[kCpPad];
-		for (uint32_t i = 0; i < kCpPad; i++) fp[i] = kGfxNop;
-		uint32_t k = 0;
-		fp[k++] = pkt3(kPKT3_WAIT_REG_MEM, 5);                 // gfx_v11_0_ring_emit_reg_write_reg_wait
-		fp[k++] = 3u /*FUNCTION equal*/ | (0u << 4) /*register*/ | (1u << 6) /*write, wait*/ | (0u << 8) /*ME*/;
-		fp[k++] = g0(R::GCVM_INVALIDATE_ENG17_REQ);
-		fp[k++] = g0(R::GCVM_INVALIDATE_ENG17_ACK);
-		fp[k++] = req;
-		fp[k++] = 1u << 0;                                     // ack bit of VMID 0
-		fp[k++] = 0x20;
-		fp[k++] = pkt3(kPKT3_WRITE_DATA, 3);
-		fp[k++] = 1u << 16;
-		fp[k++] = s1;
-		fp[k++] = 0;
-		fp[k++] = 0x7B1F1005u;
-		bar0_memcpy_to_vram(dev, base + kKiqRingOff + kCpPad * 4, fp, sizeof(fp));
-		amdgpu_hdp_flush(dev);
-		WBAR0_64(dev, base + kKiqWptrOff, 2 * kCpPad);
-		amdgpu_hdp_flush(dev);
-		ring64(dev, kKiqDoorbell, 2 * kCpPad);
-		for (rep.kiqTlbFlushUs = 0; rep.kiqTlbFlushUs < timeoutUs; rep.kiqTlbFlushUs += 10) {
-			if (RREG32(dev, s1) == 0x7B1F1005u) { rep.kiqTlbFlushOk = true; break; }
-			IODelay(10);
-		}
-		rep.tlbAckAfter = RREG32(dev, g0(R::GCVM_INVALIDATE_ENG17_ACK));
-	}
-
+	// ---- 3. gfx_v11_0_gfx_queue_init_register (BRING_UP_DEBUG), me 0 / pipe 0 / queue 0 ----
 	grbm_select(dev, 0, 0, 0, 0);
-	rep.gfxHqdActive = RREG32(dev, g0(G::CP_GFX_HQD_ACTIVE));
-	rep.gfxMqdBaseLo = RREG32(dev, g0(G::CP_GFX_MQD_BASE_ADDR));
-	if (!rep.kiqProcessed) {
-		rep.stage = rep.kiqActive ? "kiq-timeout" : "kiq-not-active";
-		return kIOReturnTimeout;
-	}
+	WREG32(dev, g0(G::CP_GFX_HQD_WPTR), q[GM::wptr]);
+	WREG32(dev, g0(G::CP_GFX_HQD_WPTR_HI), q[GM::wptr_hi]);
+	WREG32(dev, g0(H::CP_MQD_BASE_ADDR), q[GM::mqd_base]);          // what the bring-up code writes
+	WREG32(dev, g0(H::CP_MQD_BASE_ADDR_HI), q[GM::mqd_base_hi]);
+	WREG32(dev, g0(G::CP_GFX_MQD_BASE_ADDR), q[GM::mqd_base]);      // the gfx copy RS64 reads (Navi 48)
+	WREG32(dev, g0(G::CP_GFX_MQD_BASE_ADDR_HI), q[GM::mqd_base_hi]);
+	WREG32(dev, g0(G::CP_GFX_MQD_CONTROL), q[GM::mqd_control]);
+	WREG32(dev, g0(G::CP_GFX_HQD_VMID), q[GM::vmid]);
+	WREG32(dev, g0(G::CP_GFX_HQD_QUEUE_PRIORITY), q[GM::queue_priority]);
+	WREG32(dev, g0(G::CP_GFX_HQD_QUANTUM), q[GM::quantum]);
+	WREG32(dev, g0(G::CP_GFX_HQD_BASE), q[GM::hqd_base]);
+	WREG32(dev, g0(G::CP_GFX_HQD_BASE_HI), q[GM::hqd_base_hi]);
+	WREG32(dev, g0(G::CP_GFX_HQD_RPTR_ADDR), q[GM::rptr_addr]);
+	WREG32(dev, g0(G::CP_GFX_HQD_RPTR_ADDR_HI), q[GM::rptr_addr_hi]);
+	WREG32(dev, g0(G::CP_GFX_HQD_CNTL), q[GM::hqd_cntl]);
+	WREG32(dev, g0(G::CP_RB_WPTR_POLL_ADDR_LO), q[GM::wptr_poll_lo]);
+	WREG32(dev, g0(G::CP_RB_WPTR_POLL_ADDR_HI), q[GM::wptr_poll_hi]);
+	WREG32(dev, g0(G::CP_RB_DOORBELL_CONTROL), q[GM::rb_doorbell_control]);
+	WREG32(dev, g0(G::CP_GFX_HQD_ACTIVE), q[GM::active]);
 
-	// ---- gfx ring test on the mapped queue (gfx_v11_0_ring_test_ring + set_wptr_gfx) ----
+	// ---- 4. gfx_v11_0_ring_test_ring on the gfx queue (set_wptr_gfx: poll slot + doorbell) ----
 	const uint32_t scratch = g1(C::SCRATCH_REG0);
 	WREG32(dev, scratch, 0xCAFEDEADu);
 	uint32_t gp[kCpPad];
@@ -1426,19 +1335,22 @@ kern_return_t navi33_gfx_queue_test(DeviceContext &dev, N33GfxQReport &rep, uint
 	WBAR0_64(dev, base + kGfxWptrOff, kCpPad);
 	amdgpu_hdp_flush(dev);
 	ring64(dev, kGfxDoorbell, kCpPad);
-	for (us = 0; us < timeoutUs; us += 10) {
+	uint32_t us = 0;
+	for (; us < timeoutUs; us += 10) {
 		if (RREG32(dev, scratch) == 0xDEADBEEFu) { rep.passed = true; break; }
 		IODelay(10);
 	}
 	rep.gfxWaitedUs = us;
 	rep.scratch = RREG32(dev, scratch);
+	rep.rptrWriteback = RBAR0_64(dev, base + kGfxRptrOff);
 	grbm_select(dev, 0, 0, 0, 0);
 	rep.gfxRptr = RREG32(dev, g0(G::CP_GFX_HQD_RPTR));
 	rep.gfxHqdActive = RREG32(dev, g0(G::CP_GFX_HQD_ACTIVE));
 	rep.pfpPc = RREG32(dev, g1(C2::CP_GFX_RS64_INSTR_PNTR0));
-	rep.stage = rep.passed ? "gfx-queue-ok" : (rep.gfxHqdActive & 1u) ? "gfx-queue-timeout" : "gfx-queue-not-mapped";
-	UCODE_LOG("navi33-gfx: gfx queue via KIQ — KIQ %s (%u us), gfx HQD active %u, MQD %#x, rptr %u, scratch %#x after %u us -> %s",
-	          rep.kiqProcessed ? "ok" : "FAILED", rep.kiqWaitedUs, rep.gfxHqdActive, rep.gfxMqdBaseLo, rep.gfxRptr,
+	rep.mePc  = RREG32(dev, g1(C2::CP_GFX_RS64_INSTR_PNTR1));
+	rep.stage = rep.passed ? "gfx-queue-ok" : "gfx-queue-timeout";
+	UCODE_LOG("navi33-gfx: TLB flush via compute %s (%u us, ack %#x); gfx queue active %u, rptr %u, scratch %#x after %u us -> %s",
+	          rep.tlbFlushOk ? "ok" : "FAILED", rep.tlbFlushUs, rep.tlbAckAfter, rep.gfxHqdActive, rep.gfxRptr,
 	          rep.scratch, us, rep.stage);
 	return rep.passed ? kIOReturnSuccess : kIOReturnTimeout;
 }
