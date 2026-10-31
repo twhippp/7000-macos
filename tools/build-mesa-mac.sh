@@ -9,8 +9,8 @@
 # cross-x86_64.ini). Result: $MESA_DIR/build-x86_64/src/amd/vulkan/libvulkan_radeon.dylib, the path
 # tools/native/navi48metal/build.sh reads by default.
 #
-# Needs: Xcode Command Line Tools, Homebrew: brew install meson ninja pkg-config python@3
-#        and Python modules: python3 -m pip install --user mako pyyaml packaging
+# Needs: Xcode Command Line Tools (xcode-select --install) and
+#        python3 -m pip install --user meson ninja pkgconf mako pyyaml packaging   (or Homebrew's)
 set -euo pipefail
 
 MESA_SHA=f5cb8ee032adabef599ae892ec4e42d796b84da9          # VERSION 26.3.0-devel, see mesa-patches/README.txt
@@ -30,8 +30,10 @@ mode=${1:-build}
 check_tools() {
 	say "checking tools"
 	local miss=()
-	for t in git clang meson ninja pkg-config python3; do command -v "$t" >/dev/null || miss+=("$t"); done
-	[ ${#miss[@]} -eq 0 ] || die "missing: ${miss[*]}  (xcode-select --install; brew install meson ninja pkg-config)"
+	# pip --user installs (meson, ninja, pkgconf) land here; no Homebrew or sudo needed.
+	PATH="$(python3 -m site --user-base 2>/dev/null)/bin:$PATH"; export PATH
+	for t in git clang meson ninja python3; do command -v "$t" >/dev/null || miss+=("$t"); done
+	[ ${#miss[@]} -eq 0 ] || die "missing: ${miss[*]}  (xcode-select --install; pip3 install --user meson ninja pkgconf)"
 	python3 -c 'import mako, yaml, packaging' 2>/dev/null ||
 		die "python modules missing: python3 -m pip install --user mako pyyaml packaging"
 	echo "meson $(meson --version), ninja $(ninja --version), $(clang --version | head -1)"
