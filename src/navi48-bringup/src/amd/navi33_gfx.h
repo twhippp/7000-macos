@@ -91,6 +91,11 @@ struct N33CpReport {
 	bool     cacheOpTimedOut;
 	uint32_t pfpPc, mePc, mecPc;  // CP_GFX_RS64_INSTR_PNTR0/1, CP_MEC_RS64_INSTR_PNTR after the test
 	uint32_t stalled1, stalled2, stalled3, busyStat;
+	// Doorbell path (Linux always rings the gfx ring through a doorbell; the RS64 PFP
+	// does not watch the CP_RB0_WPTR register the way the old F32 firmware did).
+	bool     doorbellUsed;
+	uint32_t aperEnBefore;          // RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN
+	uint32_t s2a0Before, s2a3Before;   // NBIO S2A_DOORBELL_ENTRY_0/3_CTRL (gc_doorbell_init)
 };
 
 // Reads the start addresses out of the three firmware files; false if any header is bad.

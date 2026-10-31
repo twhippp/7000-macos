@@ -485,6 +485,36 @@ constexpr uint64_t kCpRptrOff  = 0x5000;
 constexpr uint64_t kCpWptrOff  = 0x5008;
 constexpr uint32_t kCpPad      = 256;      // gfx ring align_mask 0xff
 
+// Doorbells (amdgpu_doorbell.h AMDGPU_NAVI10_DOORBELL_*, soc21 uses the Navi10 layout).
+// Indices are in 32-bit doorbell units; the gfx ring's 64-bit doorbell is gfx_ring0 << 1.
+constexpr uint32_t kDbKiq = 0x000, kDbUserqueueEnd = 0x08A, kDbGfxRing0 = 0x08B, kDbGfxUserqueueEnd = 0x0FF;
+constexpr uint32_t kGfxDoorbell = kDbGfxRing0 << 1;              // ring->doorbell_index
+namespace D {   // gc_11_0_0_offset.h (BASE_IDX 0) / nbio_4_3_0_offset.h
+	constexpr uint32_t CP_RB_DOORBELL_RANGE_LOWER  = 0x1dfa;
+	constexpr uint32_t CP_RB_DOORBELL_RANGE_UPPER  = 0x1dfb;
+	constexpr uint32_t CP_MEC_DOORBELL_RANGE_LOWER = 0x1dfc;
+	constexpr uint32_t CP_MEC_DOORBELL_RANGE_UPPER = 0x1dfd;
+	constexpr uint32_t RCC_DOORBELL_APER_EN        = 0x00c0;     // NBIO BASE_IDX 2
+	constexpr uint32_t S2A_DOORBELL_ENTRY_0_CTRL   = 0x4f7640;   // NBIO BASE_IDX 3 (indirect)
+	constexpr uint32_t S2A_DOORBELL_ENTRY_3_CTRL   = 0x4f7643;
+}
+constexpr F RBDB_DOORBELL_OFFSET { 0x2, 0x0FFFFFFC };
+
+bool gfxDoorbellReady(const DeviceContext &d) { return d.bar2 && d.bar2Size >= (kGfxDoorbell + 2) * 4ull; }
+
+// gfx_v11_0_ring_set_wptr_gfx: wptr into the poll slot, then the doorbell (WDOORBELL64);
+// the CP_RB0_WPTR register is written as well (the non-doorbell path) — harmless either way.
+void cpCommit(DeviceContext &dev, uint64_t wptrPollVramOff, uint32_t wptrDw) {
+	WBAR0_64(dev, wptrPollVramOff, wptrDw);
+	amdgpu_hdp_flush(dev);
+	WREG32(dev, SOC15_REG_OFFSET_BIDX(dev, IPBlock::GC, 0, 0x1df4 /*CP_RB0_WPTR*/), wptrDw);
+	WREG32(dev, SOC15_REG_OFFSET_BIDX(dev, IPBlock::GC, 0, 0x1df5 /*CP_RB0_WPTR_HI*/), 0);
+	if (gfxDoorbellReady(dev)) {
+		*reinterpret_cast<volatile uint64_t *>(dev.bar2 + (uint64_t)kGfxDoorbell * 4) = wptrDw;
+		storeFence();
+	}
+}
+
 // soc21_grbm_select
 void grbm_select(const DeviceContext &d, uint32_t me, uint32_t pipe, uint32_t queue, uint32_t vmid) {
 	uint32_t t = 0;
@@ -653,7 +683,30 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	t = setf(t, MEC_HALT, 0);
 	WREG32(dev, g1(C::CP_MEC_RS64_CNTL), t);
 
-	// gfx_v11_0_cp_gfx_resume — ring 0, pipe 0, VMID 0, no doorbell
+	// Doorbells — Linux common hw_init (nbio_v4_3_enable_doorbell_aperture), nbio gc_doorbell_init,
+	// and gfx_v11_0_cp_set_doorbell_range, before any ring is resumed.
+	rep.doorbellUsed = gfxDoorbellReady(dev);
+	if (dev.ip.isResolved(IPBlock::NBIO, 2)) {
+		const uint32_t r = SOC15_REG_OFFSET_BIDX(dev, IPBlock::NBIO, 2, D::RCC_DOORBELL_APER_EN);
+		rep.aperEnBefore = RREG32(dev, r);
+		if (rep.doorbellUsed && !(rep.aperEnBefore & 1u)) WREG32(dev, r, rep.aperEnBefore | 1u);
+	}
+	if (dev.ip.isResolved(IPBlock::NBIO, 3)) {
+		const uint32_t e0 = SOC15_REG_OFFSET_BIDX(dev, IPBlock::NBIO, 3, D::S2A_DOORBELL_ENTRY_0_CTRL);
+		const uint32_t e3 = SOC15_REG_OFFSET_BIDX(dev, IPBlock::NBIO, 3, D::S2A_DOORBELL_ENTRY_3_CTRL);
+		rep.s2a0Before = SMN_RREG32(dev, e0);
+		rep.s2a3Before = SMN_RREG32(dev, e3);
+		if (rep.doorbellUsed) {
+			if (rep.s2a0Before != 0x30000007u) SMN_WREG32(dev, e0, 0x30000007u);
+			if (rep.s2a3Before != 0x3000000du) SMN_WREG32(dev, e3, 0x3000000du);
+		}
+	}
+	WREG32(dev, g0(D::CP_RB_DOORBELL_RANGE_LOWER), (kDbGfxRing0 * 2) << 2);
+	WREG32(dev, g0(D::CP_RB_DOORBELL_RANGE_UPPER), (kDbGfxUserqueueEnd * 2) << 2);
+	WREG32(dev, g0(D::CP_MEC_DOORBELL_RANGE_LOWER), (kDbKiq * 2) << 2);
+	WREG32(dev, g0(D::CP_MEC_DOORBELL_RANGE_UPPER), (kDbUserqueueEnd * 2) << 2);
+
+	// gfx_v11_0_cp_gfx_resume — ring 0, pipe 0, VMID 0, doorbell when BAR2 is mapped
 	bar0_memset_vram(dev, base + kCpRingOff, kGfxNop, kCpRingBytes);
 	WBAR0_64(dev, base + kCpRptrOff, 0);
 	WBAR0_64(dev, base + kCpWptrOff, 0);
@@ -675,7 +728,9 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	WREG32(dev, g0(C::CP_RB0_BASE), (uint32_t)(ringMc >> 8));
 	WREG32(dev, g0(C::CP_RB0_BASE_HI), (uint32_t)((ringMc >> 8) >> 32));
 	WREG32(dev, g0(C::CP_RB_ACTIVE), 1);
-	t = setf(RREG32(dev, g0(C::CP_RB_DOORBELL_CONTROL)), RBDB_DOORBELL_EN, 0);
+	t = RREG32(dev, g0(C::CP_RB_DOORBELL_CONTROL));   // gfx_v11_0_cp_gfx_set_doorbell
+	if (rep.doorbellUsed) t = setf(setf(t, RBDB_DOORBELL_OFFSET, kGfxDoorbell), RBDB_DOORBELL_EN, 1);
+	else                  t = setf(t, RBDB_DOORBELL_EN, 0);
 	WREG32(dev, g0(C::CP_RB_DOORBELL_CONTROL), t);
 
 	// gfx_v11_0_cp_gfx_start (without the clear-state preamble): init the CP, unhalt.
@@ -701,10 +756,7 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	ring[1] = scratch - kSET_UCONFIG_REG_START;
 	ring[2] = 0xDEADBEEFu;
 	bar0_memcpy_to_vram(dev, base + kCpRingOff, ring, sizeof(ring));
-	WBAR0_64(dev, base + kCpWptrOff, kCpPad);           // gfx wptr is in dwords
-	amdgpu_hdp_flush(dev);
-	WREG32(dev, g0(C::CP_RB0_WPTR), kCpPad);
-	WREG32(dev, g0(C::CP_RB0_WPTR_HI), 0);
+	cpCommit(dev, base + kCpWptrOff, kCpPad);           // gfx wptr is in dwords
 
 	rep.passed = false;
 	uint32_t us = 0;
@@ -801,8 +853,7 @@ kern_return_t navi33_ib_tests(DeviceContext &dev, N33IbReport &rep, uint32_t tim
 	amdgpu_hdp_flush(dev);
 	WREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR), (uint32_t)sdmaW);
 	WREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR_HI), 0);
-	WREG32(dev, gc0(dev, C::CP_RB0_WPTR), cpW);
-	WREG32(dev, gc0(dev, C::CP_RB0_WPTR_HI), 0);
+	cpCommit(dev, base + kCpWptrOff, cpW);
 
 	rep.sdmaPassed = rep.cpPassed = false;
 	rep.sdmaWaitedUs = rep.cpWaitedUs = timeoutUs;
@@ -904,8 +955,7 @@ kern_return_t navi33_fence_copy_tests(DeviceContext &dev, N33FenceReport &rep, u
 	amdgpu_hdp_flush(dev);
 	WREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR), (uint32_t)sdmaW);
 	WREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR_HI), 0);
-	WREG32(dev, gc0(dev, C::CP_RB0_WPTR), cpW);
-	WREG32(dev, gc0(dev, C::CP_RB0_WPTR_HI), 0);
+	cpCommit(dev, base + kCpWptrOff, cpW);
 
 	bool sd = false, cp = false;
 	rep.sdmaWaitedUs = rep.cpWaitedUs = timeoutUs;

@@ -968,8 +968,13 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 		cpfw.mecDc[2] = tmr[RS64_MEC_P2]; cpfw.mecDc[3] = tmr[RS64_MEC_P3];
 		setProperty("CP,TmrPfpIc", cpfw.pfpIc, 64);
 	}
+	setProperty("CP,Bar2Mapped", mapDoorbells());   // the gfx ring is rung through a doorbell, as in Linux
 	amdgpu::N33CpReport c {};
 	(void)amdgpu::navi33_cp_gfx_ring_test(dev, cpfw, c);
+	setProperty("CP,DoorbellUsed", c.doorbellUsed);
+	setProperty("CP,DoorbellAperBefore", static_cast<uint64_t>(c.aperEnBefore), 32);
+	setProperty("CP,S2A0Before", static_cast<uint64_t>(c.s2a0Before), 32);
+	setProperty("CP,S2A3Before", static_cast<uint64_t>(c.s2a3Before), 32);
 	setProperty("CP,PfpIcFound", c.pfpIcFound, 64);
 	setProperty("CP,MeIcFound", c.meIcFound, 64);
 	setProperty("CP,CpcIcFound", c.cpcIcFound, 64);

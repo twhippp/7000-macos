@@ -40,6 +40,7 @@ constexpr uint64_t kMcBase = 0x8000000000ull, kFbOffset = 0x0ull;
 struct Rig {
 	std::vector<uint32_t> regs = std::vector<uint32_t>(0x100000 / 4, 0);
 	std::vector<uint8_t>  vram = std::vector<uint8_t>(64u << 20, 0);
+	std::vector<uint8_t>  db   = std::vector<uint8_t>(8192, 0);   // BAR2 doorbells
 	DeviceContext dev;
 	std::atomic<bool> stop { false };
 	bool engineAlive = true;
@@ -205,7 +206,12 @@ int main() {
 		fw.mecIc = 0x81FC500000ull;
 		for (int i = 0; i < 4; i++) fw.mecDc[i] = 0x81FC600000ull + 0x10000ull * i;
 		N33CpReport cp {};
+		k.dev.bar2 = k.db.data(); k.dev.bar2Size = k.db.size();
 		check(navi33_cp_gfx_ring_test(k.dev, fw, cp) == kIOReturnSuccess && cp.passed, "CP gfx ring writes SCRATCH_REG0");
+		uint64_t dbv; std::memcpy(&dbv, &k.db[0x8B * 2 * 4], 8);
+		check(cp.doorbellUsed && dbv == 256, "gfx doorbell (index 0x116) rung with wptr 256");
+		check(((k.r(kGc0, 0x1e8d) >> 2) & 0x3FFFFFF) == 0x116 && (k.r(kGc0, 0x1e8d) & (1u << 30)), "CP_RB_DOORBELL_CONTROL: offset 0x116, enabled");
+		check(k.r(kGc0, 0x1dfa) == 0x458 && k.r(kGc0, 0x1dfb) == 0x7F8, "gfx doorbell range");
 		check(k.r(kGc0, 0x1e44) == ((1u << 30) | (0x1000 >> 2)) && k.r(kGc0, 0x1e59) == 0, "PFP program counter start");
 		check(k.r(kGc1, 0x2900) == ((0x3000 >> 2) | (1u << 30)), "MEC program counter start");
 		check(cp.cachesProgrammed && !cp.cacheOpTimedOut, "RS64 cache bases programmed (they were empty)");
@@ -219,7 +225,7 @@ int main() {
 		check(rb0 == kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0x4000, "RB0 base is the slot's MC address");
 		check(k.r(kGc0, 0x1df4) == 256 && cp.rbRptr == 256, "wptr/rptr = 256 dwords");
 		check((k.r(kGc1, 0x0803) & ((1u << 26) | (1u << 28))) == 0, "PFP/ME unhalted");
-		check((k.r(kGc0, 0x1e8d) & (1u << 30)) == 0 && k.r(kGc0, 0x1df1) == 0, "no doorbell, VMID 0");
+		check(k.r(kGc0, 0x1df1) == 0, "VMID 0");
 
 		N33IbReport ib {};
 		check(navi33_ib_tests(k.dev, ib) == kIOReturnSuccess && ib.sdmaPassed && ib.cpPassed, "IB tests: SDMA and CP both write through an IB");
