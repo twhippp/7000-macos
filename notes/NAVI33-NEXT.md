@@ -22,8 +22,17 @@ is in: `N33,Native` says ready.
 - Build: `tools/build-mesa-mac.sh` (pinned f5cb8ee, patches 0001-0006, RADV only, ACO, no LLVM,
   output `~/navi48-native/mesa-mac/build-x86_64/src/amd/vulkan/libvulkan_radeon.dylib`).
 
+## Status 2026-10-31
+- Mesa built on the Hackintosh (Sequoia, x86_64): pinned f5cb8ee + 0001-0006 applied cleanly,
+  775/775, `~/navi48-native/mesa-mac/build-x86_64/src/amd/vulkan/libvulkan_radeon.dylib` (26.9 MB).
+  Undefined: 6601 weak layer entrypoints (by design) + system libs only (libSystem, libc++, IOKit, libz).
+- Build env without Homebrew/sudo: uv Python 3.12 venv + glslang 16.4.0 from source, both in
+  `~/navi48-native/tools`. The tools/build-mesa-mac.sh handles both.
+- Kext with the GB_ADDR_CONFIG fix: CI run 41226717600 (workflow_dispatch on this branch).
+
 ## Next
-1. Build Mesa on the Mac; run the mock check (`RADV_DARWIN_MOCK=1 RADV_DARWIN_MOCK_N33=1`).
+1. Mock check (`RADV_DARWIN_MOCK=1 RADV_DARWIN_MOCK_N33=1`); needs a vulkaninfo or a small
+   vkEnumeratePhysicalDevices test, none on the Mac yet.
 2. Load the new kext, then real `vulkaninfo` against it: expect "GC 11.0.2 -> canned navi33".
 3. First real submit (a vkCmdFillBuffer / compute dispatch) on the gfx queue through VMID 8.
 4. Things gfx11 RADV may want that gfx12 didn't: check for READ_MMR_REG of anything beyond
