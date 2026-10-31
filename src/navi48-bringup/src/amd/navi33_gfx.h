@@ -106,4 +106,22 @@ struct N33IbReport {
 };
 kern_return_t navi33_ib_tests(DeviceContext &dev, N33IbReport &rep, uint32_t timeoutUs = 100000);
 
+// ---- stage 7: completion fences + a real copy ----
+//
+// The ring tests so far proved a write lands. Real work needs two more things:
+//  * fences: the engine writing a sequence number when it has finished — RELEASE_MEM on the
+//    gfx ring (gfx_v11_0_ring_emit_fence, with the cache flush), FENCE on SDMA
+//    (sdma_v6_0_ring_emit_fence);
+//  * bulk copies: SDMA COPY_LINEAR of 4 KiB inside an IB (sdma_v6_0_emit_copy_buffer).
+// Continues both rings where stage 6 left them.
+constexpr uint32_t kN33FenceSeq = 7;
+struct N33FenceReport {
+	bool     sdmaPassed, cpPassed;
+	uint32_t sdmaFence, cpFence;     // the fence slots after the test (want kN33FenceSeq)
+	uint32_t copyBadDwords;          // destination dwords that differ from the source
+	uint32_t sdmaWaitedUs, cpWaitedUs;
+	const char *stage;
+};
+kern_return_t navi33_fence_copy_tests(DeviceContext &dev, N33FenceReport &rep, uint32_t timeoutUs = 100000);
+
 } // namespace amdgpu

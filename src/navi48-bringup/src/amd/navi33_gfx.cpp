@@ -696,4 +696,109 @@ kern_return_t navi33_ib_tests(DeviceContext &dev, N33IbReport &rep, uint32_t tim
 	return rep.sdmaPassed && rep.cpPassed ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
+// ============================================================================
+// Stage 7 — fences + SDMA copy
+// ============================================================================
+namespace {
+constexpr uint32_t kSdmaWptrAfterS6 = kSdmaWptrAfterS4 + 64;   // bytes
+constexpr uint32_t kCpWptrAfterS6   = kCpWptrAfterS5 + kCpPad; // dwords
+static_assert(kCpWptrAfterS6 + kCpPad <= kCpRingBytes / 4, "stage 7 must not wrap the gfx ring");
+
+constexpr uint32_t kSDMA_OP_COPY = 1, kSDMA_SUBOP_COPY_LINEAR = 0, kSDMA_OP_FENCE = 5;
+constexpr uint32_t kPKT3_RELEASE_MEM = 0x49;                    // nvd.h
+constexpr uint32_t kRM_EVENT_CACHE_FLUSH_AND_INV_TS = 0x14;     // soc21_enum.h
+constexpr uint32_t kRM_DW1 = (1u << 22) /*GCR_SEQ*/ | (1u << 21) /*GCR_GL2_WB*/ | (1u << 13) /*GCR_GLM_INV*/ |
+                             (1u << 12) /*GCR_GLM_WB*/ | (3u << 25) /*CACHE_POLICY(3)*/ |
+                             kRM_EVENT_CACHE_FLUSH_AND_INV_TS | (5u << 8) /*EVENT_INDEX(5)*/;
+constexpr uint32_t kRM_DW2_DATA32 = 1u << 29;                   // DATA_SEL(1), INT_SEL(0)
+
+constexpr uint64_t kS7SdmaIbOff   = 0x7000;   // 32-byte aligned
+constexpr uint64_t kS7SdmaFenceOff = 0x7100;
+constexpr uint64_t kS7CpFenceOff  = 0x7108;
+constexpr uint64_t kS7SrcOff      = 0x8000;
+constexpr uint64_t kS7DstOff      = 0x9000;
+constexpr uint32_t kS7CopyBytes   = 0x1000;
+static_assert(kS7DstOff + kS7CopyBytes <= kN33GfxVramSize, "stage 7 stays inside the slot");
+} // namespace
+
+kern_return_t navi33_fence_copy_tests(DeviceContext &dev, N33FenceReport &rep, uint32_t timeoutUs) {
+	const uint64_t base = slot(dev);
+	auto mc = [&](uint64_t off) { return dev.vramMC(base + off); };
+
+	for (uint32_t i = 0; i < kS7CopyBytes / 4; i++) WBAR0_32(dev, base + kS7SrcOff + i * 4, 0x5A000000u | i);
+	bar0_memset_vram(dev, base + kS7DstOff, 0u, kS7CopyBytes);
+	WBAR0_32(dev, base + kS7SdmaFenceOff, 0);
+	WBAR0_32(dev, base + kS7CpFenceOff, 0);
+
+	// SDMA IB: COPY_LINEAR 4 KiB, padded to 8 dwords.
+	{
+		const uint64_t src = mc(kS7SrcOff), dst = mc(kS7DstOff);
+		const uint32_t ib[8] = { kSDMA_OP_COPY | (kSDMA_SUBOP_COPY_LINEAR << 8), kS7CopyBytes - 1, 0,
+		                         (uint32_t)src, (uint32_t)(src >> 32), (uint32_t)dst, (uint32_t)(dst >> 32), 0 };
+		bar0_memcpy_to_vram(dev, base + kS7SdmaIbOff, ib, sizeof(ib));
+	}
+	// SDMA ring at dword 32: 2 NOPs ((2 - 32) & 7), INDIRECT (6 dw), FENCE (4 dw), NOPs to 16.
+	{
+		const uint64_t ibMc = mc(kS7SdmaIbOff), f = mc(kS7SdmaFenceOff);
+		static_assert(((2u - kSdmaWptrAfterS6 / 4) & 7u) == 2, "IB packet alignment");
+		uint32_t pkt[16] = {};
+		pkt[2] = kSDMA_OP_INDIRECT | (0u << 16);
+		pkt[3] = (uint32_t)ibMc & 0xFFFFFFE0u;
+		pkt[4] = (uint32_t)(ibMc >> 32);
+		pkt[5] = 8;
+		pkt[6] = 0; pkt[7] = 0;
+		pkt[8]  = kSDMA_OP_FENCE | (3u << 16);       // MTYPE UC
+		pkt[9]  = (uint32_t)f;
+		pkt[10] = (uint32_t)(f >> 32);
+		pkt[11] = kN33FenceSeq;
+		bar0_memcpy_to_vram(dev, base + kRingOff + kSdmaWptrAfterS6, pkt, sizeof(pkt));
+	}
+	// gfx ring at dword 512: RELEASE_MEM (flush caches, write seq), NOPs to 768.
+	{
+		const uint64_t f = mc(kS7CpFenceOff);
+		uint32_t ring[kCpPad];
+		for (uint32_t i = 0; i < kCpPad; i++) ring[i] = kGfxNop;
+		ring[0] = pkt3(kPKT3_RELEASE_MEM, 6);
+		ring[1] = kRM_DW1;
+		ring[2] = kRM_DW2_DATA32;
+		ring[3] = (uint32_t)f;
+		ring[4] = (uint32_t)(f >> 32);
+		ring[5] = kN33FenceSeq;
+		ring[6] = 0;
+		ring[7] = 0;
+		bar0_memcpy_to_vram(dev, base + kCpRingOff + kCpWptrAfterS6 * 4, ring, sizeof(ring));
+	}
+	amdgpu_hdp_flush(dev);
+	const uint64_t sdmaW = kSdmaWptrAfterS6 + 64;
+	const uint32_t cpW   = kCpWptrAfterS6 + kCpPad;
+	WBAR0_64(dev, base + kWptrOff, sdmaW);
+	WBAR0_64(dev, base + kCpWptrOff, cpW);
+	amdgpu_hdp_flush(dev);
+	WREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR), (uint32_t)sdmaW);
+	WREG32(dev, gc0(dev, R::SDMA0_QUEUE0_RB_WPTR_HI), 0);
+	WREG32(dev, gc0(dev, C::CP_RB0_WPTR), cpW);
+	WREG32(dev, gc0(dev, C::CP_RB0_WPTR_HI), 0);
+
+	bool sd = false, cp = false;
+	rep.sdmaWaitedUs = rep.cpWaitedUs = timeoutUs;
+	for (uint32_t us = 0; us < timeoutUs && !(sd && cp); us += 10) {
+		if (!sd && RBAR0_32(dev, base + kS7SdmaFenceOff) == kN33FenceSeq) { sd = true; rep.sdmaWaitedUs = us; }
+		if (!cp && RBAR0_32(dev, base + kS7CpFenceOff) == kN33FenceSeq)   { cp = true; rep.cpWaitedUs = us; }
+		IODelay(10);
+	}
+	rep.sdmaFence = RBAR0_32(dev, base + kS7SdmaFenceOff);
+	rep.cpFence   = RBAR0_32(dev, base + kS7CpFenceOff);
+	rep.copyBadDwords = 0;
+	for (uint32_t i = 0; i < kS7CopyBytes / 4; i++)
+		if (RBAR0_32(dev, base + kS7DstOff + i * 4) != (0x5A000000u | i)) rep.copyBadDwords++;
+	rep.sdmaPassed = sd && rep.copyBadDwords == 0;
+	rep.cpPassed   = cp;
+	rep.stage = rep.sdmaPassed && rep.cpPassed ? "fence-copy-ok" :
+	            (sd && rep.copyBadDwords) ? "sdma-copy-wrong-data" :
+	            !sd && !cp ? "fence-timeout" : !sd ? "sdma-fence-timeout" : "cp-fence-timeout";
+	UCODE_LOG("navi33-gfx: fence/copy — SDMA fence %u (%u us, %u bad dwords), CP fence %u (%u us) -> %s",
+	          rep.sdmaFence, rep.sdmaWaitedUs, rep.copyBadDwords, rep.cpFence, rep.cpWaitedUs, rep.stage);
+	return rep.sdmaPassed && rep.cpPassed ? kIOReturnSuccess : kIOReturnTimeout;
+}
+
 } // namespace amdgpu

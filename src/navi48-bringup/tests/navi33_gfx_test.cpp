@@ -87,11 +87,24 @@ struct Rig {
 						const uint64_t ib = (((uint64_t)p[2] << 32) | p[1]) - kMcBase;
 						uint64_t d = 0;
 						while (d < (uint64_t)p[3] * 4) {
-							uint32_t q[5]; std::memcpy(q, &vram[ib + d], 20);
+							uint32_t q[7]; std::memcpy(q, &vram[ib + d], 28);
 							if ((q[0] & 0xFF) == 2) { const uint64_t dst = (((uint64_t)q[2] << 32) | q[1]) - kMcBase; std::memcpy(&vram[dst], &q[4], 4); d += 20; }
+							else if ((q[0] & 0xFF) == 1) {   // COPY_LINEAR: count-1, swap, src, dst
+								const uint64_t src = (((uint64_t)q[4] << 32) | q[3]) - kMcBase;
+								const uint64_t dst = (((uint64_t)q[6] << 32) | q[5]) - kMcBase;
+								std::memmove(&vram[dst], &vram[src], (size_t)q[1] + 1);
+								d += 28;
+							}
 							else d += 4;
 						}
 						return 24;
+					}
+					if ((p[0] & 0xFF) == 5) {   // FENCE: addr, addr_hi, seq
+						if (((p[0] >> 16) & 0x7) == 3) {
+							const uint64_t dst = (((uint64_t)p[2] << 32) | p[1]) - kMcBase;
+							std::memcpy(&vram[dst], &p[3], 4);
+						}
+						return 16;
 					}
 					return 4;   // NOP
 				};
@@ -126,6 +139,13 @@ struct Rig {
 				if (((q[0] >> 8) & 0xFF) == 0x37 && ((q[1] >> 8) & 0xF) == 5 && (a[2] & 0xFFFFF) == 5) {
 					const uint64_t dst = (((uint64_t)q[3] << 32) | q[2]) - kMcBase;
 					std::memcpy(&vram[dst], &q[4], 4);
+				}
+			}
+			if (op == 0x49) {   // RELEASE_MEM: dw1 event, dw2 sel, addr lo/hi, data lo/hi
+				uint32_t a[6]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 24);
+				if ((a[0] & 0x3F) == 0x14 && (a[1] >> 29) == 1) {
+					const uint64_t dst = (((uint64_t)a[3] << 32) | a[2]) - kMcBase;
+					std::memcpy(&vram[dst], &a[4], 4);
 				}
 			}
 			cpDone += n + 2;
@@ -188,6 +208,12 @@ int main() {
 		check(navi33_ib_tests(k.dev, ib) == kIOReturnSuccess && ib.sdmaPassed && ib.cpPassed, "IB tests: SDMA and CP both write through an IB");
 		check(k.ibSeen && k.ibAligned, "SDMA IB packet 32-byte base, ends on an 8-dword boundary");
 		check(k.r(kGc0, 0x0085) == 128 && k.r(kGc0, 0x1df4) == 512, "wptrs continue: SDMA 128 bytes, CP 512 dwords");
+
+		N33FenceReport fr {};
+		check(navi33_fence_copy_tests(k.dev, fr) == kIOReturnSuccess && std::strcmp(fr.stage, "fence-copy-ok") == 0,
+		      "stage 7: SDMA 4 KiB copy + FENCE, gfx RELEASE_MEM fence");
+		check(fr.copyBadDwords == 0 && fr.sdmaFence == kN33FenceSeq && fr.cpFence == kN33FenceSeq, "  ...copy exact, both fences = seq");
+		check(k.r(kGc0, 0x0085) == 192 && k.r(kGc0, 0x1df4) == 768, "  ...wptrs continue: SDMA 192 bytes, CP 768 dwords");
 	}
 	{
 		Rig k(true);

@@ -565,7 +565,32 @@ void Navi48Bringup::publishNavi33Summary() {
 		add(" | S5 %s (read 0x%08x after %llu us)", s5, (uint32_t)v, (unsigned long long)us);
 	}
 	if (const char *s6 = str("IB,Stage6")) add(" | S6 %s", s6);
+	if (const char *s7 = str("FENCE,Stage7")) add(" | S7 %s", s7);
 	setProperty("N33,Summary", sum);
+
+	// N33,Result: the first stage that did not reach its success state.
+	struct St { const char *key, *ok1, *ok2; };
+	static const St kStages[] = {
+		{ "PSP,Stage",    "sos-alive", nullptr },
+		{ "PSP,Stage2",   "ring-and-tmr-ok", nullptr },
+		{ "PSP,Stage3",   "gfx-firmware-running", "gfx-running-with-warnings" },
+		{ "SDMA,Stage4",  "sdma-write-ok", nullptr },
+		{ "CP,Stage5",    "cp-write-ok", nullptr },
+		{ "IB,Stage6",    "ib-ok", nullptr },
+		{ "FENCE,Stage7", "fence-copy-ok", nullptr },
+	};
+	uint64_t cap = 99;
+	num("N33,StopAfter", cap);
+	char res[128] = {};
+	snprintf(res, sizeof(res), "all %u stages passed", (unsigned)(sizeof(kStages) / sizeof(kStages[0])));
+	for (unsigned i = 0; i < sizeof(kStages) / sizeof(kStages[0]); i++) {
+		if (i + 1 > cap) { snprintf(res, sizeof(res), "stages 1-%u passed (stopped by navi33-stop-after)", i); break; }
+		const char *v = str(kStages[i].key);
+		auto eq = [](const char *a, const char *b) { if (!a || !b) return false; while (*a && *a == *b) { a++; b++; } return *a == *b; };
+		const bool ok = v && (eq(v, kStages[i].ok1) || eq(v, kStages[i].ok2));
+		if (!ok) { snprintf(res, sizeof(res), "FAILED at stage %u: %s", i + 1, v ? v : "not reached"); break; }
+	}
+	setProperty("N33,Result", res);
 	setProperty("N33,Warnings", w ? warn : "none");
 	N48LOG("navi33: %s | warnings: %s", sum, w ? warn : "none");
 }
@@ -573,7 +598,12 @@ void Navi48Bringup::publishNavi33Summary() {
 void Navi48Bringup::stagePSPNavi33Body() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("navi33-psp", &on, sizeof(on)) || on == 0) return;
-	N48LOG("psp-stage: navi33-psp=1 — PSP 13.0.7 chain; this WRITES to VRAM and the PSP mailbox");
+	// Any non-zero navi33-psp runs every stage in order and stops at the first one that
+	// fails (each stage is gated on the previous one passing). navi33-stop-after=N caps it.
+	uint32_t stopAfter = 0;
+	on = (PE_parse_boot_argn("navi33-stop-after", &stopAfter, sizeof(stopAfter)) && stopAfter != 0) ? stopAfter : 99;
+	setProperty("N33,StopAfter", static_cast<uint64_t>(on), 32);
+	N48LOG("psp-stage: navi33 bring-up, stages 1..%u — this WRITES to VRAM, the PSP/SMU mailboxes and GPU registers", on);
 	setProperty("PSP,Stage", "requested");
 	if (fw_psp_13_0_7_sos_size == 0) {
 		N48LOG("psp-stage: psp_13_0_7_sos.bin was not embedded in this build; nothing sent");
@@ -700,7 +730,8 @@ void Navi48Bringup::navi33SmuFeatures() {
 // feature enable (navi33SmuFeatures; navi33-smu-basic=1 skips it), and the read-only wait
 // for the RLC autoload to finish (gfx_v11_0_hw_init). navi33-psp=4 adds the first command
 // (GFXHUB VMID 0 + SDMA0 ring test, navi33_gfx.cpp); navi33-psp=5 the graphics CP ring
-// test; navi33-psp=6 indirect-buffer tests on both rings. Stops before any
+// test; navi33-psp=6 indirect-buffer tests on both rings; 7 fences + an SDMA copy.
+// (Any non-zero navi33-psp now runs every stage; navi33-stop-after=N caps it.) Stops before any
 // CP/GFX ring programming. Every step publishes its own property, so one boot shows
 // exactly where it stopped. Like Linux, a non-zero PSP status at 3+ is recorded and the
 // sequence carries on; only a PSP that stops answering ends it.
@@ -950,6 +981,20 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	setProperty("IB,FaultStatus", static_cast<uint64_t>(ib.faultStatus), 32);
 	setProperty("IB,Stage6", ib.stage);
 	N48LOG("psp-stage6: %s", ib.stage);
+	if (level < 7) return;
+	if (!(ib.sdmaPassed && ib.cpPassed)) { setProperty("FENCE,Stage7", "skipped-ib-failed"); return; }
+
+	// 11. Stage 7 — completion fences (how the driver learns work is done) and a real
+	//     4 KiB copy on SDMA (how buffers will move).
+	amdgpu::N33FenceReport fr {};
+	(void)amdgpu::navi33_fence_copy_tests(dev, fr);
+	setProperty("FENCE,SdmaFence", static_cast<uint64_t>(fr.sdmaFence), 32);
+	setProperty("FENCE,CpFence", static_cast<uint64_t>(fr.cpFence), 32);
+	setProperty("FENCE,CopyBadDwords", static_cast<uint64_t>(fr.copyBadDwords), 32);
+	setProperty("FENCE,SdmaWaitedUs", static_cast<uint64_t>(fr.sdmaWaitedUs), 32);
+	setProperty("FENCE,CpWaitedUs", static_cast<uint64_t>(fr.cpWaitedUs), 32);
+	setProperty("FENCE,Stage7", fr.stage);
+	N48LOG("psp-stage7: %s", fr.stage);
 }
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware
