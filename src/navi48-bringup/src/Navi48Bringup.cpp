@@ -569,7 +569,13 @@ void Navi48Bringup::publishNavi33Summary() {
 	if (const char *s8 = str("SCREEN,Stage8")) {
 		uint64_t mb = 0, us = 0;
 		num("SCREEN,FbBytes", mb); num("SCREEN,BackupUs", us);
-		add(" | S8 %s (copied %llu KiB of screen in %llu us)", s8, (unsigned long long)(mb >> 10), (unsigned long long)us);
+		if (num("SCREEN,FbBytes", mb)) add(" | S8 %s (copied %llu KiB of screen in %llu us)", s8, (unsigned long long)(mb >> 10), (unsigned long long)us);
+		else add(" | S8 %s", s8);
+	}
+	if (const char *s9 = str("GFXQ,Stage9")) {
+		uint64_t v = 0, us = 0;
+		num("GFXQ,Scratch", v); num("GFXQ,WaitedUs", us);
+		add(" | S9 %s (read 0x%08x after %llu us)", s9, (uint32_t)v, (unsigned long long)us);
 	}
 	setProperty("N33,Summary", sum);
 
@@ -583,7 +589,8 @@ void Navi48Bringup::publishNavi33Summary() {
 		{ "CP,Stage5",    "cp-write-ok", nullptr },
 		{ "IB,Stage6",    "ib-ok", nullptr },
 		{ "FENCE,Stage7", "fence-copy-ok", nullptr },
-		{ "SCREEN,Stage8", "screen-ok", "skipped-by-boot-arg" },
+		{ "SCREEN,Stage8", "screen-ok", "off" },
+		{ "GFXQ,Stage9",   "gfx-queue-ok", nullptr },
 	};
 	uint64_t cap = 99;
 	num("N33,StopAfter", cap);
@@ -1031,27 +1038,44 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	N48LOG("psp-stage7: %s", fr.stage);
 	if (level < 8) return;
 	if (!(fr.sdmaPassed && fr.cpPassed)) { setProperty("SCREEN,Stage8", "skipped-fence-failed"); return; }
-	uint32_t noScreen = 0;
-	if (PE_parse_boot_argn("navi33-no-screen", &noScreen, sizeof(noScreen)) && noScreen) {
-		setProperty("SCREEN,Stage8", "skipped-by-boot-arg");
-		return;
-	}
 
-	// 12. Stage 8 — real data: the copy engine backs up the live console framebuffer,
-	//     paints a white band over the top of the screen for 3 s, then restores it.
-	amdgpu::N33ScreenReport sc {};
-	(void)amdgpu::navi33_screen_test(dev, bootFbOff, bootFbLen, sc);
-	setProperty("SCREEN,FbOffset", sc.fbOff, 64);
-	setProperty("SCREEN,FbBytes", sc.fbLen, 64);
-	setProperty("SCREEN,BackupOffset", sc.backupOff, 64);
-	setProperty("SCREEN,BackupUs", static_cast<uint64_t>(sc.backupUs), 32);
-	setProperty("SCREEN,BandUs", static_cast<uint64_t>(sc.bandUs), 32);
-	setProperty("SCREEN,RestoreUs", static_cast<uint64_t>(sc.restoreUs), 32);
-	setProperty("SCREEN,BackupMismatches", static_cast<uint64_t>(sc.backupMismatches), 32);
-	setProperty("SCREEN,BandMismatches", static_cast<uint64_t>(sc.bandMismatches), 32);
-	setProperty("SCREEN,RestoreMismatches", static_cast<uint64_t>(sc.restoreMismatches), 32);
-	setProperty("SCREEN,Stage8", sc.stage);
-	N48LOG("psp-stage8: %s", sc.stage);
+	// 12. Stage 8 — real data on the live screen (white band for 3 s). Proven on hardware;
+	//     now opt-in: navi33-screen-test=1.
+	uint32_t screenTest = 0;
+	if (!(PE_parse_boot_argn("navi33-screen-test", &screenTest, sizeof(screenTest)) && screenTest)) {
+		setProperty("SCREEN,Stage8", "off");
+	} else {
+		amdgpu::N33ScreenReport sc {};
+		(void)amdgpu::navi33_screen_test(dev, bootFbOff, bootFbLen, sc);
+		setProperty("SCREEN,FbOffset", sc.fbOff, 64);
+		setProperty("SCREEN,FbBytes", sc.fbLen, 64);
+		setProperty("SCREEN,BackupOffset", sc.backupOff, 64);
+		setProperty("SCREEN,BackupUs", static_cast<uint64_t>(sc.backupUs), 32);
+		setProperty("SCREEN,BandUs", static_cast<uint64_t>(sc.bandUs), 32);
+		setProperty("SCREEN,RestoreUs", static_cast<uint64_t>(sc.restoreUs), 32);
+		setProperty("SCREEN,BackupMismatches", static_cast<uint64_t>(sc.backupMismatches), 32);
+		setProperty("SCREEN,BandMismatches", static_cast<uint64_t>(sc.bandMismatches), 32);
+		setProperty("SCREEN,RestoreMismatches", static_cast<uint64_t>(sc.restoreMismatches), 32);
+		setProperty("SCREEN,Stage8", sc.stage);
+		N48LOG("psp-stage8: %s", sc.stage);
+	}
+	if (level < 9) return;
+
+	// 13. Stage 9 — the graphics queue: the KIQ maps a gfx queue described by a v11_gfx_mqd,
+	//     then the gfx ring test runs on it. This is the queue all drawing will use.
+	amdgpu::N33GfxQReport gq {};
+	(void)amdgpu::navi33_gfx_queue_test(dev, gq);
+	setProperty("GFXQ,KiqActive", gq.kiqActive);
+	setProperty("GFXQ,KiqProcessed", gq.kiqProcessed);
+	setProperty("GFXQ,KiqWaitedUs", static_cast<uint64_t>(gq.kiqWaitedUs), 32);
+	setProperty("GFXQ,HqdActive", static_cast<uint64_t>(gq.gfxHqdActive), 32);
+	setProperty("GFXQ,MqdBaseLo", static_cast<uint64_t>(gq.gfxMqdBaseLo), 32);
+	setProperty("GFXQ,Rptr", static_cast<uint64_t>(gq.gfxRptr), 32);
+	setProperty("GFXQ,Scratch", static_cast<uint64_t>(gq.scratch), 32);
+	setProperty("GFXQ,WaitedUs", static_cast<uint64_t>(gq.gfxWaitedUs), 32);
+	setProperty("GFXQ,PfpPC", static_cast<uint64_t>(gq.pfpPc), 32);
+	setProperty("GFXQ,Stage9", gq.stage);
+	N48LOG("psp-stage9: %s", gq.stage);
 }
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware

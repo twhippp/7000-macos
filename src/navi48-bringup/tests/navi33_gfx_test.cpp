@@ -45,6 +45,8 @@ struct Rig {
 	std::atomic<bool> stop { false };
 	bool engineAlive = true;
 	bool cpAlive = true;
+	bool kiqSim = false, kiqMapped = false;
+	uint64_t kiqDone = 0, gfxDone = 0, gfxRing = 0;
 	bool ibSeen = false, ibAligned = false;
 	uint64_t cpDone = 0;
 	std::thread sdma;
@@ -123,8 +125,43 @@ struct Rig {
 				r(kGc0, 0x0083) = (uint32_t)done;
 			}
 			runCp();
+			if (kiqSim) runKiq();
 			std::this_thread::sleep_for(std::chrono::microseconds(50));
 		}
+	}
+
+	// The KIQ (RLC_CP_SCHEDULERS designated, doorbell 0) and the gfx queue it maps (doorbell 0x116).
+	void runKiq() {
+		if ((r(kGc1, 0x098a) & 0xFF) != (0x80 | (1u << 5) | (3u << 3)) || !(r(kGc0, 0x1fab) & 1u)) return;
+		const uint64_t ring = ((((uint64_t)r(kGc0, 0x1fb2)) << 32 | r(kGc0, 0x1fb1)) << 8) - kMcBase;
+		uint64_t wptr; std::memcpy(&wptr, &db[0], 8);
+		while (kiqDone < wptr) {
+			uint32_t h; std::memcpy(&h, &vram[ring + kiqDone * 4], 4);
+			const uint32_t op = (h >> 8) & 0xFF, n = (h >> 16) & 0x3FFF;
+			if (op == 0x10 && n == 0x3FFF) { kiqDone += 1; continue; }
+			uint32_t a[8]; std::memcpy(a, &vram[ring + (kiqDone + 1) * 4], 32);
+			if (op == 0xA2 && ((a[0] >> 26) & 7) == 4 && (a[1] >> 2) == 0x116) {   // MAP_QUEUES gfx
+				const uint64_t mqd = mc(a[2], a[3]);
+				uint32_t q[512]; std::memcpy(q, &vram[mqd], sizeof(q));
+				gfxRing = ((((uint64_t)q[137]) << 32 | q[136]) << 8) - kMcBase;
+				r(kGc0, 0x1e7e) = a[2];
+				r(kGc0, 0x1e80) = q[130];
+				kiqMapped = true;
+			}
+			if (op == 0x37 && (a[0] & 0xF00) == 0) regs[a[1]] = a[3];          // WRITE_DATA to a register
+			kiqDone += n + 2;
+		}
+		if (!kiqMapped) return;
+		uint64_t gw; std::memcpy(&gw, &db[0x116 * 4], 8);
+		while (gfxDone < gw) {
+			uint32_t h; std::memcpy(&h, &vram[gfxRing + gfxDone * 4], 4);
+			const uint32_t op = (h >> 8) & 0xFF, n = (h >> 16) & 0x3FFF;
+			if (op == 0x10 && n == 0x3FFF) { gfxDone += 1; continue; }
+			uint32_t a[2]; std::memcpy(a, &vram[gfxRing + (gfxDone + 1) * 4], 8);
+			if (op == 0x79) regs[0xC000 + a[0]] = a[1];
+			gfxDone += n + 2;
+		}
+		r(kGc0, 0x1e88) = (uint32_t)gfxDone;
 	}
 
 	// The CP's compute queue (me 1, pipe 0, queue 0), programmed through the HQD registers.
@@ -251,6 +288,23 @@ int main() {
 		check(px == (0x11000000u | 5), "  ...first pixels are the original ones again");
 		N33ScreenReport none {};
 		check(navi33_screen_test(k.dev, ~0ull, 0, none, 1) == kIOReturnNotFound, "  ...no console FB -> skipped");
+	}
+	{
+		Rig k(true);
+		k.kiqSim = true;
+		k.dev.bar2 = k.db.data(); k.dev.bar2Size = k.db.size();
+		N33GfxReport rep {};
+		navi33_gfxhub_enable(k.dev, rep);
+		N33GfxQReport gq {};
+		check(navi33_gfx_queue_test(k.dev, gq) == kIOReturnSuccess && std::strcmp(gq.stage, "gfx-queue-ok") == 0,
+		      "stage 9: KIQ maps the gfx queue, gfx ring writes SCRATCH_REG0");
+		check(gq.kiqActive && gq.kiqProcessed && gq.gfxHqdActive == 1 && gq.gfxRptr == 256, "  ...KIQ ran, gfx HQD active, gfx rptr 256");
+		check((k.r(kGc1, 0x098a) & 0xFF) == 0xB8, "  ...RLC_CP_SCHEDULERS = KIQ me1 pipe3 queue0");
+		uint32_t gq128[2]; std::memcpy(gq128, &k.vram[k.dev.vramBase + kN33GfxVramOffset + 0xF000 + 128 * 4], 8);
+		check(gq128[0] == (uint32_t)(kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0xF000), "  ...gfx MQD points at itself");
+		N33GfxQReport none {};
+		DeviceContext d2 = k.dev; d2.bar2 = nullptr;
+		check(navi33_gfx_queue_test(d2, none) == kIOReturnNotReady, "  ...no BAR2 -> refuses");
 	}
 	{
 		Rig k(true);

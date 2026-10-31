@@ -159,4 +159,26 @@ struct N33ScreenReport {
 kern_return_t navi33_screen_test(DeviceContext &dev, uint64_t fbOff, uint64_t fbLen, N33ScreenReport &rep,
                                  uint32_t holdMs = 3000, uint32_t timeoutUs = 2000000);
 
+// ---- stage 9: the graphics queue, mapped through the KIQ ----
+//
+// gfx_v11_0_cp_resume (async path): the KIQ (me 1, pipe 3, queue 0 — RLC_CP_SCHEDULERS)
+// is programmed straight into its hardware queue registers (gfx_v11_0_kiq_init_register),
+// then it is handed SET_RESOURCES + MAP_QUEUES (gfx11_kiq_set_resources / _map_queues) for
+// the gfx queue (me 0, pipe 0, queue 0, doorbell gfx_ring0 << 1) described by a
+// v11_gfx_mqd (gfx_v11_0_gfx_mqd_init). Then gfx_v11_0_ring_test_ring on the gfx queue.
+struct N33GfxQReport {
+	bool     kiqActive;          // CP_HQD_ACTIVE of the KIQ after programming
+	bool     kiqProcessed;       // the KIQ ran its packets (SCRATCH_REG1 marker landed)
+	uint32_t kiqWaitedUs;
+	uint32_t gfxHqdActive;       // CP_GFX_HQD_ACTIVE (me 0 pipe 0 queue 0) after MAP_QUEUES
+	uint32_t gfxMqdBaseLo;       // CP_GFX_MQD_BASE_ADDR as the firmware loaded it
+	uint32_t gfxRptr;            // CP_GFX_HQD_RPTR after the test
+	uint32_t scratch;            // SCRATCH_REG0 after the test
+	uint32_t gfxWaitedUs;
+	uint32_t pfpPc;
+	bool     passed;
+	const char *stage;
+};
+kern_return_t navi33_gfx_queue_test(DeviceContext &dev, N33GfxQReport &rep, uint32_t timeoutUs = 100000);
+
 } // namespace amdgpu
