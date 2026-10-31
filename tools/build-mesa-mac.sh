@@ -139,9 +139,20 @@ smoke() {
 	local icd="$MESA_DIR/$BUILD/radeon_icd.darwin.json"
 	printf '{ "file_format_version": "1.0.1", "ICD": { "library_path": "%s", "api_version": "1.4.0" } }\n' "$lib" >"$icd"
 	echo "ICD json: $icd   (VK_DRIVER_FILES=$icd vulkaninfo --summary)"
+
+	# radvprobe: loads the dylib directly (no Vulkan loader or SDK needed) and lists the device.
+	local probe="$MESA_DIR/$BUILD/radvprobe"
+	clang -std=gnu11 -O1 -I "$MESA_DIR/include" "$HERE/tools/native/radvprobe/radvprobe.c" -o "$probe" ||
+		die "radvprobe did not compile"
+	say "mock check: no GPU access, the in-process mock kext answers as the RX 7600"
+	if RADV_DARWIN_MOCK=1 RADV_DARWIN_MOCK_N33=1 "$probe" "$lib"; then
+		echo "MOCK CHECK OK"
+	else
+		echo "MOCK CHECK FAILED (exit $?)"
+	fi
 	echo
-	echo "Safe check with no GPU access (mock kext, answers as the RX 7600):"
-	echo "  RADV_DARWIN_MOCK=1 RADV_DARWIN_MOCK_N33=1 VK_DRIVER_FILES=$icd vulkaninfo --summary"
+	echo "Real GPU (kext loaded):  $probe $lib          list only"
+	echo "                         $probe $lib --fill   first submit: fill a buffer on the GPU"
 }
 
 check_tools
