@@ -958,8 +958,30 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 		setProperty("CP,Stage5", "bad-firmware-header");
 		return;
 	}
+	{
+		using namespace amdgpu::PSPGfxFwType;
+		const uint64_t *tmr = psp.tmr_fw_addr_by_type;
+		cpfw.pfpIc = tmr[RS64_PFP]; cpfw.pfpDc[0] = tmr[RS64_PFP_P0]; cpfw.pfpDc[1] = tmr[RS64_PFP_P1];
+		cpfw.meIc  = tmr[RS64_ME];  cpfw.meDc[0]  = tmr[RS64_ME_P0];  cpfw.meDc[1]  = tmr[RS64_ME_P1];
+		cpfw.mecIc = tmr[RS64_MEC];
+		cpfw.mecDc[0] = tmr[RS64_MEC_P0]; cpfw.mecDc[1] = tmr[RS64_MEC_P1];
+		cpfw.mecDc[2] = tmr[RS64_MEC_P2]; cpfw.mecDc[3] = tmr[RS64_MEC_P3];
+		setProperty("CP,TmrPfpIc", cpfw.pfpIc, 64);
+	}
 	amdgpu::N33CpReport c {};
 	(void)amdgpu::navi33_cp_gfx_ring_test(dev, cpfw, c);
+	setProperty("CP,PfpIcFound", c.pfpIcFound, 64);
+	setProperty("CP,MeIcFound", c.meIcFound, 64);
+	setProperty("CP,CpcIcFound", c.cpcIcFound, 64);
+	setProperty("CP,CachesProgrammed", c.cachesProgrammed);
+	setProperty("CP,CacheOpTimedOut", c.cacheOpTimedOut);
+	setProperty("CP,PfpPC", static_cast<uint64_t>(c.pfpPc), 32);
+	setProperty("CP,MePC", static_cast<uint64_t>(c.mePc), 32);
+	setProperty("CP,MecPC", static_cast<uint64_t>(c.mecPc), 32);
+	setProperty("CP,Stalled1", static_cast<uint64_t>(c.stalled1), 32);
+	setProperty("CP,Stalled2", static_cast<uint64_t>(c.stalled2), 32);
+	setProperty("CP,Stalled3", static_cast<uint64_t>(c.stalled3), 32);
+	setProperty("CP,BusyStat", static_cast<uint64_t>(c.busyStat), 32);
 	setProperty("CP,Scratch", static_cast<uint64_t>(c.scratch), 32);
 	setProperty("CP,WaitedUs", static_cast<uint64_t>(c.waitedUs), 32);
 	setProperty("CP,RB0_RPTR", static_cast<uint64_t>(c.rbRptr), 32);

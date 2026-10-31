@@ -430,6 +430,30 @@ namespace C {   // gc_11_0_0_offset.h: register, BASE_IDX
 	constexpr uint32_t CP_MEC_RS64_CNTL      = 0x2904;  // 1
 	constexpr uint32_t CP_MEC_RS64_PRGRM_CNTR_START_HI = 0x2938; // 1
 }
+namespace C2 {   // gc_11_0_0_offset.h, all BASE_IDX 1
+	constexpr uint32_t CP_PFP_IC_BASE_LO = 0x5840, CP_PFP_IC_BASE_HI = 0x5841, CP_PFP_IC_BASE_CNTL = 0x5842, CP_PFP_IC_OP_CNTL = 0x5843;
+	constexpr uint32_t CP_ME_IC_BASE_LO  = 0x5844, CP_ME_IC_BASE_HI  = 0x5845, CP_ME_IC_BASE_CNTL  = 0x5846, CP_ME_IC_OP_CNTL  = 0x5847;
+	constexpr uint32_t CP_CPC_IC_BASE_LO = 0x584c, CP_CPC_IC_BASE_HI = 0x584d, CP_CPC_IC_BASE_CNTL = 0x584e, CP_CPC_IC_OP_CNTL = 0x297a;
+	constexpr uint32_t CP_GFX_RS64_DC_BASE0_LO = 0x5863, CP_GFX_RS64_DC_BASE1_LO = 0x5864;
+	constexpr uint32_t CP_GFX_RS64_DC_BASE0_HI = 0x5865, CP_GFX_RS64_DC_BASE1_HI = 0x5866;
+	constexpr uint32_t CP_GFX_RS64_DC_BASE_CNTL = 0x2a08, CP_GFX_RS64_DC_OP_CNTL = 0x2a09;
+	constexpr uint32_t CP_MEC_DC_BASE_CNTL = 0x290b, CP_MEC_DC_OP_CNTL = 0x290c;
+	constexpr uint32_t CP_MEC_MDBASE_LO = 0x5870, CP_MEC_MDBASE_HI = 0x5871;
+	constexpr uint32_t CP_GFX_RS64_INSTR_PNTR0 = 0x2a44, CP_GFX_RS64_INSTR_PNTR1 = 0x2a45, CP_MEC_RS64_INSTR_PNTR = 0x2908;
+	constexpr uint32_t CP_STALLED_STAT3 = 0x0f3c, CP_STALLED_STAT1 = 0x0f3d, CP_STALLED_STAT2 = 0x0f3e, CP_BUSY_STAT = 0x0f3f;   // BASE_IDX 0
+}
+// *_IC_BASE_CNTL / *_DC_BASE_CNTL share these positions (gc_11_0_0_sh_mask.h)
+constexpr F IC_VMID         { 0x0,  0x0000000F };
+constexpr F IC_EXE_DISABLE  { 0x17, 0x00800000 };
+constexpr F IC_CACHE_POLICY { 0x18, 0x03000000 };
+constexpr uint32_t kIC_INVALIDATE_COMPLETE = 0x2, kIC_PRIME = 0x10, kIC_PRIMED = 0x20;
+constexpr uint32_t kDC_INVALIDATE = 0x1, kDC_INVALIDATE_COMPLETE = 0x2, kCPC_INVALIDATE = 0x1;
+constexpr F MEC_INVALIDATE_ICACHE { 0x4,  0x00000010 };
+constexpr F MEC_PIPE0_ACTIVE      { 0x1a, 0x04000000 };
+constexpr F MEC_PIPE1_ACTIVE      { 0x1b, 0x08000000 };
+constexpr F MEC_PIPE2_ACTIVE      { 0x1c, 0x10000000 };
+constexpr F MEC_PIPE3_ACTIVE      { 0x1d, 0x20000000 };
+constexpr F MEC_HALT              { 0x1e, 0x40000000 };
 constexpr F ME_PFP_PIPE0_RESET { 0x12, 0x00040000 };
 constexpr F ME_PFP_PIPE1_RESET { 0x13, 0x00080000 };
 constexpr F ME_ME_PIPE0_RESET  { 0x14, 0x00100000 };
@@ -497,39 +521,136 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	auto g1 = [&](uint32_t r) { return gc1(dev, r); };
 	rep.meCntlBefore = RREG32(dev, g1(C::CP_ME_CNTL));
 
-	// gfx_v11_0_config_gfx_rs64
+	// Survey the RS64 cache bases the RLC autoload left behind.
+	auto rd64 = [&](uint32_t lo, uint32_t hi) { return ((uint64_t)RREG32(dev, g1(hi)) << 32) | RREG32(dev, g1(lo)); };
+	rep.pfpIcFound = rd64(C2::CP_PFP_IC_BASE_LO, C2::CP_PFP_IC_BASE_HI);
+	rep.meIcFound  = rd64(C2::CP_ME_IC_BASE_LO, C2::CP_ME_IC_BASE_HI);
+	grbm_select(dev, 1, 0, 0, 0);
+	rep.cpcIcFound = rd64(C2::CP_CPC_IC_BASE_LO, C2::CP_CPC_IC_BASE_HI);
+	grbm_select(dev, 0, 0, 0, 0);
+
+	// Halt everything first (cp_gfx_enable(false), cp_compute_enable(false)).
+	uint32_t t = RREG32(dev, g1(C::CP_ME_CNTL));
+	t = setf(setf(t, ME_ME_HALT, 1), ME_PFP_HALT, 1);
+	WREG32(dev, g1(C::CP_ME_CNTL), t);
+	t = RREG32(dev, g1(C::CP_MEC_RS64_CNTL));
+	t = setf(t, MEC_HALT, 1);
+	t = setf(setf(setf(setf(t, MEC_PIPE0_ACTIVE, 0), MEC_PIPE1_ACTIVE, 0), MEC_PIPE2_ACTIVE, 0), MEC_PIPE3_ACTIVE, 0);
+	WREG32(dev, g1(C::CP_MEC_RS64_CNTL), t);
+
+	auto waitBit = [&](uint32_t reg, uint32_t mask) {
+		for (uint32_t us = 0; us < 50000; us++) { if (RREG32(dev, g1(reg)) & mask) return true; IODelay(1); }
+		rep.cacheOpTimedOut = true;
+		return false;
+	};
+	const bool program = rep.pfpIcFound == 0 && rep.meIcFound == 0 && fw.pfpIc && fw.meIc && fw.mecIc;
+	rep.cachesProgrammed = program;
+
+	// ---- PFP: gfx_v11_0_config_pfp_cache_rs64 (IC + DC base0) / config_gfx_rs64 ----
+	if (program) {
+		WREG32(dev, g1(C2::CP_PFP_IC_BASE_LO), (uint32_t)fw.pfpIc);
+		WREG32(dev, g1(C2::CP_PFP_IC_BASE_HI), (uint32_t)(fw.pfpIc >> 32));
+		t = RREG32(dev, g1(C2::CP_PFP_IC_BASE_CNTL));
+		t = setf(setf(setf(t, IC_VMID, 0), IC_CACHE_POLICY, 0), IC_EXE_DISABLE, 0);
+		WREG32(dev, g1(C2::CP_PFP_IC_BASE_CNTL), t);
+		waitBit(C2::CP_PFP_IC_OP_CNTL, kIC_INVALIDATE_COMPLETE);
+		WREG32(dev, g1(C2::CP_PFP_IC_OP_CNTL), RREG32(dev, g1(C2::CP_PFP_IC_OP_CNTL)) | kIC_PRIME);
+		waitBit(C2::CP_PFP_IC_OP_CNTL, kIC_PRIMED);
+	}
 	for (uint32_t pipe = 0; pipe < 2; pipe++) {
 		grbm_select(dev, 0, pipe, 0, 0);
 		WREG32(dev, g0(C::CP_PFP_PRGRM_CNTR_START), (fw.pfpHi << 30) | (fw.pfpLo >> 2));
 		WREG32(dev, g0(C::CP_PFP_PRGRM_CNTR_START_HI), fw.pfpHi >> 2);
+		t = RREG32(dev, g1(C::CP_ME_CNTL));
+		t = setf(t, pipe ? ME_PFP_PIPE1_RESET : ME_PFP_PIPE0_RESET, 1);
+		WREG32(dev, g1(C::CP_ME_CNTL), t);
+		t = setf(t, pipe ? ME_PFP_PIPE1_RESET : ME_PFP_PIPE0_RESET, 0);
+		WREG32(dev, g1(C::CP_ME_CNTL), t);
+		if (program) {
+			const uint64_t dc = fw.pfpDc[pipe] ? fw.pfpDc[pipe] : fw.pfpDc[0];
+			WREG32(dev, g1(C2::CP_GFX_RS64_DC_BASE0_LO), (uint32_t)dc);
+			WREG32(dev, g1(C2::CP_GFX_RS64_DC_BASE0_HI), (uint32_t)(dc >> 32));
+		}
 	}
 	grbm_select(dev, 0, 0, 0, 0);
-	uint32_t t = RREG32(dev, g1(C::CP_ME_CNTL));
-	t = setf(setf(t, ME_PFP_PIPE0_RESET, 1), ME_PFP_PIPE1_RESET, 1);
-	WREG32(dev, g1(C::CP_ME_CNTL), t);
-	t = setf(setf(t, ME_PFP_PIPE0_RESET, 0), ME_PFP_PIPE1_RESET, 0);
-	WREG32(dev, g1(C::CP_ME_CNTL), t);
+
+	// ---- ME: gfx_v11_0_config_me_cache_rs64 (IC + DC base1) ----
+	if (program) {
+		WREG32(dev, g1(C2::CP_ME_IC_BASE_LO), (uint32_t)fw.meIc);
+		WREG32(dev, g1(C2::CP_ME_IC_BASE_HI), (uint32_t)(fw.meIc >> 32));
+		t = RREG32(dev, g1(C2::CP_ME_IC_BASE_CNTL));
+		t = setf(setf(setf(t, IC_VMID, 0), IC_CACHE_POLICY, 0), IC_EXE_DISABLE, 0);
+		WREG32(dev, g1(C2::CP_ME_IC_BASE_CNTL), t);
+		waitBit(C2::CP_ME_IC_OP_CNTL, kIC_INVALIDATE_COMPLETE);
+		WREG32(dev, g1(C2::CP_ME_IC_OP_CNTL), RREG32(dev, g1(C2::CP_ME_IC_OP_CNTL)) | kIC_PRIME);
+		waitBit(C2::CP_ME_IC_OP_CNTL, kIC_PRIMED);
+	}
 	for (uint32_t pipe = 0; pipe < 2; pipe++) {
 		grbm_select(dev, 0, pipe, 0, 0);
 		WREG32(dev, g0(C::CP_ME_PRGRM_CNTR_START), (fw.meHi << 30) | (fw.meLo >> 2));
 		WREG32(dev, g0(C::CP_ME_PRGRM_CNTR_START_HI), fw.meHi >> 2);
+		t = RREG32(dev, g1(C::CP_ME_CNTL));
+		t = setf(t, pipe ? ME_ME_PIPE1_RESET : ME_ME_PIPE0_RESET, 1);
+		WREG32(dev, g1(C::CP_ME_CNTL), t);
+		t = setf(t, pipe ? ME_ME_PIPE1_RESET : ME_ME_PIPE0_RESET, 0);
+		WREG32(dev, g1(C::CP_ME_CNTL), t);
+		if (program) {
+			const uint64_t dc = fw.meDc[pipe] ? fw.meDc[pipe] : fw.meDc[0];
+			WREG32(dev, g1(C2::CP_GFX_RS64_DC_BASE1_LO), (uint32_t)dc);
+			WREG32(dev, g1(C2::CP_GFX_RS64_DC_BASE1_HI), (uint32_t)(dc >> 32));
+		}
 	}
 	grbm_select(dev, 0, 0, 0, 0);
-	t = RREG32(dev, g1(C::CP_ME_CNTL));
-	t = setf(setf(t, ME_ME_PIPE0_RESET, 1), ME_ME_PIPE1_RESET, 1);
-	WREG32(dev, g1(C::CP_ME_CNTL), t);
-	t = setf(setf(t, ME_ME_PIPE0_RESET, 0), ME_ME_PIPE1_RESET, 0);
-	WREG32(dev, g1(C::CP_ME_CNTL), t);
+	if (program) {
+		t = RREG32(dev, g1(C2::CP_GFX_RS64_DC_BASE_CNTL));
+		t = setf(setf(t, IC_VMID, 0), IC_CACHE_POLICY, 0);
+		WREG32(dev, g1(C2::CP_GFX_RS64_DC_BASE_CNTL), t);
+		WREG32(dev, g1(C2::CP_GFX_RS64_DC_OP_CNTL), RREG32(dev, g1(C2::CP_GFX_RS64_DC_OP_CNTL)) | kDC_INVALIDATE);
+		waitBit(C2::CP_GFX_RS64_DC_OP_CNTL, kDC_INVALIDATE_COMPLETE);
+	}
+
+	// ---- MEC: gfx_v11_0_config_mec_cache_rs64 / config_gfx_rs64 ----
+	if (program) {
+		t = RREG32(dev, g1(C2::CP_CPC_IC_BASE_CNTL));
+		t = setf(setf(setf(t, IC_VMID, 0), IC_EXE_DISABLE, 0), IC_CACHE_POLICY, 0);
+		WREG32(dev, g1(C2::CP_CPC_IC_BASE_CNTL), t);
+		t = RREG32(dev, g1(C2::CP_MEC_DC_BASE_CNTL));
+		t = setf(setf(t, IC_VMID, 0), IC_CACHE_POLICY, 0);
+		WREG32(dev, g1(C2::CP_MEC_DC_BASE_CNTL), t);
+	}
 	for (uint32_t pipe = 0; pipe < 4; pipe++) {
 		grbm_select(dev, 1, pipe, 0, 0);
+		if (program) {
+			const uint64_t dc = fw.mecDc[pipe] ? fw.mecDc[pipe] : fw.mecDc[0];
+			WREG32(dev, g1(C2::CP_MEC_MDBASE_LO), (uint32_t)dc);
+			WREG32(dev, g1(C2::CP_MEC_MDBASE_HI), (uint32_t)(dc >> 32));
+		}
 		WREG32(dev, g1(C::CP_MEC_RS64_PRGRM_CNTR_START), (fw.mecLo >> 2) | (fw.mecHi << 30));
 		WREG32(dev, g1(C::CP_MEC_RS64_PRGRM_CNTR_START_HI), fw.mecHi >> 2);
+		if (program) {
+			WREG32(dev, g1(C2::CP_CPC_IC_BASE_LO), (uint32_t)fw.mecIc);
+			WREG32(dev, g1(C2::CP_CPC_IC_BASE_HI), (uint32_t)(fw.mecIc >> 32));
+		}
 	}
 	grbm_select(dev, 0, 0, 0, 0);
+	if (program) {
+		WREG32(dev, g1(C2::CP_MEC_DC_OP_CNTL), RREG32(dev, g1(C2::CP_MEC_DC_OP_CNTL)) | kDC_INVALIDATE);
+		waitBit(C2::CP_MEC_DC_OP_CNTL, kDC_INVALIDATE_COMPLETE);
+		WREG32(dev, g1(C2::CP_CPC_IC_OP_CNTL), RREG32(dev, g1(C2::CP_CPC_IC_OP_CNTL)) | kCPC_INVALIDATE);
+		waitBit(C2::CP_CPC_IC_OP_CNTL, kIC_INVALIDATE_COMPLETE);
+	}
 	t = RREG32(dev, g1(C::CP_MEC_RS64_CNTL));
 	t = setf(setf(setf(setf(t, MEC_PIPE0_RESET, 1), MEC_PIPE1_RESET, 1), MEC_PIPE2_RESET, 1), MEC_PIPE3_RESET, 1);
 	WREG32(dev, g1(C::CP_MEC_RS64_CNTL), t);
 	t = setf(setf(setf(setf(t, MEC_PIPE0_RESET, 0), MEC_PIPE1_RESET, 0), MEC_PIPE2_RESET, 0), MEC_PIPE3_RESET, 0);
+	WREG32(dev, g1(C::CP_MEC_RS64_CNTL), t);
+
+	// kcq_resume on the !async path: cp_compute_enable(true) before the gfx ring.
+	t = RREG32(dev, g1(C::CP_MEC_RS64_CNTL));
+	t = setf(t, MEC_INVALIDATE_ICACHE, 0);
+	t = setf(setf(setf(setf(t, MEC_PIPE0_RESET, 0), MEC_PIPE1_RESET, 0), MEC_PIPE2_RESET, 0), MEC_PIPE3_RESET, 0);
+	t = setf(setf(setf(setf(t, MEC_PIPE0_ACTIVE, 1), MEC_PIPE1_ACTIVE, 1), MEC_PIPE2_ACTIVE, 1), MEC_PIPE3_ACTIVE, 1);
+	t = setf(t, MEC_HALT, 0);
 	WREG32(dev, g1(C::CP_MEC_RS64_CNTL), t);
 
 	// gfx_v11_0_cp_gfx_resume — ring 0, pipe 0, VMID 0, no doorbell
@@ -597,6 +718,13 @@ kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33
 	rep.rptrWriteback = RBAR0_64(dev, base + kCpRptrOff);
 	rep.grbmStatus    = RREG32(dev, g0(C::GRBM_STATUS));
 	if (!rep.passed) rep.cpStat = RREG32(dev, g0(C::CP_STAT));
+	rep.pfpPc    = RREG32(dev, g1(C2::CP_GFX_RS64_INSTR_PNTR0));
+	rep.mePc     = RREG32(dev, g1(C2::CP_GFX_RS64_INSTR_PNTR1));
+	rep.mecPc    = RREG32(dev, g1(C2::CP_MEC_RS64_INSTR_PNTR));
+	rep.stalled1 = RREG32(dev, g0(C2::CP_STALLED_STAT1));
+	rep.stalled2 = RREG32(dev, g0(C2::CP_STALLED_STAT2));
+	rep.stalled3 = RREG32(dev, g0(C2::CP_STALLED_STAT3));
+	rep.busyStat = RREG32(dev, g0(C2::CP_BUSY_STAT));
 	UCODE_LOG("navi33-gfx: CP gfx ring test %s after %u us (SCRATCH %#x, RB0_RPTR %#x, rptr wb %#llx, CP_STAT %#x, GRBM %#x, ME_CNTL %#x->%#x)",
 	          rep.passed ? "PASSED" : "FAILED", us, rep.scratch, rep.rbRptr, (unsigned long long)rep.rptrWriteback,
 	          rep.cpStat, rep.grbmStatus, rep.meCntlBefore, rep.meCntlAfter);

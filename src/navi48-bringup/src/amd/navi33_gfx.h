@@ -68,6 +68,10 @@ kern_return_t navi33_sdma_ring_test(DeviceContext &dev, N33GfxReport &rep, uint3
 // + SRM, the clear-state preamble in cp_gfx_start, KIQ/KCQ, golden registers.
 struct N33CpFw {   // gfx_firmware_header_v2_0 ucode_start_addr_lo/hi of each RS64 image
 	uint32_t pfpLo, pfpHi, meLo, meHi, mecLo, mecHi;
+	// Where the PSP put each RS64 image inside the TMR (LOAD_IP_FW responses, by fw_type).
+	// 0 = unknown. Used for the instruction/data cache bases when the RLC autoload left
+	// them empty (on Navi 48 it did: the cores fetched from address 0).
+	uint64_t pfpIc, pfpDc[2], meIc, meDc[2], mecIc, mecDc[4];
 };
 
 struct N33CpReport {
@@ -81,6 +85,12 @@ struct N33CpReport {
 	uint32_t waitedUs;
 	bool     passed;
 	const char *stage;
+	// RS64 cache bases as found (before this stage touched them) and whether we set them
+	uint64_t pfpIcFound, meIcFound, cpcIcFound;
+	bool     cachesProgrammed;
+	bool     cacheOpTimedOut;
+	uint32_t pfpPc, mePc, mecPc;  // CP_GFX_RS64_INSTR_PNTR0/1, CP_MEC_RS64_INSTR_PNTR after the test
+	uint32_t stalled1, stalled2, stalled3, busyStat;
 };
 
 // Reads the start addresses out of the three firmware files; false if any header is bad.

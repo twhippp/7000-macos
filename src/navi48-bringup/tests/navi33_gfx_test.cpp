@@ -69,6 +69,8 @@ struct Rig {
 		uint64_t done = 0;
 		while (!stop) {
 			r(kGc0, 0x16ce) = r(kGc0, 0x16bc) ? 1u : 0u;   // ENG17 ACK follows REQ
+			r(kGc1, 0x5843) |= 0x22; r(kGc1, 0x5847) |= 0x22;   // PFP/ME IC: invalidate complete + primed
+			r(kGc1, 0x297a) |= 0x2;  r(kGc1, 0x2a09) |= 0x2; r(kGc1, 0x290c) |= 0x2;   // CPC IC, GFX DC, MEC DC
 			const bool running = engineAlive && (r(kGc1, 0x589a) & 1u) == 0 && (r(kGc0, 0x0080) & 1u);
 			if (running) {
 				const uint64_t ring = (((uint64_t)r(kGc0, 0x0082) << 40) | ((uint64_t)r(kGc0, 0x0081) << 8)) - kMcBase;
@@ -196,11 +198,21 @@ int main() {
 		check(rep.rptrWriteback == 64, "rptr write-back seen");
 
 		k.r(kGc1, 0x0803) = (1u << 26) | (1u << 28);   // CP_ME_CNTL: PFP/ME halted
-		N33CpFw fw { 0x1000, 0x1, 0x2000, 0x1, 0x3000, 0x1 };
+		N33CpFw fw {};
+		fw.pfpLo = 0x1000; fw.pfpHi = 1; fw.meLo = 0x2000; fw.meHi = 1; fw.mecLo = 0x3000; fw.mecHi = 1;
+		fw.pfpIc = 0x81FC100000ull; fw.pfpDc[0] = 0x81FC200000ull; fw.pfpDc[1] = 0x81FC210000ull;
+		fw.meIc  = 0x81FC300000ull; fw.meDc[0]  = 0x81FC400000ull; fw.meDc[1]  = 0x81FC410000ull;
+		fw.mecIc = 0x81FC500000ull;
+		for (int i = 0; i < 4; i++) fw.mecDc[i] = 0x81FC600000ull + 0x10000ull * i;
 		N33CpReport cp {};
 		check(navi33_cp_gfx_ring_test(k.dev, fw, cp) == kIOReturnSuccess && cp.passed, "CP gfx ring writes SCRATCH_REG0");
 		check(k.r(kGc0, 0x1e44) == ((1u << 30) | (0x1000 >> 2)) && k.r(kGc0, 0x1e59) == 0, "PFP program counter start");
 		check(k.r(kGc1, 0x2900) == ((0x3000 >> 2) | (1u << 30)), "MEC program counter start");
+		check(cp.cachesProgrammed && !cp.cacheOpTimedOut, "RS64 cache bases programmed (they were empty)");
+		check(k.r(kGc1, 0x5840) == 0xFC100000u && k.r(kGc1, 0x5841) == 0x81, "PFP IC base = TMR address");
+		check(k.r(kGc1, 0x5844) == 0xFC300000u && k.r(kGc1, 0x584c) == 0xFC500000u, "ME IC / CPC IC bases = TMR addresses");
+		check(k.r(kGc1, 0x5870) == 0xFC630000u, "MEC MDBASE (last pipe written) = P3 stack");
+		check((k.r(kGc1, 0x2904) & (1u << 30)) == 0 && (k.r(kGc1, 0x2904) & 0x3C000000u) == 0x3C000000u, "MEC unhalted, 4 pipes active");
 		check((k.r(kGc0, 0x1de1) & 0x3F) == 9 && ((k.r(kGc0, 0x1de1) >> 8) & 0x3F) == 7 && (k.r(kGc0, 0x1de1) & (1u << 29)),
 		      "RB0_CNTL: bufsz 9, blksz 7, KMD queue");
 		const uint64_t rb0 = ((((uint64_t)k.r(kGc0, 0x1e51)) << 32) | k.r(kGc0, 0x1de0)) << 8;
