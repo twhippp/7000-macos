@@ -5,6 +5,7 @@
 //
 #include "navi33_gfx.h"
 #include "amdgpu_log.h"
+#include "amdgpu_ucode_psp.h"
 
 namespace amdgpu {
 
@@ -281,7 +282,8 @@ kern_return_t navi33_gfxhub_enable(DeviceContext &dev, N33GfxReport &rep) {
 	WREG32(dev, gc0(dev, R::GCVM_INVALIDATE_ENG17_REQ), req);
 	rep.tlbFlushAcked = false;
 	for (uint32_t us = 0; us < 100000; us += 10) {
-		if (RREG32(dev, gc0(dev, R::GCVM_INVALIDATE_ENG17_ACK)) & 1u) { rep.tlbFlushAcked = true; break; }
+		rep.tlbAckRaw = RREG32(dev, gc0(dev, R::GCVM_INVALIDATE_ENG17_ACK));
+		if (rep.tlbAckRaw & 1u) { rep.tlbFlushAcked = true; break; }
 		IODelay(10);
 	}
 	(void)R::GCVM_INVALIDATE_ENG17_SEM;
@@ -391,6 +393,214 @@ kern_return_t navi33_sdma_ring_test(DeviceContext &dev, N33GfxReport &rep, uint3
 	          rep.rbRptr, rep.statusReg, rep.f32CntlBefore, rep.f32CntlAfter, rep.faultStatus,
 	          (unsigned long long)rep.faultAddr);
 	rep.stage = rep.passed ? "sdma-write-ok" : "sdma-timeout";
+	return rep.passed ? kIOReturnSuccess : kIOReturnTimeout;
+}
+
+// ============================================================================
+// Stage 5 — gfx CP ring 0 (gfx_v11_0.c, amdgpu_async_gfx_ring = 0)
+// ============================================================================
+namespace {
+namespace C {   // gc_11_0_0_offset.h: register, BASE_IDX
+	constexpr uint32_t CP_RB0_RPTR           = 0x0f60;  // 0
+	constexpr uint32_t CP_RB_WPTR_DELAY      = 0x0f61;  // 0
+	constexpr uint32_t CP_STAT               = 0x0f40;  // 0
+	constexpr uint32_t GRBM_STATUS           = 0x0da4;  // 0
+	constexpr uint32_t CP_RB0_BASE           = 0x1de0;  // 0
+	constexpr uint32_t CP_RB0_CNTL           = 0x1de1;  // 0
+	constexpr uint32_t CP_RB0_RPTR_ADDR      = 0x1de3;  // 0
+	constexpr uint32_t CP_RB0_RPTR_ADDR_HI   = 0x1de4;  // 0
+	constexpr uint32_t CP_DEVICE_ID          = 0x1deb;  // 0
+	constexpr uint32_t CP_RB_VMID            = 0x1df1;  // 0
+	constexpr uint32_t CP_RB0_WPTR           = 0x1df4;  // 0
+	constexpr uint32_t CP_RB0_WPTR_HI        = 0x1df5;  // 0
+	constexpr uint32_t CP_PFP_PRGRM_CNTR_START = 0x1e44; // 0
+	constexpr uint32_t CP_ME_PRGRM_CNTR_START  = 0x1e45; // 0
+	constexpr uint32_t CP_MAX_CONTEXT        = 0x1e4e;  // 0
+	constexpr uint32_t CP_RB0_BASE_HI        = 0x1e51;  // 0
+	constexpr uint32_t CP_PFP_PRGRM_CNTR_START_HI = 0x1e59; // 0
+	constexpr uint32_t CP_ME_PRGRM_CNTR_START_HI  = 0x1e79; // 0
+	constexpr uint32_t CP_RB_WPTR_POLL_ADDR_LO = 0x1e8b; // 0
+	constexpr uint32_t CP_RB_WPTR_POLL_ADDR_HI = 0x1e8c; // 0
+	constexpr uint32_t CP_RB_DOORBELL_CONTROL  = 0x1e8d; // 0
+	constexpr uint32_t CP_RB_ACTIVE          = 0x1f40;  // 0
+	constexpr uint32_t CP_ME_CNTL            = 0x0803;  // 1
+	constexpr uint32_t GRBM_GFX_CNTL         = 0x0900;  // 1
+	constexpr uint32_t SCRATCH_REG0          = 0x2040;  // 1
+	constexpr uint32_t CP_MEC_RS64_PRGRM_CNTR_START    = 0x2900; // 1
+	constexpr uint32_t CP_MEC_RS64_CNTL      = 0x2904;  // 1
+	constexpr uint32_t CP_MEC_RS64_PRGRM_CNTR_START_HI = 0x2938; // 1
+}
+constexpr F ME_PFP_PIPE0_RESET { 0x12, 0x00040000 };
+constexpr F ME_PFP_PIPE1_RESET { 0x13, 0x00080000 };
+constexpr F ME_ME_PIPE0_RESET  { 0x14, 0x00100000 };
+constexpr F ME_ME_PIPE1_RESET  { 0x15, 0x00200000 };
+constexpr F ME_PFP_HALT        { 0x1a, 0x04000000 };
+constexpr F ME_ME_HALT         { 0x1c, 0x10000000 };
+constexpr F MEC_PIPE0_RESET    { 0x10, 0x00010000 };
+constexpr F MEC_PIPE1_RESET    { 0x11, 0x00020000 };
+constexpr F MEC_PIPE2_RESET    { 0x12, 0x00040000 };
+constexpr F MEC_PIPE3_RESET    { 0x13, 0x00080000 };
+constexpr F RB0_BUFSZ          { 0x0,  0x0000003F };
+constexpr F RB0_BLKSZ          { 0x8,  0x00003F00 };
+constexpr F RB0_KMD_QUEUE      { 0x1d, 0x20000000 };
+constexpr F RBDB_DOORBELL_EN   { 0x1e, 0x40000000 };
+constexpr F GFXC_PIPEID        { 0x0,  0x00000003 };
+constexpr F GFXC_MEID          { 0x2,  0x0000000C };
+constexpr F GFXC_VMID          { 0x4,  0x000000F0 };
+constexpr F GFXC_QUEUEID       { 0x8,  0x00000700 };
+constexpr uint32_t kRB_RPTR_ADDR_HI_MASK = 0x0000FFFFu;
+
+// nvd.h
+constexpr uint32_t pkt3(uint32_t op, uint32_t n) { return (3u << 30) | ((n & 0x3FFFu) << 16) | ((op & 0xFFu) << 8); }
+constexpr uint32_t kPKT3_NOP = 0x10, kPKT3_SET_UCONFIG_REG = 0x79, kSET_UCONFIG_REG_START = 0x0000c000;
+constexpr uint32_t kGfxNop = pkt3(kPKT3_NOP, 0x3FFF);   // gfx_v11_0_ring_funcs_gfx .nop
+
+constexpr uint64_t kCpRingOff  = 0x4000;   // 4 KiB = 1024 dwords
+constexpr uint32_t kCpRingBytes = 0x1000;
+constexpr uint64_t kCpRptrOff  = 0x5000;
+constexpr uint64_t kCpWptrOff  = 0x5008;
+constexpr uint32_t kCpPad      = 256;      // gfx ring align_mask 0xff
+
+// soc21_grbm_select
+void grbm_select(const DeviceContext &d, uint32_t me, uint32_t pipe, uint32_t queue, uint32_t vmid) {
+	uint32_t t = 0;
+	t = setf(t, GFXC_PIPEID, pipe);
+	t = setf(t, GFXC_MEID, me);
+	t = setf(t, GFXC_VMID, vmid);
+	t = setf(t, GFXC_QUEUEID, queue);
+	WREG32(d, gc1(d, C::GRBM_GFX_CNTL), t);
+}
+
+bool startAddr(const uint8_t *b, size_t n, uint32_t &lo, uint32_t &hi) {
+	if (!b || n < sizeof(gfx_firmware_header_v2_0)) return false;
+	const auto *h = reinterpret_cast<const gfx_firmware_header_v2_0 *>(b);
+	if (h->header.header_version_major != 2) return false;
+	lo = h->ucode_start_addr_lo; hi = h->ucode_start_addr_hi;
+	return true;
+}
+} // namespace
+
+bool navi33_cp_fw_from_blobs(const uint8_t *pfp, size_t pfpSize, const uint8_t *me, size_t meSize,
+                             const uint8_t *mec, size_t mecSize, N33CpFw &out) {
+	return startAddr(pfp, pfpSize, out.pfpLo, out.pfpHi) &&
+	       startAddr(me, meSize, out.meLo, out.meHi) &&
+	       startAddr(mec, mecSize, out.mecLo, out.mecHi);
+}
+
+kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33CpReport &rep, uint32_t timeoutUs) {
+	rep.stage = "cp";
+	const uint64_t base   = slot(dev);
+	const uint64_t ringMc = dev.vramMC(base + kCpRingOff);
+	const uint64_t rptrMc = dev.vramMC(base + kCpRptrOff);
+	const uint64_t wptrMc = dev.vramMC(base + kCpWptrOff);
+	auto g0 = [&](uint32_t r) { return gc0(dev, r); };
+	auto g1 = [&](uint32_t r) { return gc1(dev, r); };
+	rep.meCntlBefore = RREG32(dev, g1(C::CP_ME_CNTL));
+
+	// gfx_v11_0_config_gfx_rs64
+	for (uint32_t pipe = 0; pipe < 2; pipe++) {
+		grbm_select(dev, 0, pipe, 0, 0);
+		WREG32(dev, g0(C::CP_PFP_PRGRM_CNTR_START), (fw.pfpHi << 30) | (fw.pfpLo >> 2));
+		WREG32(dev, g0(C::CP_PFP_PRGRM_CNTR_START_HI), fw.pfpHi >> 2);
+	}
+	grbm_select(dev, 0, 0, 0, 0);
+	uint32_t t = RREG32(dev, g1(C::CP_ME_CNTL));
+	t = setf(setf(t, ME_PFP_PIPE0_RESET, 1), ME_PFP_PIPE1_RESET, 1);
+	WREG32(dev, g1(C::CP_ME_CNTL), t);
+	t = setf(setf(t, ME_PFP_PIPE0_RESET, 0), ME_PFP_PIPE1_RESET, 0);
+	WREG32(dev, g1(C::CP_ME_CNTL), t);
+	for (uint32_t pipe = 0; pipe < 2; pipe++) {
+		grbm_select(dev, 0, pipe, 0, 0);
+		WREG32(dev, g0(C::CP_ME_PRGRM_CNTR_START), (fw.meHi << 30) | (fw.meLo >> 2));
+		WREG32(dev, g0(C::CP_ME_PRGRM_CNTR_START_HI), fw.meHi >> 2);
+	}
+	grbm_select(dev, 0, 0, 0, 0);
+	t = RREG32(dev, g1(C::CP_ME_CNTL));
+	t = setf(setf(t, ME_ME_PIPE0_RESET, 1), ME_ME_PIPE1_RESET, 1);
+	WREG32(dev, g1(C::CP_ME_CNTL), t);
+	t = setf(setf(t, ME_ME_PIPE0_RESET, 0), ME_ME_PIPE1_RESET, 0);
+	WREG32(dev, g1(C::CP_ME_CNTL), t);
+	for (uint32_t pipe = 0; pipe < 4; pipe++) {
+		grbm_select(dev, 1, pipe, 0, 0);
+		WREG32(dev, g1(C::CP_MEC_RS64_PRGRM_CNTR_START), (fw.mecLo >> 2) | (fw.mecHi << 30));
+		WREG32(dev, g1(C::CP_MEC_RS64_PRGRM_CNTR_START_HI), fw.mecHi >> 2);
+	}
+	grbm_select(dev, 0, 0, 0, 0);
+	t = RREG32(dev, g1(C::CP_MEC_RS64_CNTL));
+	t = setf(setf(setf(setf(t, MEC_PIPE0_RESET, 1), MEC_PIPE1_RESET, 1), MEC_PIPE2_RESET, 1), MEC_PIPE3_RESET, 1);
+	WREG32(dev, g1(C::CP_MEC_RS64_CNTL), t);
+	t = setf(setf(setf(setf(t, MEC_PIPE0_RESET, 0), MEC_PIPE1_RESET, 0), MEC_PIPE2_RESET, 0), MEC_PIPE3_RESET, 0);
+	WREG32(dev, g1(C::CP_MEC_RS64_CNTL), t);
+
+	// gfx_v11_0_cp_gfx_resume — ring 0, pipe 0, VMID 0, no doorbell
+	bar0_memset_vram(dev, base + kCpRingOff, kGfxNop, kCpRingBytes);
+	WBAR0_64(dev, base + kCpRptrOff, 0);
+	WBAR0_64(dev, base + kCpWptrOff, 0);
+	WREG32(dev, g0(C::CP_RB_WPTR_DELAY), 0);
+	WREG32(dev, g0(C::CP_RB_VMID), 0);
+	grbm_select(dev, 0, 0, 0, 0);                      // cp_gfx_switch_pipe(PIPE_ID0)
+	constexpr uint32_t bufsz = 9;                      // order_base_2(4096 / 8)
+	static_assert(kCpRingBytes / 8 == (1u << bufsz), "RB_BUFSZ");
+	uint32_t rb = setf(setf(setf(0, RB0_BUFSZ, bufsz), RB0_BLKSZ, bufsz - 2), RB0_KMD_QUEUE, 1);
+	WREG32(dev, g0(C::CP_RB0_CNTL), rb);
+	WREG32(dev, g0(C::CP_RB0_WPTR), 0);
+	WREG32(dev, g0(C::CP_RB0_WPTR_HI), 0);
+	WREG32(dev, g0(C::CP_RB0_RPTR_ADDR), (uint32_t)rptrMc);
+	WREG32(dev, g0(C::CP_RB0_RPTR_ADDR_HI), (uint32_t)(rptrMc >> 32) & kRB_RPTR_ADDR_HI_MASK);
+	WREG32(dev, g0(C::CP_RB_WPTR_POLL_ADDR_LO), (uint32_t)wptrMc);
+	WREG32(dev, g0(C::CP_RB_WPTR_POLL_ADDR_HI), (uint32_t)(wptrMc >> 32));
+	IOSleep(1);
+	WREG32(dev, g0(C::CP_RB0_CNTL), rb);
+	WREG32(dev, g0(C::CP_RB0_BASE), (uint32_t)(ringMc >> 8));
+	WREG32(dev, g0(C::CP_RB0_BASE_HI), (uint32_t)((ringMc >> 8) >> 32));
+	WREG32(dev, g0(C::CP_RB_ACTIVE), 1);
+	t = setf(RREG32(dev, g0(C::CP_RB_DOORBELL_CONTROL)), RBDB_DOORBELL_EN, 0);
+	WREG32(dev, g0(C::CP_RB_DOORBELL_CONTROL), t);
+
+	// gfx_v11_0_cp_gfx_start (without the clear-state preamble): init the CP, unhalt.
+	WREG32(dev, g0(C::CP_MAX_CONTEXT), 8 - 1);         // max_hw_contexts 8
+	WREG32(dev, g0(C::CP_DEVICE_ID), 1);
+	t = RREG32(dev, g1(C::CP_ME_CNTL));
+	t = setf(setf(t, ME_ME_HALT, 0), ME_PFP_HALT, 0);
+	WREG32(dev, g1(C::CP_ME_CNTL), t);
+	rep.cpIdleAfterUnhalt = false;
+	for (uint32_t us = 0; us < 100000; us += 10) {
+		rep.cpStat = RREG32(dev, g0(C::CP_STAT));
+		if (rep.cpStat == 0) { rep.cpIdleAfterUnhalt = true; break; }
+		IODelay(10);
+	}
+	rep.meCntlAfter = RREG32(dev, g1(C::CP_ME_CNTL));
+
+	// gfx_v11_0_ring_test_ring
+	const uint32_t scratch = g1(C::SCRATCH_REG0);       // absolute dword index
+	WREG32(dev, scratch, 0xCAFEDEADu);
+	uint32_t ring[kCpPad];
+	for (uint32_t i = 0; i < kCpPad; i++) ring[i] = kGfxNop;
+	ring[0] = pkt3(kPKT3_SET_UCONFIG_REG, 1);
+	ring[1] = scratch - kSET_UCONFIG_REG_START;
+	ring[2] = 0xDEADBEEFu;
+	bar0_memcpy_to_vram(dev, base + kCpRingOff, ring, sizeof(ring));
+	WBAR0_64(dev, base + kCpWptrOff, kCpPad);           // gfx wptr is in dwords
+	amdgpu_hdp_flush(dev);
+	WREG32(dev, g0(C::CP_RB0_WPTR), kCpPad);
+	WREG32(dev, g0(C::CP_RB0_WPTR_HI), 0);
+
+	rep.passed = false;
+	uint32_t us = 0;
+	for (; us < timeoutUs; us += 10) {
+		if (RREG32(dev, scratch) == 0xDEADBEEFu) { rep.passed = true; break; }
+		IODelay(10);
+	}
+	rep.waitedUs      = us;
+	rep.scratch       = RREG32(dev, scratch);
+	rep.rbRptr        = RREG32(dev, g0(C::CP_RB0_RPTR));
+	rep.rptrWriteback = RBAR0_64(dev, base + kCpRptrOff);
+	rep.grbmStatus    = RREG32(dev, g0(C::GRBM_STATUS));
+	if (!rep.passed) rep.cpStat = RREG32(dev, g0(C::CP_STAT));
+	UCODE_LOG("navi33-gfx: CP gfx ring test %s after %u us (SCRATCH %#x, RB0_RPTR %#x, rptr wb %#llx, CP_STAT %#x, GRBM %#x, ME_CNTL %#x->%#x)",
+	          rep.passed ? "PASSED" : "FAILED", us, rep.scratch, rep.rbRptr, (unsigned long long)rep.rptrWriteback,
+	          rep.cpStat, rep.grbmStatus, rep.meCntlBefore, rep.meCntlAfter);
+	rep.stage = rep.passed ? "cp-write-ok" : (rep.cpIdleAfterUnhalt ? "cp-timeout" : "cp-not-idle");
 	return rep.passed ? kIOReturnSuccess : kIOReturnTimeout;
 }
 

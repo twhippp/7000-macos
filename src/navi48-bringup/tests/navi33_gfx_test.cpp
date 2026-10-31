@@ -43,6 +43,8 @@ struct Rig {
 	DeviceContext dev;
 	std::atomic<bool> stop { false };
 	bool engineAlive = true;
+	bool cpAlive = true;
+	uint64_t cpDone = 0;
 	std::thread sdma;
 
 	volatile uint32_t &r(uint32_t base, uint32_t off) { return reinterpret_cast<volatile uint32_t &>(regs[base + off]); }
@@ -83,8 +85,30 @@ struct Rig {
 				std::memcpy(&vram[rp], &done, 8);
 				r(kGc0, 0x0083) = (uint32_t)done;
 			}
+			runCp();
 			std::this_thread::sleep_for(std::chrono::microseconds(50));
 		}
+	}
+
+	// gfx CP ring 0: PFP/ME unhalted (CP_ME_CNTL bits 26/28 clear) + RB_ACTIVE.
+	void runCp() {
+		const uint32_t me = r(kGc1, 0x0803);
+		if (!cpAlive || (me & ((1u << 26) | (1u << 28))) || !r(kGc0, 0x1f40)) return;
+		const uint64_t ring = ((((uint64_t)r(kGc0, 0x1e51)) << 32 | r(kGc0, 0x1de0)) << 8) - kMcBase;
+		const uint64_t wptr = r(kGc0, 0x1df4);
+		while (cpDone < wptr) {
+			uint32_t h; std::memcpy(&h, &vram[ring + cpDone * 4], 4);
+			const uint32_t op = (h >> 8) & 0xFF, n = (h >> 16) & 0x3FFF;
+			if (op == 0x10 && n == 0x3FFF) { cpDone += 1; continue; }
+			if (op == 0x79) {
+				uint32_t a[2]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 8);
+				regs[0xC000 + a[0]] = a[1];
+			}
+			cpDone += n + 2;
+		}
+		r(kGc0, 0x0f60) = (uint32_t)cpDone;
+		const uint64_t rp = (((uint64_t)r(kGc0, 0x1de4) << 32) | r(kGc0, 0x1de3)) - kMcBase;
+		std::memcpy(&vram[rp], &cpDone, 8);
 	}
 };
 
@@ -121,6 +145,30 @@ int main() {
 		check((k.r(kGc1, 0x589a) & 1) == 0, "F32 unhalted");
 		check((k.r(kGc0, 0x0092) & (1u << 28)) == 0, "doorbell off");
 		check(rep.rptrWriteback == 64, "rptr write-back seen");
+
+		k.r(kGc1, 0x0803) = (1u << 26) | (1u << 28);   // CP_ME_CNTL: PFP/ME halted
+		N33CpFw fw { 0x1000, 0x1, 0x2000, 0x1, 0x3000, 0x1 };
+		N33CpReport cp {};
+		check(navi33_cp_gfx_ring_test(k.dev, fw, cp) == kIOReturnSuccess && cp.passed, "CP gfx ring writes SCRATCH_REG0");
+		check(k.r(kGc0, 0x1e44) == ((1u << 30) | (0x1000 >> 2)) && k.r(kGc0, 0x1e59) == 0, "PFP program counter start");
+		check(k.r(kGc1, 0x2900) == ((0x3000 >> 2) | (1u << 30)), "MEC program counter start");
+		check((k.r(kGc0, 0x1de1) & 0x3F) == 9 && ((k.r(kGc0, 0x1de1) >> 8) & 0x3F) == 7 && (k.r(kGc0, 0x1de1) & (1u << 29)),
+		      "RB0_CNTL: bufsz 9, blksz 7, KMD queue");
+		const uint64_t rb0 = ((((uint64_t)k.r(kGc0, 0x1e51)) << 32) | k.r(kGc0, 0x1de0)) << 8;
+		check(rb0 == kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0x4000, "RB0 base is the slot's MC address");
+		check(k.r(kGc0, 0x1df4) == 256 && cp.rbRptr == 256, "wptr/rptr = 256 dwords");
+		check((k.r(kGc1, 0x0803) & ((1u << 26) | (1u << 28))) == 0, "PFP/ME unhalted");
+		check((k.r(kGc0, 0x1e8d) & (1u << 30)) == 0 && k.r(kGc0, 0x1df1) == 0, "no doorbell, VMID 0");
+	}
+	{
+		Rig k(true);
+		k.cpAlive = false;
+		N33GfxReport rep {};
+		navi33_gfxhub_enable(k.dev, rep);
+		N33CpFw fw {};
+		N33CpReport cp {};
+		check(navi33_cp_gfx_ring_test(k.dev, fw, cp, 2000) == kIOReturnTimeout && k.r(kGc1, 0x2040) == 0xCAFEDEADu,
+		      "dead CP times out, scratch keeps its seed");
 	}
 	{
 		Rig k(false);

@@ -19,6 +19,7 @@
 //
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <IOKit/IOReturn.h>
 #include "amdgpu_regs.h"
@@ -35,6 +36,7 @@ struct N33GfxReport {
 	uint32_t prevL1TlbCntl;              // GCMC_VM_MX_L1_TLB_CNTL as found
 	uint32_t prevSysApLow, prevSysApHigh;
 	bool     tlbFlushAcked;
+	uint32_t tlbAckRaw;                  // GCVM_INVALIDATE_ENG17_ACK as last read
 	uint32_t faultStatus;                // GCVM_L2_PROTECTION_FAULT_STATUS after the test
 	uint64_t faultAddr;
 	// SDMA0
@@ -54,5 +56,39 @@ kern_return_t navi33_gfxhub_enable(DeviceContext &dev, N33GfxReport &rep);
 
 // Starts SDMA0 queue 0 and runs the WRITE_LINEAR ring test. Needs navi33_gfxhub_enable first.
 kern_return_t navi33_sdma_ring_test(DeviceContext &dev, N33GfxReport &rep, uint32_t timeoutUs = 100000);
+
+// ---- stage 5: the graphics command processor (CP) ----
+//
+// Linux gfx_v11_0_hw_init for PSP-loaded RS64 firmware, with amdgpu_async_gfx_ring=0 (the
+// legacy kernel ring, which Linux still supports): config_gfx_rs64 (program-counter start
+// from the PFP/ME/MEC headers + pipe resets), cp_gfx_resume (RB0 in VRAM, VMID 0, no
+// doorbell), cp_gfx_enable (unhalt PFP/ME), then gfx_v11_0_ring_test_ring: SET_UCONFIG_REG
+// SCRATCH_REG0 = 0xDEADBEEF, read back over MMIO.
+// Not yet ported (not needed for that test): constants_init, rlc_resume's clear-state buffer
+// + SRM, the clear-state preamble in cp_gfx_start, KIQ/KCQ, golden registers.
+struct N33CpFw {   // gfx_firmware_header_v2_0 ucode_start_addr_lo/hi of each RS64 image
+	uint32_t pfpLo, pfpHi, meLo, meHi, mecLo, mecHi;
+};
+
+struct N33CpReport {
+	uint32_t meCntlBefore, meCntlAfter;
+	uint32_t cpStat;            // CP_STAT after unhalt (0 = idle)
+	bool     cpIdleAfterUnhalt;
+	uint32_t scratch;           // SCRATCH_REG0 after the test
+	uint32_t rbRptr;            // CP_RB0_RPTR (dwords)
+	uint64_t rptrWriteback;
+	uint32_t grbmStatus;
+	uint32_t waitedUs;
+	bool     passed;
+	const char *stage;
+};
+
+// Reads the start addresses out of the three firmware files; false if any header is bad.
+bool navi33_cp_fw_from_blobs(const uint8_t *pfp, size_t pfpSize, const uint8_t *me, size_t meSize,
+                             const uint8_t *mec, size_t mecSize, N33CpFw &out);
+
+// Needs navi33_gfxhub_enable (VMID 0) first.
+kern_return_t navi33_cp_gfx_ring_test(DeviceContext &dev, const N33CpFw &fw, N33CpReport &rep,
+                                      uint32_t timeoutUs = 100000);
 
 } // namespace amdgpu

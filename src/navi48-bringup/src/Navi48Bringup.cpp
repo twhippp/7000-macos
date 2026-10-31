@@ -532,7 +532,7 @@ void Navi48Bringup::publishNavi33Summary() {
 	};
 	auto yes = [&](const char *k) { return getProperty(k) == kOSBooleanTrue; };
 
-	char sum[256] = {}, warn[192] = {};
+	char sum[384] = {}, warn[192] = {};
 	size_t n = 0, w = 0;
 	auto add = [&](const char *fmt, auto... a) {
 		if (n < sizeof(sum)) n += (size_t)snprintf(sum + n, sizeof(sum) - n, fmt, a...);
@@ -558,6 +558,11 @@ void Navi48Bringup::publishNavi33Summary() {
 		if (getProperty("GFXHUB,TlbFlushAcked") && !yes("GFXHUB,TlbFlushAcked")) addw("tlb-flush-not-acked");
 		uint64_t fault = 0;
 		if (num("GFXHUB,FaultStatus", fault) && (uint32_t)fault) addw("gpu-vm-fault");
+	}
+	if (const char *s5 = str("CP,Stage5")) {
+		uint64_t v = 0, us = 0;
+		num("CP,Scratch", v); num("CP,WaitedUs", us);
+		add(" | S5 %s (read 0x%08x after %llu us)", s5, (uint32_t)v, (unsigned long long)us);
 	}
 	setProperty("N33,Summary", sum);
 	setProperty("N33,Warnings", w ? warn : "none");
@@ -693,7 +698,8 @@ void Navi48Bringup::navi33SmuFeatures() {
 // navi33-psp=3 (or higher): + every GFX/SDMA/MES/IMU/RLC firmware, AUTOLOAD_RLC, the SMU
 // feature enable (navi33SmuFeatures; navi33-smu-basic=1 skips it), and the read-only wait
 // for the RLC autoload to finish (gfx_v11_0_hw_init). navi33-psp=4 adds the first command
-// (GFXHUB VMID 0 + SDMA0 ring test, navi33_gfx.cpp). Stops before any
+// (GFXHUB VMID 0 + SDMA0 ring test, navi33_gfx.cpp); navi33-psp=5 the graphics CP ring
+// test. Stops before any
 // CP/GFX ring programming. Every step publishes its own property, so one boot shows
 // exactly where it stopped. Like Linux, a non-zero PSP status at 3+ is recorded and the
 // sequence carries on; only a PSP that stops answering ends it.
@@ -900,7 +906,33 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	setProperty("GFXHUB,FaultStatus", static_cast<uint64_t>(g.faultStatus), 32);
 	setProperty("GFXHUB,FaultAddr", g.faultAddr, 64);
 	setProperty("SDMA,Stage4", g.stage);
+	setProperty("GFXHUB,TlbAckRaw", static_cast<uint64_t>(g.tlbAckRaw), 32);
 	N48LOG("psp-stage4: %s", g.stage);
+	if (level < 5) return;
+	if (!g.passed) { setProperty("CP,Stage5", "skipped-sdma-failed"); return; }
+
+	// 9. Stage 5 — the graphics command processor: RS64 program counters, gfx ring 0,
+	//    unhalt, and Linux's gfx ring test (SET_UCONFIG_REG SCRATCH_REG0 = 0xDEADBEEF).
+	setProperty("CP,Stage5", "requested");
+	amdgpu::N33CpFw cpfw {};
+	if (!amdgpu::navi33_cp_fw_from_blobs(fw_gc_11_0_2_pfp, fw_gc_11_0_2_pfp_size, fw_gc_11_0_2_me, fw_gc_11_0_2_me_size,
+	                                     fw_gc_11_0_2_mec, fw_gc_11_0_2_mec_size, cpfw)) {
+		setProperty("CP,Stage5", "bad-firmware-header");
+		return;
+	}
+	amdgpu::N33CpReport c {};
+	(void)amdgpu::navi33_cp_gfx_ring_test(dev, cpfw, c);
+	setProperty("CP,Scratch", static_cast<uint64_t>(c.scratch), 32);
+	setProperty("CP,WaitedUs", static_cast<uint64_t>(c.waitedUs), 32);
+	setProperty("CP,RB0_RPTR", static_cast<uint64_t>(c.rbRptr), 32);
+	setProperty("CP,RptrWriteback", c.rptrWriteback, 64);
+	setProperty("CP,CP_STAT", static_cast<uint64_t>(c.cpStat), 32);
+	setProperty("CP,IdleAfterUnhalt", c.cpIdleAfterUnhalt);
+	setProperty("CP,GRBM_STATUS", static_cast<uint64_t>(c.grbmStatus), 32);
+	setProperty("CP,ME_CNTL_Before", static_cast<uint64_t>(c.meCntlBefore), 32);
+	setProperty("CP,ME_CNTL_After", static_cast<uint64_t>(c.meCntlAfter), 32);
+	setProperty("CP,Stage5", c.stage);
+	N48LOG("psp-stage5: %s", c.stage);
 }
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware
