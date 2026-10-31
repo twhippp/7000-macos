@@ -1,0 +1,300 @@
+From 5c8681d310c6ba36f6a9e7d22e9a03cfd38a251b Mon Sep 17 00:00:00 2001
+From: Navi48-MacOS contributors <noreply@example.invalid>
+Date: Sat, 31 Oct 2026 10:51:58 -0700
+Subject: [PATCH 6/6] radv: Darwin: pick the canned device from the kext's GC
+ version (Navi 33 / gfx1102)
+
+The Darwin backend always answered device-info queries from the canned
+gfx1201 (Navi 48) entry.  The kext reports its GC version in QueryInfo, so
+the handshake now picks the drm-shim entry from it: 12.0.1 -> "gfx1201",
+11.0.2 -> "navi33" (RX 7600, device 0x7480, the entry Mesa already ships).
+GB_ADDR_CONFIG is checked against the chosen entry's own recorded value
+instead of the gfx1201 constant.  RADV_DARWIN_CANNED=<name> overrides the
+choice (and picks the entry for the RADV_DARWIN_HOST_BO stand-in, default
+gfx1201).  RADV_DARWIN_MOCK_N33=1 makes the mock answer as the RX 7600 kext
+(GC 11.0.2, GB_ADDR_CONFIG 0x343).  The PRT half-VA reservation stays: Linux
+uses it for gfx11 too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/common/darwin/ac_darwin_drm.c  | 99 +++++++++++++++++++++-----
+ src/amd/common/darwin/ac_darwin_drm.h  |  6 +-
+ src/amd/common/darwin/ac_darwin_kext.h |  1 +
+ src/amd/common/darwin/ac_darwin_mock.c | 20 +++++-
+ 4 files changed, 102 insertions(+), 24 deletions(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index ea10051..b0d261a 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -60,6 +60,7 @@ struct acd_core {
+    int refcount;
+    uint32_t minor; /* ABI minor the kernel reported */
+    bool shared; /* the process-wide core (false: the private HOST_BO stand-in core) */
++   const struct amdgpu_device *canned; /* the canned device chosen at the handshake */
+    struct acd_kext *kext; /* NULL in the HOST_BO stand-in */
+    struct amdgpu_va_manager *va_mgr;
+    struct util_sync_provider *sync; /* master; every device holds a clone */
+@@ -113,9 +114,45 @@ env_is_1(const char *name)
+    return v && v[0] == '1';
+ }
+ 
++/* The canned drm-shim entry for the GC version the kernel reports ((maj << 16) | (min << 8) | rev).
++ * RADV_DARWIN_CANNED=<name> overrides it (any name in amdgpu_devices.c). */
++static const struct amdgpu_device *
++canned_for_gc(uint32_t gc_version)
++{
++   const char *name = getenv("RADV_DARWIN_CANNED");
++   if (!name || !name[0]) {
++      switch (gc_version) {
++      case (12u << 16) | (0u << 8) | 1u: name = "gfx1201"; break; /* Navi 48, RX 9070 XT */
++      case (11u << 16) | (0u << 8) | 2u: name = "navi33"; break;  /* Navi 33, RX 7600 (gfx1102) */
++      default:
++         fprintf(stderr, "radv-darwin: no canned device for GC %u.%u.%u (set RADV_DARWIN_CANNED=<name>)\n",
++                 gc_version >> 16, (gc_version >> 8) & 0xff, gc_version & 0xff);
++         return NULL;
++      }
++   }
++   const struct amdgpu_device *d = find_canned(name);
++   if (!d)
++      fprintf(stderr, "radv-darwin: canned device '%s' is not in amdgpu_devices.c\n", name);
++   return d;
++}
++
++/* GB_ADDR_CONFIG as the canned entry recorded it (its mmr_regs triple for that register). */
++static bool
++canned_gb_addr_config(const struct amdgpu_device *d, uint32_t *out)
++{
++   for (uint32_t j = 0; j < d->mmr_reg_count; j++) {
++      const uint32_t *t = &d->mmr_regs[j * 3];
++      if (t[0] == ACD_GB_ADDR_CONFIG_REG && t[1] == 0xffffffffu) {
++         *out = t[2];
++         return true;
++      }
++   }
++   return false;
++}
++
+ /* Hello, live checks and the info snapshot; every failure is one clear stderr line. */
+ static int
+-acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned, uint32_t *minor_out)
++acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device **canned_out, uint32_t *minor_out)
+ {
+    struct acd_hello h;
+    int r = acd_kext_hello(kext, &h);
+@@ -141,6 +178,16 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+       return r;
+    }
+ 
++   /* Which GPU: the canned table entry follows the kernel's GC version. */
++   const struct amdgpu_device *canned = canned_for_gc(info.gc_version);
++   if (!canned)
++      return -ENODEV;
++   uint32_t want_gb = 0;
++   if (!canned_gb_addr_config(canned, &want_gb)) {
++      fprintf(stderr, "radv-darwin: canned '%s' has no GB_ADDR_CONFIG\n", canned->name);
++      return -ENODEV;
++   }
++
+    /* GB_ADDR_CONFIG: the tiling layout the canned info and S1d's image assume. */
+    uint32_t gb = 0;
+    r = acd_kext_read_regs(kext, ACD_GB_ADDR_CONFIG_REG, 1, &gb);
+@@ -148,10 +195,10 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+       fprintf(stderr, "radv-darwin: ReadRegs(GB_ADDR_CONFIG) failed: %d\n", r);
+       return r;
+    }
+-   if (gb != ACD_GB_ADDR_CONFIG_GFX1201 && !env_is_1("RADV_DARWIN_ALLOW_ADDRCFG")) {
+-      fprintf(stderr, "radv-darwin: live GB_ADDR_CONFIG 0x%08x != canned gfx1201 0x%08x (set "
++   if (gb != want_gb && !env_is_1("RADV_DARWIN_ALLOW_ADDRCFG")) {
++      fprintf(stderr, "radv-darwin: live GB_ADDR_CONFIG 0x%08x != canned %s 0x%08x (set "
+                       "RADV_DARWIN_ALLOW_ADDRCFG=1 to override)\n",
+-              gb, ACD_GB_ADDR_CONFIG_GFX1201);
++              gb, canned->name, want_gb);
+       return -ENODEV;
+    }
+ 
+@@ -172,11 +219,13 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+    static bool logged;
+    if (!logged) {
+       logged = true;
+-      fprintf(stderr, "radv-darwin: native kext: ABI %u.%u, build %u, VMID %u, max %u IBs/submit, GB_ADDR_CONFIG "
+-                      "0x%08x, VRAM %llu MiB visible + %llu MiB hi, GTT cap %llu MiB\n",
+-              h.abi, h.minor, h.build, h.vmid, h.max_ibs, gb, (unsigned long long)(info.vram_vis_total >> 20),
++      fprintf(stderr, "radv-darwin: native kext: ABI %u.%u, build %u, GC %u.%u.%u -> canned %s, VMID %u, max %u "
++                      "IBs/submit, GB_ADDR_CONFIG 0x%08x, VRAM %llu MiB visible + %llu MiB hi, GTT cap %llu MiB\n",
++              h.abi, h.minor, h.build, info.gc_version >> 16, (info.gc_version >> 8) & 0xff, info.gc_version & 0xff,
++              canned->name, h.vmid, h.max_ibs, gb, (unsigned long long)(info.vram_vis_total >> 20),
+               (unsigned long long)(info.vram_hi_total >> 20), (unsigned long long)(info.gtt_cap >> 20));
+    }
++   *canned_out = canned;
+    return 0;
+ }
+ 
+@@ -188,10 +237,13 @@ acd_device_kext(acd_device_handle dev, uint32_t *abi_minor)
+    return dev->core->kext;
+ }
+ 
+-/* Builds the core: connection (unless the HOST_BO stand-in), handshake, VA manager, master provider. */
++/* Builds the core: connection (unless the HOST_BO stand-in), handshake, VA manager, master provider.
++ * With the kext the handshake picks the canned device from the live GC version; the HOST_BO
++ * stand-in has no kernel to ask and takes RADV_DARWIN_CANNED, else gfx1201. */
+ static int
+-acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_core **out)
++acd_core_create(bool host_bo, struct acd_core **out)
+ {
++   const struct amdgpu_device *canned = NULL;
+    struct acd_core *c = calloc(1, sizeof(*c));
+    if (!c)
+       return -ENOMEM;
+@@ -201,7 +253,7 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+    if (!host_bo) {
+       int r = acd_kext_open(&c->kext);
+       if (r == 0)
+-         r = acd_native_handshake(c->kext, canned, &c->minor);
++         r = acd_native_handshake(c->kext, &canned, &c->minor);
+       if (r) {
+          acd_kext_destroy(c->kext);
+          pthread_mutex_destroy(&c->bo_lock);
+@@ -210,6 +262,20 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+       }
+    }
+ 
++   if (host_bo) {
++      const char *name = getenv("RADV_DARWIN_CANNED");
++      if (!name || !name[0])
++         name = "gfx1201";
++      canned = find_canned(name);
++      if (!canned) {
++         fprintf(stderr, "radv-darwin: canned device '%s' is not in amdgpu_devices.c\n", name);
++         pthread_mutex_destroy(&c->bo_lock);
++         free(c);
++         return -ENODEV;
++      }
++   }
++   c->canned = canned;
++
+    const struct acd_sync_backend be = {.wait_seq = acd_backend_wait_seq, .ctx = c->kext};
+    c->sync = acd_sync_provider_create(c->kext ? &be : NULL);
+    c->va_mgr = amdgpu_va_manager_alloc();
+@@ -224,7 +290,7 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+    }
+ 
+    const struct drm_amdgpu_info_device *di = &canned->dev;
+-   /* gfx12: RADV needs half of the VA range reserved for PRT, as on Linux. */
++   /* gfx11 and gfx12: RADV needs half of the VA range reserved for PRT, as on Linux (amdgpu_device_initialize). */
+    amdgpu_va_manager_init2(c->va_mgr, di->virtual_address_offset, di->virtual_address_max, di->high_va_offset,
+                            di->high_va_max, di->virtual_address_alignment, AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT);
+    *out = c;
+@@ -252,25 +318,19 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+    if (!dev)
+       return -ENOMEM;
+ 
+-   dev->canned = find_canned("gfx1201");
+-   if (!dev->canned) {
+-      free(dev);
+-      return -ENODEV;
+-   }
+-
+    const bool mock = env_is_1("RADV_DARWIN_MOCK");
+    dev->host_bo = env_is_1("RADV_DARWIN_HOST_BO") && !mock;
+ 
+    int r = 0;
+    if (dev->host_bo) {
+-      r = acd_core_create(dev->canned, true, &dev->core); /* private, no kext */
++      r = acd_core_create(true, &dev->core); /* private, no kext */
+    } else {
+       pthread_mutex_lock(&g_core_lock);
+       if (g_core) {
+          g_core->refcount++;
+          dev->core = g_core;
+       } else {
+-         r = acd_core_create(dev->canned, false, &g_core);
++         r = acd_core_create(false, &g_core);
+          if (r == 0) {
+             g_core->shared = true;
+             dev->core = g_core;
+@@ -282,6 +342,7 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+       free(dev);
+       return r;
+    }
++   dev->canned = dev->core->canned;
+ 
+    dev->sync = dev->core->sync->clone(dev->core->sync);
+    if (!dev->sync) {
+diff --git a/src/amd/common/darwin/ac_darwin_drm.h b/src/amd/common/darwin/ac_darwin_drm.h
+index 0d92684..4066a7a 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.h
++++ b/src/amd/common/darwin/ac_darwin_drm.h
+@@ -4,8 +4,10 @@
+  * Darwin backend of the ac_drm_* layer (ac_linux_drm.c), for RADV on macOS.
+  *
+  * There is no DRM node and no libdrm on macOS.  Device-info queries are answered
+- * from the canned gfx1201 table (amd/common/amdgpu_devices.c, the table the Linux
+- * drm-shim serves) except memory sizes; the VA manager and syncobjs live in
++ * from a canned table entry (amd/common/amdgpu_devices.c, the table the Linux
++ * drm-shim serves) except memory sizes.  The entry follows the GC version the kext
++ * reports: 12.0.1 -> "gfx1201" (Navi 48), 11.0.2 -> "navi33" (RX 7600, gfx1102);
++ * RADV_DARWIN_CANNED=<name> overrides it; the VA manager and syncobjs live in
+  * userspace; BOs, VA mappings, contexts, submits and waits are marshalled to the
+  * kext's native client (ac_darwin_kext.c, contract NATIVE-S1C-ABI.md).
+  *
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index b65ea41..12f220b 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -64,6 +64,7 @@ enum acd_sel {
+ 
+ #define ACD_TIMEOUT_INFINITE    0xffffffffffffffffull /* == AMDGPU_TIMEOUT_INFINITE */
+ #define ACD_GB_ADDR_CONFIG_GFX1201 0x08200545u
++#define ACD_GB_ADDR_CONFIG_NAVI33  0x00000343u /* RX 7600, as amdgpu_devices.c "navi33" */
+ #define ACD_GB_ADDR_CONFIG_REG     0x263eu
+ 
+ struct acd_kext_ops {
+diff --git a/src/amd/common/darwin/ac_darwin_mock.c b/src/amd/common/darwin/ac_darwin_mock.c
+index b7588d5..bfd2f00 100644
+--- a/src/amd/common/darwin/ac_darwin_mock.c
++++ b/src/amd/common/darwin/ac_darwin_mock.c
+@@ -95,6 +95,20 @@ retired_locked(struct mock *m)
+    return m->retired_at_submit;
+ }
+ 
++
++/* RADV_DARWIN_MOCK_N33=1: the mock answers as the RX 7600 kext does (GC 11.0.2, its GB_ADDR_CONFIG). */
++static bool
++mock_n33(void)
++{
++   const char *v = getenv("RADV_DARWIN_MOCK_N33");
++   return v && v[0] == '1';
++}
++
++static uint32_t
++mock_gb_addr_config(void)
++{
++   return mock_n33() ? ACD_GB_ADDR_CONFIG_NAVI33 : ACD_GB_ADDR_CONFIG_GFX1201;
++}
+ static bool
+ mock_trace(void)
+ {
+@@ -611,8 +625,8 @@ mock_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const voi
+       inf.reserved[2] = N48N_ABI_MINOR;
+       inf.flags = N48N_INFO_S1B_POSITIVE | N48N_INFO_NATIVE_BOOT;
+       inf.vmid = 8;
+-      inf.gb_addr_config = ACD_GB_ADDR_CONFIG_GFX1201;
+-      inf.gc_version = (12u << 16) | (0u << 8) | 1u;
++      inf.gb_addr_config = mock_gb_addr_config();
++      inf.gc_version = mock_n33() ? (11u << 16) | (0u << 8) | 2u : (12u << 16) | (0u << 8) | 1u;
+       inf.ring_size_dw = 4096;
+       inf.max_ibs = N48N_MAX_IBS;
+       inf.vram_vis_total = MOCK_VIS_TOTAL;
+@@ -640,7 +654,7 @@ mock_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const voi
+       NEED(sin[1] >= 1 && sin[1] <= 16 && sin[2] == 0xFFFFFFFFull && shape(3, 0, 0, sin[1] * 4));
+       uint32_t v[16] = {0};
+       for (uint64_t i = 0; i < sin[1]; i++)
+-         v[i] = (sin[0] + i == ACD_GB_ADDR_CONFIG_REG) ? ACD_GB_ADDR_CONFIG_GFX1201 : 0;
++         v[i] = (sin[0] + i == ACD_GB_ADDR_CONFIG_REG) ? mock_gb_addr_config() : 0;
+       memcpy(stout, v, sin[1] * 4);
+       *stoutsz = sin[1] * 4;
+       break;
+-- 
+2.43.0
+

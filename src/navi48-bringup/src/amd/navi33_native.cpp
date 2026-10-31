@@ -34,7 +34,10 @@ constexpr uint64_t kV = 1ull << 0, kSys = 1ull << 1, kSnoop = 1ull << 2, kX = 1u
 constexpr uint64_t kMtUC = 3ull << 48, kAddr = 0x0000FFFFFFFFF000ull;
 // GCVM_CONTEXT8 (gc_11_0_0_offset.h, BASE_IDX 0)
 constexpr uint32_t kCtxBaseLo = 0x16f3 + 2 * kVmid, kCtxBaseHi = 0x16f4 + 2 * kVmid;
-constexpr uint32_t kGbAddrConfig = 0x263e;          // BASE_IDX 0
+// regGB_ADDR_CONFIG (gc_11_0_0_offset.h): 0x13de, BASE_IDX 0. navi33_gc_reg adds GC seg 0 (0x1260),
+// giving the absolute 0x263e that Mesa reads (READ_MMR_REG dword_offset). Not 0x263e here: that
+// would be added to the base a second time.
+constexpr uint32_t kGbAddrConfig = 0x13de;
 
 struct Bo { uint8_t used; uint32_t blk, nblk; uint64_t off, size; };
 
