@@ -62,9 +62,29 @@ patch_tree() {
 	git -C "$MESA_DIR" log --oneline "$MESA_SHA"..HEAD
 }
 
+# RADV's BVH shaders need glslangValidator at build time. Without Homebrew there is none on macOS,
+# so build it once from source (cmake from pip, no SPIRV-Tools) into $TOOLS.
+TOOLS="$HOME/navi48-native/tools"
+GLSLANG_TAG=16.4.0
+ensure_glslang() {
+	PATH="$TOOLS/bin:$PATH"; export PATH
+	if command -v glslangValidator >/dev/null; then return; fi
+	say "building glslang $GLSLANG_TAG into $TOOLS (one time)"
+	command -v cmake >/dev/null || python3 -m pip install --user -q cmake || die "pip install cmake failed"
+	local src="$TOOLS/src/glslang"
+	[ -d "$src/.git" ] || git clone -q --depth 1 -b "$GLSLANG_TAG" https://github.com/KhronosGroup/glslang.git "$src"
+	cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$TOOLS" \
+		-DENABLE_OPT=OFF -DBUILD_EXTERNAL=OFF -DGLSLANG_TESTS=OFF -DBUILD_SHARED_LIBS=OFF >/dev/null
+	cmake --build "$src/build" --target install -j "$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" >/dev/null ||
+		die "glslang build failed (cmake --build $src/build)"
+	command -v glslangValidator >/dev/null || die "glslangValidator still missing after the build"
+	glslangValidator --version | head -1
+}
+
 configure() {
 	local cross=()
 	if [ "$(uname -m)" != x86_64 ]; then cross=(--cross-file "$MESA_DIR/cross-x86_64.ini"); fi
+	ensure_glslang
 	if [ -f "$MESA_DIR/$BUILD/build.ninja" ]; then return; fi
 	local note=""; [ ${#cross[@]} -eq 0 ] || note=", cross to x86_64"
 	say "configuring ($(uname -m) host$note)"
