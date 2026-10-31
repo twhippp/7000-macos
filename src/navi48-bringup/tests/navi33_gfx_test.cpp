@@ -131,6 +131,35 @@ struct Rig {
 	}
 
 	// The gfx queue programmed through its HQD registers (doorbell 0x116).
+	// GCVM_CONTEXTn walk (4 levels, 9 bits each): -1 on any invalid entry.
+	int64_t vmTranslate(uint32_t vmid, uint64_t va) {
+		if (!(r(kGc0, 0x1688 + vmid) & 1u) || ((r(kGc0, 0x1688 + vmid) >> 1) & 3u) != 3u) return -1;
+		uint64_t e = ((uint64_t)r(kGc0, 0x16f4 + 2 * vmid) << 32) | r(kGc0, 0x16f3 + 2 * vmid);
+		if (!(e & 1)) return -1;
+		for (int lvl = 3; lvl >= 0; lvl--) {
+			const uint64_t tbl = (e & 0x0000FFFFFFFFF000ull) - kFbOffset;
+			std::memcpy(&e, &vram[tbl + ((va >> (12 + 9 * lvl)) & 511) * 8], 8);
+			if (!(e & 1)) return -1;
+		}
+		return (int64_t)((e & 0x0000FFFFFFFFF000ull) - kFbOffset + (va & 0xFFF));
+	}
+	uint32_t vmIbRan = 0;
+	void runGfxIb(uint64_t va, uint32_t ctl) {
+		const uint32_t vmid = (ctl >> 24) & 0xF, ndw = ctl & 0xFFFFF;
+		if (vmid == 0) return;
+		const int64_t ib = vmTranslate(vmid, va);
+		if (ib < 0) return;
+		for (uint32_t i = 0; i < ndw;) {
+			uint32_t q[5]; std::memcpy(q, &vram[ib + i * 4], 20);
+			const uint32_t op = (q[0] >> 8) & 0xFF, n = (q[0] >> 16) & 0x3FFF;
+			if (op == 0x37 && ((q[1] >> 8) & 0xF) == 5) {
+				const int64_t d = vmTranslate(vmid, ((uint64_t)q[3] << 32) | q[2]);
+				if (d >= 0) std::memcpy(&vram[d], &q[4], 4);
+			}
+			i += n + 2;
+		}
+		vmIbRan++;
+	}
 	std::vector<uint32_t> gfxPreamble; uint32_t gfxCtxRegs = 0, gfxClearState = 0;
 	void runKiq() {
 		if (!(r(kGc0, 0x1e80) & 1u)) return;
@@ -145,6 +174,7 @@ struct Rig {
 			if (op == 0x69) gfxCtxRegs += n;
 			if (op == 0x12) gfxClearState++;
 			if (op == 0x79 && gfxPreamble.size() != 1) regs[0xC000 + at(gfxDone + 1)] = at(gfxDone + 2);
+			if (op == 0x3F) runGfxIb(((uint64_t)at(gfxDone + 2) << 32) | at(gfxDone + 1), at(gfxDone + 3));
 			gfxDone += n + 2;
 		}
 		r(kGc0, 0x1e88) = (uint32_t)gfxDone;
@@ -346,6 +376,11 @@ int main() {
 		      k.gfxCtxRegs == 934 + 1 && k.gfxClearState == 1, "  ...begin, 935 context regs, end, CLEAR_STATE");
 		check(st.gfxWptrBefore == 256 && st.gfxWptrAfter == 1280 && st.gfxRptr == 1280, "  ...gfx wptr 256 -> 1280, rptr caught up");
 		check(k.r(kGc0, 0xda0) & 0xFFu, "  ...GRBM read timeout set");
+		N33VmReport vm {};
+		check(navi33_vm_test(k.dev, vm) == kIOReturnSuccess && std::strcmp(vm.stage, "vm-ok") == 0,
+		      "stage 12: an IB at a VMID-8 address writes through VMID-8 addresses");
+		check(k.vmIbRan == 1 && vm.tlbFlushOk && ((vm.ctxCntl >> 1) & 3u) == 3u, "  ...ran once, VMID-8 TLB flushed, 4-level table");
+		check(vm.rootPa == k.dev.vramBase + kN33GfxVramOffset + 0x14000, "  ...root page table in the slot");
 		N33GfxQReport none {};
 		DeviceContext d2 = k.dev; d2.bar2 = nullptr;
 		check(navi33_gfx_queue_test(d2, none) == kIOReturnNotReady, "  ...no BAR2 -> refuses");

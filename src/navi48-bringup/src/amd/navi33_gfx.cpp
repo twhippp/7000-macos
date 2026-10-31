@@ -1627,4 +1627,156 @@ kern_return_t navi33_gfx_state_init(DeviceContext &dev, N33StateReport &rep, uin
 	return rep.passed ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
+// ============================================================================
+// Stage 12 — VMID 8: a per-app GPU address space
+// ============================================================================
+namespace {
+namespace V {   // gc_11_0_0_offset.h, BASE_IDX 0: CONTEXTn registers are CONTEXT0 + n (CNTL) / + 2n (64-bit pairs)
+	constexpr uint32_t kVmid = 8;
+	constexpr uint32_t CNTL     = 0x1688 + kVmid;              // GCVM_CONTEXT8_CNTL
+	constexpr uint32_t BASE_LO  = 0x16f3 + 2 * kVmid, BASE_HI  = 0x16f4 + 2 * kVmid;
+	constexpr uint32_t START_LO = 0x1713 + 2 * kVmid, START_HI = 0x1714 + 2 * kVmid;
+	constexpr uint32_t END_LO   = 0x1733 + 2 * kVmid, END_HI   = 0x1734 + 2 * kVmid;
+}
+// GCVM_CONTEXT1_CNTL fields (gc_11_0_0_sh_mask.h)
+constexpr uint32_t kCtxEnable = 1u << 0, kCtxDepthShift = 1, kCtxBlockShift = 3;
+constexpr uint32_t kCtxFaultDefaults = (1u << 9) | (1u << 11) | (1u << 13) | (1u << 15) | (1u << 17) | (1u << 19) | (1u << 21);
+// amdgpu_vm.h PTE bits (gfx10/11 layout)
+constexpr uint64_t kPteValid = 1ull << 0, kPteExec = 1ull << 4, kPteRead = 1ull << 5, kPteWrite = 1ull << 6;
+constexpr uint64_t kPteMtypeUC = 3ull << 48;                  // AMDGPU_PTE_MTYPE_NV10(MTYPE_UC)
+constexpr uint64_t kMaxPfn = 1ull << 36;                      // 48-bit VA, 4 KiB pages
+
+// layout inside the slot
+constexpr uint64_t kPdb2Off = 0x14000, kPdb1Off = 0x15000, kPdb0Off = 0x16000, kPtbOff = 0x17000;
+constexpr uint64_t kVmIbOff = 0x18000, kVmDataAOff = 0x19000, kVmDataBOff = 0x1A000;
+static_assert(kVmDataBOff + 0x1000 <= kN33GfxVramSize, "stage 12 stays inside the slot");
+// the VMID-8 virtual addresses (the same PTB: index 0, 1, 2 of the table for VA 0x1_0000_0000)
+constexpr uint64_t kVaIb = 0x100000000ull, kVaA = kVaIb + 0x1000, kVaB = kVaIb + 0x2000;
+constexpr uint32_t kValA = 0x5612A001u, kValB = 0x5612B002u, kMarker12 = 0x56120C0Du;
+} // namespace
+
+kern_return_t navi33_vm_test(DeviceContext &dev, N33VmReport &rep, uint32_t timeoutUs) {
+	rep = N33VmReport{};
+	rep.stage = "vm";
+	if (!gfxDoorbellReady(dev) || gGfxWptrDw == 0 || gCpWptrDw == 0) { rep.stage = "no-queues"; return kIOReturnNotReady; }
+	const uint64_t base = slot(dev);
+	auto g0 = [&](uint32_t r) { return gc0(dev, r); };
+	auto g1 = [&](uint32_t r) { return gc1(dev, r); };
+	const uint64_t fbOffset = (uint64_t)RREG32(dev, g0(R::GCMC_VM_FB_OFFSET)) << 24;
+	auto pa = [&](uint64_t off) { return fbOffset + base + off; };   // amdgpu_gmc_vram_mc2pa
+
+	// ---- 1. the tables ----
+	bar0_memset_vram(dev, base + kPdb2Off, 0u, kVmDataBOff + 0x1000 - kPdb2Off);
+	WBAR0_64(dev, base + kPdb2Off + ((kVaIb >> 39) & 511) * 8, pa(kPdb1Off) | kPteValid);
+	WBAR0_64(dev, base + kPdb1Off + ((kVaIb >> 30) & 511) * 8, pa(kPdb0Off) | kPteValid);
+	WBAR0_64(dev, base + kPdb0Off + ((kVaIb >> 21) & 511) * 8, pa(kPtbOff)  | kPteValid);
+	const uint64_t leaf = kPteValid | kPteRead | kPteWrite | kPteExec | kPteMtypeUC;
+	WBAR0_64(dev, base + kPtbOff + ((kVaIb >> 12) & 511) * 8, pa(kVmIbOff) | leaf);
+	WBAR0_64(dev, base + kPtbOff + ((kVaA  >> 12) & 511) * 8, pa(kVmDataAOff) | leaf);
+	WBAR0_64(dev, base + kPtbOff + ((kVaB  >> 12) & 511) * 8, pa(kVmDataBOff) | leaf);
+	WBAR0_32(dev, base + kVmDataAOff, 0xDEADBEEFu);
+	WBAR0_32(dev, base + kVmDataBOff, 0xDEADBEEFu);
+
+	// The IB: two WRITE_DATAs through VMID-8 addresses. It exists in VRAM, but the GPU only
+	// reaches it through VA 0x1_0000_0000.
+	uint32_t ib[16] = {};
+	uint32_t ni = 0;
+	ib[ni++] = pkt3(kPKT3_WRITE_DATA, 3); ib[ni++] = kWRITE_DATA_DST_SEL_MEM | kWR_CONFIRM;
+	ib[ni++] = (uint32_t)kVaA; ib[ni++] = (uint32_t)(kVaA >> 32); ib[ni++] = kValA;
+	ib[ni++] = pkt3(kPKT3_WRITE_DATA, 3); ib[ni++] = kWRITE_DATA_DST_SEL_MEM | kWR_CONFIRM;
+	ib[ni++] = (uint32_t)kVaB; ib[ni++] = (uint32_t)(kVaB >> 32); ib[ni++] = kValB;
+	bar0_memcpy_to_vram(dev, base + kVmIbOff, ib, ni * 4);
+	amdgpu_hdp_flush(dev);
+
+	// ---- 2. GCVM_CONTEXT8 (gfxhub_v3_0_setup_vmid_config + the PD base gmc_v11 emits per job) ----
+	rep.rootPa = pa(kPdb2Off);
+	const uint64_t pd = rep.rootPa | kPteValid;
+	WREG32(dev, g0(V::BASE_LO), (uint32_t)pd);
+	WREG32(dev, g0(V::BASE_HI), (uint32_t)(pd >> 32));
+	WREG32(dev, g0(V::START_LO), 0);
+	WREG32(dev, g0(V::START_HI), 0);
+	WREG32(dev, g0(V::END_LO), (uint32_t)(kMaxPfn - 1));
+	WREG32(dev, g0(V::END_HI), (uint32_t)((kMaxPfn - 1) >> 32));
+	WREG32(dev, g0(V::CNTL), kCtxEnable | (3u << kCtxDepthShift) | (0u << kCtxBlockShift) | kCtxFaultDefaults);
+	rep.ctxCntl = RREG32(dev, g0(V::CNTL));
+
+	// ---- 3. flush VMID 8's TLB through the compute queue (MMIO flushes are never acked here) ----
+	{
+		const uint32_t s1 = g1(G::SCRATCH_REG1);
+		WREG32(dev, s1, 0);
+		uint32_t req = 0;
+		req = setf(req, INV_PER_VMID_INVALIDATE_REQ, 1u << V::kVmid);
+		req = setf(req, INV_FLUSH_TYPE, 0);
+		req = setf(req, INV_INVALIDATE_L2_PTES, 1);
+		req = setf(req, INV_INVALIDATE_L2_PDE0, 1);
+		req = setf(req, INV_INVALIDATE_L2_PDE1, 1);
+		req = setf(req, INV_INVALIDATE_L2_PDE2, 1);
+		req = setf(req, INV_INVALIDATE_L1_PTES, 1);
+		uint32_t fp[kCpPad];
+		for (uint32_t i = 0; i < kCpPad; i++) fp[i] = kGfxNop;
+		uint32_t k = 0;
+		fp[k++] = pkt3(kPKT3_WAIT_REG_MEM, 5);
+		fp[k++] = 3u | (0u << 4) | (1u << 6) | (0u << 8);
+		fp[k++] = g0(R::GCVM_INVALIDATE_ENG17_REQ);
+		fp[k++] = g0(R::GCVM_INVALIDATE_ENG17_ACK);
+		fp[k++] = req;
+		fp[k++] = 1u << V::kVmid;
+		fp[k++] = 0x20;
+		fp[k++] = pkt3(kPKT3_WRITE_DATA, 3);
+		fp[k++] = kWR_CONFIRM;
+		fp[k++] = s1;
+		fp[k++] = 0;
+		fp[k++] = 0x7B1F1008u;
+		const uint32_t wp = gCpWptrDw;
+		for (uint32_t i = 0; i < kCpPad; i++)
+			WBAR0_32(dev, base + kCpRingOff + (uint64_t)((wp + i) % (kCpRingBytes / 4)) * 4, fp[i]);
+		cpCommit(dev, base + kCpWptrOff, wp + kCpPad);
+		for (uint32_t us = 0; us < timeoutUs; us += 10) {
+			if (RREG32(dev, s1) == 0x7B1F1008u) { rep.tlbFlushOk = true; break; }
+			IODelay(10);
+		}
+	}
+
+	// ---- 4. the IB on the gfx queue with vmid 8 (gfx_v11_0_ring_emit_ib_gfx), then a marker ----
+	const uint32_t scratch = g1(C::SCRATCH_REG0);
+	WREG32(dev, scratch, 0);
+	constexpr uint32_t kBlk = 256;
+	uint32_t blk[kBlk];
+	for (uint32_t i = 0; i < kBlk; i++) blk[i] = kGfxNop;
+	uint32_t k = 0;
+	blk[k++] = pkt3(kPKT3_INDIRECT_BUFFER, 2);
+	blk[k++] = (uint32_t)kVaIb & 0xfffffffcu;
+	blk[k++] = (uint32_t)(kVaIb >> 32);
+	blk[k++] = ni | (V::kVmid << 24);
+	blk[k++] = pkt3(kPKT3_SET_UCONFIG_REG, 1);
+	blk[k++] = scratch - kSET_UCONFIG_REG_START;
+	blk[k++] = kMarker12;
+	for (uint32_t i = 0; i < kBlk; i++)
+		WBAR0_32(dev, base + kGfxRingOff + (uint64_t)((gGfxWptrDw + i) % (kGfxRingBytes / 4)) * 4, blk[i]);
+	const uint32_t nw = gGfxWptrDw + kBlk;
+	WBAR0_64(dev, base + kGfxWptrOff, nw);
+	amdgpu_hdp_flush(dev);
+	ring64(dev, kGfxDoorbell, nw);
+	gGfxWptrDw = nw;
+
+	uint32_t us = 0;
+	for (; us < timeoutUs; us += 10) {
+		if (RREG32(dev, scratch) == kMarker12) break;
+		IODelay(10);
+	}
+	rep.waitedUs = us;
+	rep.got0 = RBAR0_32(dev, base + kVmDataAOff);
+	rep.got1 = RBAR0_32(dev, base + kVmDataBOff);
+	grbm_select(dev, 0, 0, 0, 0);
+	rep.gfxRptr = RREG32(dev, g0(G::CP_GFX_HQD_RPTR));
+	rep.passed = rep.got0 == kValA && rep.got1 == kValB;
+	rep.stage = rep.passed ? "vm-ok" :
+	            RREG32(dev, scratch) != kMarker12 ? "vm-timeout" :
+	            (rep.got0 == 0xDEADBEEFu && rep.got1 == 0xDEADBEEFu) ? "vm-writes-lost" : "vm-wrong-data";
+	UCODE_LOG("navi33-gfx: VMID %u — root pa %#llx, CNTL %#x, TLB flush %s, A %#x B %#x after %u us, rptr %u -> %s",
+	          V::kVmid, (unsigned long long)rep.rootPa, rep.ctxCntl, rep.tlbFlushOk ? "ok" : "NOT acked",
+	          rep.got0, rep.got1, us, rep.gfxRptr, rep.stage);
+	return rep.passed ? kIOReturnSuccess : kIOReturnIOError;
+}
+
 } // namespace amdgpu

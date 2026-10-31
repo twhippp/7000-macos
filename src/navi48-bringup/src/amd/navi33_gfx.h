@@ -225,4 +225,23 @@ struct N33StateReport {
 };
 kern_return_t navi33_gfx_state_init(DeviceContext &dev, N33StateReport &rep, uint32_t timeoutUs = 200000);
 
+// ---- stage 12: a per-app GPU address space (VMID 8), the way amdgpu gives each client one ----
+//
+// A 4-level page table (gmc_v11: PDB2 -> PDB1 -> PDB0 -> PTB, 9 bits each, 4 KiB pages) built in
+// VRAM; GCVM_CONTEXT8 pointed at it (gfxhub_v3_0_setup_vmid_config, depth 3, block size 0); the
+// VMID-8 TLB flushed through the compute queue. Then an IB that exists ONLY at a VMID-8 virtual
+// address runs on the gfx queue with vmid 8 and writes two values through VMID-8 addresses that
+// land on different physical pages. Proves translation, both ways, before any app uses it.
+struct N33VmReport {
+	uint64_t rootPa;
+	uint32_t ctxCntl;
+	bool     tlbFlushOk;
+	uint32_t got0, got1;        // what landed on the two physical pages
+	uint32_t waitedUs;
+	uint32_t gfxRptr;
+	bool     passed;
+	const char *stage;
+};
+kern_return_t navi33_vm_test(DeviceContext &dev, N33VmReport &rep, uint32_t timeoutUs = 200000);
+
 } // namespace amdgpu

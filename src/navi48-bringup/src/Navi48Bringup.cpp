@@ -532,7 +532,7 @@ void Navi48Bringup::publishNavi33Summary() {
 	};
 	auto yes = [&](const char *k) { return getProperty(k) == kOSBooleanTrue; };
 
-	char sum[640] = {}, warn[192] = {};
+	char sum[896] = {}, warn[192] = {};
 	size_t n = 0, w = 0;
 	auto add = [&](const char *fmt, auto... a) {
 		if (n < sizeof(sum)) n += (size_t)snprintf(sum + n, sizeof(sum) - n, fmt, a...);
@@ -593,6 +593,11 @@ void Navi48Bringup::publishNavi33Summary() {
 		num("GFXSTATE,Rptr", rp); num("GFXSTATE,WaitedUs", us);
 		add(" | S11 %s (rptr %llu after %llu us)", s11, (unsigned long long)rp, (unsigned long long)us);
 	}
+	if (const char *s12 = str("VM,Stage12")) {
+		uint64_t a = 0, b = 0;
+		num("VM,GotA", a); num("VM,GotB", b);
+		add(" | S12 %s (0x%08x 0x%08x)", s12, (uint32_t)a, (uint32_t)b);
+	}
 	setProperty("N33,Summary", sum);
 
 	// N33,Result: the first stage that did not reach its success state.
@@ -609,6 +614,7 @@ void Navi48Bringup::publishNavi33Summary() {
 		{ "GFXQ,Stage9",   "gfx-queue-ok", nullptr },
 		{ "SHADER,Stage10", "shader-ok", nullptr },
 		{ "GFXSTATE,Stage11", "gfx-state-ok", nullptr },
+		{ "VM,Stage12", "vm-ok", nullptr },
 	};
 	uint64_t cap = 99;
 	num("N33,StopAfter", cap);
@@ -1133,6 +1139,20 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	setProperty("GFXSTATE,WaitedUs", static_cast<uint64_t>(st.waitedUs), 32);
 	setProperty("GFXSTATE,Stage11", st.stage);
 	N48LOG("psp-stage11: %s", st.stage);
+	if (level < 12) return;
+
+	// 16. Stage 12 — a per-app GPU address space: VMID 8 gets its own 4-level page table and
+	//     the gfx queue runs an IB that exists only at a VMID-8 virtual address.
+	amdgpu::N33VmReport vm {};
+	(void)amdgpu::navi33_vm_test(dev, vm);
+	setProperty("VM,RootPa", vm.rootPa, 64);
+	setProperty("VM,Cntl", static_cast<uint64_t>(vm.ctxCntl), 32);
+	setProperty("VM,TlbFlushOk", vm.tlbFlushOk);
+	setProperty("VM,GotA", static_cast<uint64_t>(vm.got0), 32);
+	setProperty("VM,GotB", static_cast<uint64_t>(vm.got1), 32);
+	setProperty("VM,WaitedUs", static_cast<uint64_t>(vm.waitedUs), 32);
+	setProperty("VM,Stage12", vm.stage);
+	N48LOG("psp-stage12: %s", vm.stage);
 }
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware
