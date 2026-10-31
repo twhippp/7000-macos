@@ -532,7 +532,7 @@ void Navi48Bringup::publishNavi33Summary() {
 	};
 	auto yes = [&](const char *k) { return getProperty(k) == kOSBooleanTrue; };
 
-	char sum[512] = {}, warn[192] = {};
+	char sum[640] = {}, warn[192] = {};
 	size_t n = 0, w = 0;
 	auto add = [&](const char *fmt, auto... a) {
 		if (n < sizeof(sum)) n += (size_t)snprintf(sum + n, sizeof(sum) - n, fmt, a...);
@@ -583,6 +583,11 @@ void Navi48Bringup::publishNavi33Summary() {
 		num("GFXQ,Scratch", v); num("GFXQ,WaitedUs", us);
 		add(" | S9 %s (read 0x%08x after %llu us)", s9, (uint32_t)v, (unsigned long long)us);
 	}
+	if (const char *s10 = str("SHADER,Stage10")) {
+		uint64_t w = 0, h = 0, us = 0;
+		num("SHADER,Width", w); num("SHADER,Height", h); num("SHADER,WaitedUs", us);
+		add(" | S10 %s (%llux%llu in %llu us)", s10, (unsigned long long)w, (unsigned long long)h, (unsigned long long)us);
+	}
 	setProperty("N33,Summary", sum);
 
 	// N33,Result: the first stage that did not reach its success state.
@@ -597,6 +602,7 @@ void Navi48Bringup::publishNavi33Summary() {
 		{ "FENCE,Stage7", "fence-copy-ok", nullptr },
 		{ "SCREEN,Stage8", "screen-ok", "off" },
 		{ "GFXQ,Stage9",   "gfx-queue-ok", nullptr },
+		{ "SHADER,Stage10", "shader-ok", nullptr },
 	};
 	uint64_t cap = 99;
 	num("N33,StopAfter", cap);
@@ -1084,6 +1090,27 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	setProperty("GFXQ,MePC", static_cast<uint64_t>(gq.mePc), 32);
 	setProperty("GFXQ,Stage9", gq.stage);
 	N48LOG("psp-stage9: %s", gq.stage);
+	if (level < 10) return;
+
+	// 14. Stage 10 — the GPU runs a shader: a gfx1102 compute shader paints a colour gradient
+	//     (off-screen; navi33-draw-screen=1 paints the live console). Uses the compute queue,
+	//     so it runs whatever stage 9 did.
+	uint32_t drawScreen = 0;
+	PE_parse_boot_argn("navi33-draw-screen", &drawScreen, sizeof(drawScreen));
+	amdgpu::N33ShaderReport sr {};
+	(void)amdgpu::navi33_shader_test(dev, bootFbOff, bootFbLen, bootFbRow, gN48ConsoleW, gN48ConsoleH, drawScreen != 0, sr);
+	setProperty("SHADER,TargetOffset", sr.targetOff, 64);
+	setProperty("SHADER,OnScreen", sr.onScreen);
+	setProperty("SHADER,Width", static_cast<uint64_t>(sr.width), 32);
+	setProperty("SHADER,Height", static_cast<uint64_t>(sr.height), 32);
+	setProperty("SHADER,Fence", static_cast<uint64_t>(sr.fence), 32);
+	setProperty("SHADER,WaitedUs", static_cast<uint64_t>(sr.waitedUs), 32);
+	setProperty("SHADER,Sampled", static_cast<uint64_t>(sr.sampled), 32);
+	setProperty("SHADER,Mismatches", static_cast<uint64_t>(sr.mismatches), 32);
+	setProperty("SHADER,FirstBadIndex", static_cast<uint64_t>(sr.firstBadIndex), 32);
+	setProperty("SHADER,FirstBadValue", static_cast<uint64_t>(sr.firstBadValue), 32);
+	setProperty("SHADER,Stage10", sr.stage);
+	N48LOG("psp-stage10: %s", sr.stage);
 }
 
 // 0.0.201 — the MM_INDEX/MM_DATA window is three register accesses with no hardware

@@ -524,8 +524,13 @@ namespace D {   // gc_11_0_0_offset.h (BASE_IDX 0) / nbio_4_3_0_offset.h
 
 bool gfxDoorbellReady(const DeviceContext &d) { return d.bar2 && d.bar2Size >= (kGfxDoorbell + 2) * 4ull; }
 
+// Where the compute queue's wptr stands (dwords, absolute): every commit records it so a later
+// stage can append wherever the previous ones stopped.
+uint32_t gCpWptrDw = 0;
+
 // gfx_v11_0_ring_set_wptr_compute: wptr into the poll slot, then the 64-bit doorbell.
 void cpCommit(DeviceContext &dev, uint64_t wptrPollVramOff, uint32_t wptrDw) {
+	gCpWptrDw = wptrDw;
 	WBAR0_64(dev, wptrPollVramOff, wptrDw);
 	amdgpu_hdp_flush(dev);
 	if (gfxDoorbellReady(dev)) {
@@ -1353,6 +1358,144 @@ kern_return_t navi33_gfx_queue_test(DeviceContext &dev, N33GfxQReport &rep, uint
 	          rep.tlbFlushOk ? "ok" : "FAILED", rep.tlbFlushUs, rep.tlbAckAfter, rep.gfxHqdActive, rep.gfxRptr,
 	          rep.scratch, us, rep.stage);
 	return rep.passed ? kIOReturnSuccess : kIOReturnTimeout;
+}
+
+// ============================================================================
+// Stage 10 — a shader
+// ============================================================================
+namespace {
+// shaders/navi33_gradient.s, gfx1102, + s_code_end padding for instruction prefetch
+constexpr uint32_t kGradientShader[] = {
+	0x360200FFu, 0x000003FFu, 0x84068504u, 0x4A020206u, 0x96070205u, 0x4A040207u,
+	0x30040482u, 0x7E0A0201u, 0xD7006A03u, 0x00020400u, 0x40080A80u, 0x4A120203u,
+	0x360C12FFu, 0x000000FFu, 0x300C0C90u, 0x7E0E0205u, 0x360E0EFFu, 0x000000FFu,
+	0x300E0E88u, 0x380C0F06u, 0x4A101205u, 0x361010FFu, 0x000000FFu, 0x380C1106u,
+	0x380C0CFFu, 0xFF000000u, 0xDC6A0000u, 0x007C0603u, 0xBFB00000u, 0xBF9F0000u,
+	0xBF9F0000u, 0xBF9F0000u, 0xBF9F0000u, 0xBF9F0000u, 0xBF9F0000u, 0xBF9F0000u,
+	0xBF9F0000u, 0xBF9F0000u, 0xBF9F0000u, 0xBF9F0000u, 0xBF9F0000u, 0xBF9F0000u,
+	0xBF9F0000u, 0xBF9F0000u, 0xBF9F0000u
+
+};
+constexpr uint64_t kShaderOff      = 0xE000;   // 256-byte aligned (COMPUTE_PGM_LO is addr >> 8)
+constexpr uint64_t kShaderFenceOff = 0xE800;
+static_assert(kShaderOff + sizeof(kGradientShader) <= kShaderFenceOff, "shader fits");
+constexpr uint32_t kPKT3_SET_SH_REG = 0x76, kSET_SH_REG_START = 0x2c00, kPKT3_DISPATCH_DIRECT = 0x15;
+namespace S {   // gc_11_0_0_offset.h, BASE_IDX 0 unless noted
+	constexpr uint32_t COMPUTE_DISPATCH_INITIATOR = 0x1ba0, COMPUTE_START_X = 0x1ba4, COMPUTE_NUM_THREAD_X = 0x1ba7;
+	constexpr uint32_t COMPUTE_PGM_LO = 0x1bac, COMPUTE_PGM_RSRC1 = 0x1bb2, COMPUTE_RESOURCE_LIMITS = 0x1bb5;
+	constexpr uint32_t COMPUTE_STATIC_THREAD_MGMT_SE0 = 0x1bb6;   // SE1 0x1bb7, TMPRING_SIZE 0x1bb8 follow
+	constexpr uint32_t COMPUTE_STATIC_THREAD_MGMT_SE2 = 0x1bb9, COMPUTE_PGM_RSRC3 = 0x1bc8, COMPUTE_USER_DATA_0 = 0x1be0;
+	constexpr uint32_t SH_MEM_BASES = 0x09e3, SH_MEM_CONFIG = 0x09e4;   // BASE_IDX 1
+}
+// DEFAULT_SH_MEM_CONFIG: ADDRESS_MODE_64 (0), ALIGNMENT_MODE_UNALIGNED (3) << 2, INITIAL_INST_PREFETCH 3 << 14
+constexpr uint32_t kDefaultShMemConfig = (0u << 0) | (3u << 2) | (3u << 14);
+constexpr uint32_t kRsrc1 = (1u << 0) /*VGPRS: (9-1)/8, wave32*/ | (0xC0u << 12) /*FLOAT_MODE*/ | (1u << 30) /*MEM_ORDERED*/;
+constexpr uint32_t kRsrc2 = (4u << 1) /*USER_SGPR*/ | (1u << 7) /*TGID_X_EN*/ | (1u << 8) /*TGID_Y_EN*/;
+constexpr uint32_t kInitiator = (1u << 0) /*COMPUTE_SHADER_EN*/ | (1u << 2) /*FORCE_START_AT_000*/ | (1u << 15) /*CS_W32_EN*/;
+constexpr uint32_t kShaderSeed = 0x40;
+
+inline uint32_t gradientPixel(uint32_t x, uint32_t y) {
+	const uint32_t xs = x + kShaderSeed;
+	return 0xFF000000u | ((xs & 0xFF) << 16) | ((y & 0xFF) << 8) | ((y + xs) & 0xFF);
+}
+} // namespace
+
+kern_return_t navi33_shader_test(DeviceContext &dev, uint64_t fbOff, uint64_t fbLen, uint64_t fbRowBytes,
+                                 uint32_t fbWidth, uint32_t fbHeight, bool toScreen, N33ShaderReport &rep,
+                                 uint32_t timeoutUs) {
+	rep = N33ShaderReport{};
+	rep.stage = "shader";
+	const uint64_t base = slot(dev);
+	auto g0 = [&](uint32_t r) { return gc0(dev, r); };
+	auto g1 = [&](uint32_t r) { return gc1(dev, r); };
+
+	// Geometry: the console's, else 1920x1080. Width must be a multiple of 32 (one wave each).
+	const bool haveFb = fbOff != ~0ull && fbRowBytes >= 4 && fbWidth && fbHeight && fbOff + fbLen <= dev.vramLimit;
+	rep.width  = haveFb ? fbWidth : 1920;
+	rep.height = haveFb ? fbHeight : 1080;
+	rep.pitch  = haveFb ? (uint32_t)(fbRowBytes / 4) : rep.width;
+	rep.width &= ~31u;
+	if (rep.width == 0 || rep.pitch < rep.width) { rep.stage = "bad-geometry"; return kIOReturnBadArgument; }
+	const uint64_t bytes = (uint64_t)rep.pitch * rep.height * 4;
+	rep.onScreen = toScreen && haveFb;
+	if (rep.onScreen) {
+		rep.targetOff = fbOff;
+	} else {
+		rep.targetOff = (dev.vramBase + (32ull << 20) + 0xFFFFF) & ~0xFFFFFull;   // above the bring-up span
+		if (haveFb && rep.targetOff < fbOff + fbLen && fbOff < rep.targetOff + bytes)
+			rep.targetOff = (fbOff + fbLen + 0xFFFFF) & ~0xFFFFFull;
+		if (rep.targetOff + bytes > dev.vramLimit) { rep.stage = "no-room"; return kIOReturnNoSpace; }
+		bar0_memset_vram(dev, rep.targetOff, 0u, bytes);
+	}
+
+	// The shader, and SH_MEM_CONFIG for VMID 0 (gfx_v11_0_constants_init).
+	bar0_memcpy_to_vram(dev, base + kShaderOff, kGradientShader, sizeof(kGradientShader));
+	WBAR0_32(dev, base + kShaderFenceOff, 0);
+	grbm_select(dev, 0, 0, 0, 0);
+	WREG32(dev, g1(S::SH_MEM_CONFIG), kDefaultShMemConfig);
+	WREG32(dev, g1(S::SH_MEM_BASES), 0);
+
+	const uint64_t pgm = dev.vramMC(base + kShaderOff), dst = dev.vramMC(rep.targetOff);
+	const uint64_t fence = dev.vramMC(base + kShaderFenceOff);
+	const uint32_t seq = kN33FenceSeq + 3;
+	auto sh = [&](uint32_t reg) { return g0(reg) - kSET_SH_REG_START; };
+
+	uint32_t p[kCpPad];
+	for (uint32_t i = 0; i < kCpPad; i++) p[i] = kGfxNop;
+	uint32_t n = 0;
+	p[n++] = pkt3(kPKT3_SET_SH_REG, 2); p[n++] = sh(S::COMPUTE_PGM_LO);
+	p[n++] = (uint32_t)(pgm >> 8);      p[n++] = (uint32_t)(pgm >> 40);
+	p[n++] = pkt3(kPKT3_SET_SH_REG, 2); p[n++] = sh(S::COMPUTE_PGM_RSRC1);
+	p[n++] = kRsrc1;                    p[n++] = kRsrc2;
+	p[n++] = pkt3(kPKT3_SET_SH_REG, 1); p[n++] = sh(S::COMPUTE_PGM_RSRC3);       p[n++] = 0;
+	p[n++] = pkt3(kPKT3_SET_SH_REG, 1); p[n++] = sh(S::COMPUTE_RESOURCE_LIMITS); p[n++] = 0;
+	p[n++] = pkt3(kPKT3_SET_SH_REG, 3); p[n++] = sh(S::COMPUTE_STATIC_THREAD_MGMT_SE0);
+	p[n++] = 0xFFFFFFFFu; p[n++] = 0xFFFFFFFFu; p[n++] = 0;                       // SE0, SE1, TMPRING_SIZE
+	p[n++] = pkt3(kPKT3_SET_SH_REG, 2); p[n++] = sh(S::COMPUTE_STATIC_THREAD_MGMT_SE2);
+	p[n++] = 0xFFFFFFFFu; p[n++] = 0xFFFFFFFFu;
+	p[n++] = pkt3(kPKT3_SET_SH_REG, 3); p[n++] = sh(S::COMPUTE_START_X); p[n++] = 0; p[n++] = 0; p[n++] = 0;
+	p[n++] = pkt3(kPKT3_SET_SH_REG, 3); p[n++] = sh(S::COMPUTE_NUM_THREAD_X); p[n++] = 32; p[n++] = 1; p[n++] = 1;
+	p[n++] = pkt3(kPKT3_SET_SH_REG, 4); p[n++] = sh(S::COMPUTE_USER_DATA_0);
+	p[n++] = (uint32_t)dst; p[n++] = (uint32_t)(dst >> 32); p[n++] = rep.pitch; p[n++] = kShaderSeed;
+	p[n++] = pkt3(kPKT3_DISPATCH_DIRECT, 3);
+	p[n++] = rep.width / 32; p[n++] = rep.height; p[n++] = 1; p[n++] = kInitiator;
+	p[n++] = pkt3(kPKT3_RELEASE_MEM, 6);                 // flush the shader's stores, then the fence
+	p[n++] = kRM_DW1; p[n++] = kRM_DW2_DATA32;
+	p[n++] = (uint32_t)fence; p[n++] = (uint32_t)(fence >> 32); p[n++] = seq; p[n++] = 0; p[n++] = 0;
+	(void)S::COMPUTE_DISPATCH_INITIATOR;
+
+	const uint32_t wp = gCpWptrDw;
+	for (uint32_t i = 0; i < kCpPad; i++)
+		WBAR0_32(dev, base + kCpRingOff + (uint64_t)((wp + i) % (kCpRingBytes / 4)) * 4, p[i]);
+	cpCommit(dev, base + kCpWptrOff, wp + kCpPad);
+
+	uint32_t us = 0;
+	for (; us < timeoutUs; us += 10) {
+		if (RBAR0_32(dev, base + kShaderFenceOff) == seq) break;
+		IODelay(10);
+	}
+	rep.waitedUs = us;
+	rep.fence = RBAR0_32(dev, base + kShaderFenceOff);
+
+	// Sample up to 4096 pixels spread over the picture.
+	const uint64_t total = (uint64_t)rep.width * rep.height;
+	const uint64_t step = total / 4096 ? total / 4096 : 1;
+	rep.firstBadIndex = ~0u;
+	for (uint64_t i = 0; i < total; i += step) {
+		const uint32_t x = (uint32_t)(i % rep.width), y = (uint32_t)(i / rep.width);
+		const uint32_t got = RBAR0_32(dev, rep.targetOff + ((uint64_t)y * rep.pitch + x) * 4);
+		rep.sampled++;
+		if (got != gradientPixel(x, y)) {
+			if (rep.mismatches++ == 0) { rep.firstBadIndex = (uint32_t)i; rep.firstBadValue = got; }
+		}
+	}
+	rep.passed = rep.fence == seq && rep.mismatches == 0;
+	rep.stage = rep.passed ? "shader-ok" : (rep.fence != seq ? "shader-timeout" :
+	            (rep.mismatches == rep.sampled ? "shader-wrote-nothing" : "shader-wrong-pixels"));
+	UCODE_LOG("navi33-gfx: shader %ux%u -> vram+%#llx%s, fence %u after %u us, %u/%u pixels wrong -> %s",
+	          rep.width, rep.height, (unsigned long long)rep.targetOff, rep.onScreen ? " (screen)" : "",
+	          rep.fence, us, rep.mismatches, rep.sampled, rep.stage);
+	return rep.passed ? kIOReturnSuccess : kIOReturnIOError;
 }
 
 } // namespace amdgpu

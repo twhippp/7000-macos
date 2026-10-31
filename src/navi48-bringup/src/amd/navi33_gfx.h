@@ -183,4 +183,26 @@ struct N33GfxQReport {
 };
 kern_return_t navi33_gfx_queue_test(DeviceContext &dev, N33GfxQReport &rep, uint32_t timeoutUs = 100000);
 
+// ---- stage 10: the GPU runs a shader ----
+//
+// A real gfx1102 (RDNA3) wave32 compute shader (shaders/navi33_gradient.s) launched on the
+// compute queue with DISPATCH_DIRECT: one wave per 32 pixels, each lane computes a colour
+// from its x/y and stores it. Default target is an off-screen buffer the size of the screen;
+// navi33-draw-screen=1 paints the live console instead (stays until macOS redraws it).
+// Completion through RELEASE_MEM; the CPU then checks sampled pixels against the formula.
+struct N33ShaderReport {
+	uint64_t targetOff;          // VRAM offset of what was painted
+	uint32_t width, height, pitch;
+	bool     onScreen;
+	uint32_t fence;              // want kN33FenceSeq + 3
+	uint32_t waitedUs;
+	uint32_t sampled, mismatches;
+	uint32_t firstBadIndex, firstBadValue;
+	bool     passed;
+	const char *stage;
+};
+kern_return_t navi33_shader_test(DeviceContext &dev, uint64_t fbOff, uint64_t fbLen, uint64_t fbRowBytes,
+                                 uint32_t fbWidth, uint32_t fbHeight, bool toScreen, N33ShaderReport &rep,
+                                 uint32_t timeoutUs = 2000000);
+
 } // namespace amdgpu

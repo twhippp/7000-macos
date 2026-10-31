@@ -156,15 +156,15 @@ struct Rig {
 		if (dev.bar2) std::memcpy(&wptr, &db[6 * 4], 8);
 		else { const uint64_t p = mc(r(kGc0, 0x1fb6), r(kGc0, 0x1fb7)); std::memcpy(&wptr, &vram[p], 8); }
 		while (cpDone < wptr) {
-			uint32_t h; std::memcpy(&h, &vram[ring + cpDone * 4], 4);
+			uint32_t h; std::memcpy(&h, &vram[ring + (cpDone % 1024) * 4], 4);
 			const uint32_t op = (h >> 8) & 0xFF, n = (h >> 16) & 0x3FFF;
 			if (op == 0x10 && n == 0x3FFF) { cpDone += 1; continue; }
 			if (op == 0x79) {
-				uint32_t a[2]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 8);
+				uint32_t a[2]; std::memcpy(a, &vram[ring + ((cpDone + 1) % 1024) * 4], 8);
 				regs[0xC000 + a[0]] = a[1];
 			}
 			if (op == 0x3F) {   // INDIRECT_BUFFER -> WRITE_DATA(dst_sel 5); compute needs IB_VALID
-				uint32_t a[3]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 12);
+				uint32_t a[3]; std::memcpy(a, &vram[ring + ((cpDone + 1) % 1024) * 4], 12);
 				const uint64_t ib = (((uint64_t)a[1] << 32) | a[0]) - kMcBase;
 				uint32_t q[5]; std::memcpy(q, &vram[ib], 20);
 				if ((a[2] & (1u << 23)) && ((q[0] >> 8) & 0xFF) == 0x37 && ((q[1] >> 8) & 0xF) == 5 && (a[2] & 0xFFFFF) == 5) {
@@ -173,15 +173,34 @@ struct Rig {
 				}
 			}
 			if (op == 0x3C) {   // WAIT_REG_MEM write-wait-write: the hub acks
-				uint32_t a[4]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 16);
+				uint32_t a[4]; std::memcpy(a, &vram[ring + ((cpDone + 1) % 1024) * 4], 16);
 				if (a[0] & 0x40) { regs[a[1]] = a[3]; r(kGc0, 0x16ce) = 1; }
 			}
 			if (op == 0x37) {   // WRITE_DATA to a register (dst_sel 0)
-				uint32_t a[4]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 16);
+				uint32_t a[4]; std::memcpy(a, &vram[ring + ((cpDone + 1) % 1024) * 4], 16);
 				if ((a[0] & 0xF00) == 0) regs[a[1]] = a[3];
 			}
+			if (op == 0x76) {   // SET_SH_REG: offset from 0x2c00, then values
+				uint32_t a[8]; std::memcpy(a, &vram[ring + ((cpDone + 1) % 1024) * 4], 4 * (n + 1));
+				for (uint32_t i = 0; i < n; i++) regs[kGc0 + 0x2c00 - kGc0 + a[0] + i] = a[1 + i];
+			}
+			if (op == 0x15) {   // DISPATCH_DIRECT: run "the shader" (shaders/navi33_gradient.s) in C
+				uint32_t a[4]; std::memcpy(a, &vram[ring + ((cpDone + 1) % 1024) * 4], 16);
+				auto shr = [&](uint32_t reg) { return regs[0x2c00 + (kGc0 + reg - 0x2c00)]; };
+				const uint64_t pgm = (((uint64_t)shr(0x1bad) << 40) | ((uint64_t)shr(0x1bac) << 8)) - kMcBase;
+				uint32_t first; std::memcpy(&first, &vram[pgm], 4);
+				const uint64_t dst = mc(shr(0x1be0), shr(0x1be1));
+				const uint32_t pitch = shr(0x1be2), seed = shr(0x1be3), tpg = shr(0x1ba7);
+				if (first == 0x360200FFu && tpg == 32 && (a[3] & 0x8001) == 0x8001)
+					for (uint32_t y = 0; y < a[1]; y++)
+						for (uint32_t x = 0; x < a[0] * 32; x++) {
+							const uint32_t xs = x + seed;
+							const uint32_t c = 0xFF000000u | ((xs & 0xFF) << 16) | ((y & 0xFF) << 8) | ((y + xs) & 0xFF);
+							std::memcpy(&vram[dst + ((uint64_t)y * pitch + x) * 4], &c, 4);
+						}
+			}
 			if (op == 0x49) {   // RELEASE_MEM: dw1 event, dw2 sel, addr lo/hi, data lo/hi
-				uint32_t a[6]; std::memcpy(a, &vram[ring + (cpDone + 1) * 4], 24);
+				uint32_t a[6]; std::memcpy(a, &vram[ring + ((cpDone + 1) % 1024) * 4], 24);
 				if ((a[0] & 0x3F) == 0x14 && (a[1] >> 29) == 1) {
 					const uint64_t dst = (((uint64_t)a[3] << 32) | a[2]) - kMcBase;
 					std::memcpy(&vram[dst], &a[4], 4);
@@ -304,6 +323,15 @@ int main() {
 		const uint64_t gb = ((((uint64_t)k.r(kGc0, 0x1e87)) << 32) | k.r(kGc0, 0x1e86)) << 8;
 		check(gb == kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0xD000, "  ...gfx HQD base = the gfx ring");
 		check(k.r(kGc0, 0x1e7e) == (uint32_t)(kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0xF000), "  ...CP_GFX_MQD_BASE_ADDR = the MQD");
+		N33ShaderReport sr {};
+		const uint64_t fbOff = 0, fbW = 640, fbH = 64, fbRow = 704 * 4;   // a pitched fake console
+		check(navi33_shader_test(k.dev, fbOff, fbRow * fbH, fbRow, fbW, fbH, false, sr) == kIOReturnSuccess &&
+		      std::strcmp(sr.stage, "shader-ok") == 0, "stage 10: gradient shader dispatched, pixels match");
+		check(!sr.onScreen && sr.targetOff >= k.dev.vramBase + (32u << 20) && sr.pitch == 704 && sr.sampled > 0,
+		      "  ...off-screen by default, pitch honoured");
+		N33ShaderReport on {};
+		check(navi33_shader_test(k.dev, fbOff, fbRow * fbH, fbRow, fbW, fbH, true, on) == kIOReturnSuccess &&
+		      on.onScreen && on.targetOff == fbOff, "  ...navi33-draw-screen paints the console itself");
 		N33GfxQReport none {};
 		DeviceContext d2 = k.dev; d2.bar2 = nullptr;
 		check(navi33_gfx_queue_test(d2, none) == kIOReturnNotReady, "  ...no BAR2 -> refuses");
