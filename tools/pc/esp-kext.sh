@@ -5,6 +5,7 @@
 #   esp-kext.sh install    copy ~/navi48-staging/Navi48Bringup.kext -> EFI/OC/Kexts/
 #   esp-kext.sh remove     delete it from the ESP
 #   esp-kext.sh show       what is on the ESP right now
+#   N48_ESP=OPENCORE esp-kext.sh install    OpenCore on another partition (by volume name)
 #
 # WHY THIS EXISTS
 # ---------------
@@ -36,11 +37,19 @@ set -eu
 STAGED=~/navi48-staging/Navi48Bringup.kext
 MNT=/Volumes/N48-ESP
 
-store=$(diskutil info / | awk -F': *' '/APFS Physical Store/{print $2; exit}')
-[[ -n "$store" ]] || { echo "cannot find the APFS physical store of /"; exit 1; }
-disk=$(echo "$store" | sed -E 's#^(/dev/)?(disk[0-9]+)s[0-9]+$#\2#')
-esp=$(diskutil list "$disk" | awk '$2=="EFI"{print $NF; exit}')
-[[ -n "$esp" ]] || { echo "no EFI partition on $disk"; exit 1; }
+# N48_ESP=<volume name or disk id> picks the OpenCore partition directly, e.g. N48_ESP=OPENCORE
+# when OpenCore boots from a USB stick or another disk. Default: the EFI partition on the
+# boot volume's physical disk.
+if [[ -n "${N48_ESP:-}" ]]; then
+  esp=$(diskutil info "$N48_ESP" 2>/dev/null | awk -F': *' '/Device Identifier/{print $2; exit}')
+  [[ -n "$esp" ]] || { echo "no volume or disk '$N48_ESP' (diskutil list shows them)"; exit 1; }
+else
+  store=$(diskutil info / | awk -F': *' '/APFS Physical Store/{print $2; exit}')
+  [[ -n "$store" ]] || { echo "cannot find the APFS physical store of /"; exit 1; }
+  disk=$(echo "$store" | sed -E 's#^(/dev/)?(disk[0-9]+)s[0-9]+$#\2#')
+  esp=$(diskutil list "$disk" | awk '$2=="EFI"{print $NF; exit}')
+  [[ -n "$esp" ]] || { echo "no EFI partition on $disk"; exit 1; }
+fi
 
 # The ESP may already be mounted somewhere else (diskutil picks /Volumes/EFI by
 # default). Reuse that mount rather than failing, and only unmount on exit if we
@@ -56,7 +65,7 @@ else
 fi
 cleanup() { [[ "$MOUNTED_BY_US" == 1 ]] && { diskutil unmount "$MNT" >/dev/null 2>&1 || diskutil unmount force "$MNT" >/dev/null 2>&1; } || true; }
 trap cleanup EXIT
-[[ -f "$MNT/EFI/OC/OpenCore.efi" ]] || { echo "$esp (at $MNT) has no OpenCore — refusing"; exit 1; }
+[[ -f "$MNT/EFI/OC/OpenCore.efi" ]] || { echo "$esp (at $MNT) has no OpenCore — refusing (OpenCore elsewhere? N48_ESP=<volume name>, e.g. N48_ESP=OPENCORE)"; exit 1; }
 DEST="$MNT/EFI/OC/Kexts/Navi48Bringup.kext"
 
 case "${1:-show}" in
