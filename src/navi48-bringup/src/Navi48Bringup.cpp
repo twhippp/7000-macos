@@ -555,7 +555,13 @@ void Navi48Bringup::publishNavi33Summary() {
 		uint64_t v = 0, us = 0;
 		num("SDMA,TestValue", v); num("SDMA,WaitedUs", us);
 		add(" | S4 %s (read 0x%08x after %llu us)", s4, (uint32_t)v, (unsigned long long)us);
-		if (getProperty("GFXHUB,TlbFlushAcked") && !yes("GFXHUB,TlbFlushAcked")) addw("tlb-flush-not-acked");
+		// The CPU's MMIO flush in stage 4 is never acked on this card; the KIQ flush in stage 9
+		// (Linux's normal path) is the one that counts once it has run.
+		if (getProperty("GFXQ,KiqTlbFlushOk")) {
+			if (!yes("GFXQ,KiqTlbFlushOk")) addw("tlb-flush-not-acked-via-kiq");
+		} else if (getProperty("GFXHUB,TlbFlushAcked") && !yes("GFXHUB,TlbFlushAcked")) {
+			addw("tlb-flush-not-acked");
+		}
 		uint64_t fault = 0;
 		if (num("GFXHUB,FaultStatus", fault) && (uint32_t)fault) addw("gpu-vm-fault");
 	}
@@ -1074,6 +1080,9 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	setProperty("GFXQ,Scratch", static_cast<uint64_t>(gq.scratch), 32);
 	setProperty("GFXQ,WaitedUs", static_cast<uint64_t>(gq.gfxWaitedUs), 32);
 	setProperty("GFXQ,PfpPC", static_cast<uint64_t>(gq.pfpPc), 32);
+	setProperty("GFXQ,KiqTlbFlushOk", gq.kiqTlbFlushOk);
+	setProperty("GFXQ,KiqTlbFlushUs", static_cast<uint64_t>(gq.kiqTlbFlushUs), 32);
+	setProperty("GFXQ,TlbAckAfter", static_cast<uint64_t>(gq.tlbAckAfter), 32);
 	setProperty("GFXQ,Stage9", gq.stage);
 	N48LOG("psp-stage9: %s", gq.stage);
 }

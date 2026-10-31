@@ -1195,7 +1195,7 @@ static_assert(kGfxWptrOff + 8 <= kN33GfxVramSize, "stage 9 stays inside the slot
 constexpr uint32_t kKiqMe = 1, kKiqPipe = 3, kKiqQueue = 0;
 constexpr uint32_t kKiqDoorbell = kDbKiq << 1;                           // 0
 
-constexpr uint32_t kPKT3_SET_RESOURCES = 0xA0, kPKT3_MAP_QUEUES = 0xA2;
+constexpr uint32_t kPKT3_SET_RESOURCES = 0xA0, kPKT3_MAP_QUEUES = 0xA2, kPKT3_WAIT_REG_MEM = 0x3C;
 namespace G {   // gc_11_0_0_offset.h, BASE_IDX 0 (gfx HQD, banked by GRBM_GFX_CNTL)
 	constexpr uint32_t CP_GFX_MQD_BASE_ADDR = 0x1e7e, CP_GFX_HQD_ACTIVE = 0x1e80, CP_GFX_HQD_RPTR = 0x1e88;
 	constexpr uint32_t RLC_CP_SCHEDULERS = 0x098a;   // BASE_IDX 1
@@ -1368,6 +1368,44 @@ kern_return_t navi33_gfx_queue_test(DeviceContext &dev, N33GfxQReport &rep, uint
 		IODelay(10);
 	}
 	rep.kiqWaitedUs = us;
+
+	// ---- GFXHUB TLB flush through the KIQ (stage 4's MMIO flush was never acked) ----
+	if (rep.kiqProcessed) {
+		uint32_t req = 0;
+		req = setf(req, INV_PER_VMID_INVALIDATE_REQ, 1u << 0);
+		req = setf(req, INV_FLUSH_TYPE, 0);
+		req = setf(req, INV_INVALIDATE_L2_PTES, 1);
+		req = setf(req, INV_INVALIDATE_L2_PDE0, 1);
+		req = setf(req, INV_INVALIDATE_L2_PDE1, 1);
+		req = setf(req, INV_INVALIDATE_L2_PDE2, 1);
+		req = setf(req, INV_INVALIDATE_L1_PTES, 1);
+		uint32_t fp[kCpPad];
+		for (uint32_t i = 0; i < kCpPad; i++) fp[i] = kGfxNop;
+		uint32_t k = 0;
+		fp[k++] = pkt3(kPKT3_WAIT_REG_MEM, 5);                 // gfx_v11_0_ring_emit_reg_write_reg_wait
+		fp[k++] = 3u /*FUNCTION equal*/ | (0u << 4) /*register*/ | (1u << 6) /*write, wait*/ | (0u << 8) /*ME*/;
+		fp[k++] = g0(R::GCVM_INVALIDATE_ENG17_REQ);
+		fp[k++] = g0(R::GCVM_INVALIDATE_ENG17_ACK);
+		fp[k++] = req;
+		fp[k++] = 1u << 0;                                     // ack bit of VMID 0
+		fp[k++] = 0x20;
+		fp[k++] = pkt3(kPKT3_WRITE_DATA, 3);
+		fp[k++] = 1u << 16;
+		fp[k++] = s1;
+		fp[k++] = 0;
+		fp[k++] = 0x7B1F1005u;
+		bar0_memcpy_to_vram(dev, base + kKiqRingOff + kCpPad * 4, fp, sizeof(fp));
+		amdgpu_hdp_flush(dev);
+		WBAR0_64(dev, base + kKiqWptrOff, 2 * kCpPad);
+		amdgpu_hdp_flush(dev);
+		ring64(dev, kKiqDoorbell, 2 * kCpPad);
+		for (rep.kiqTlbFlushUs = 0; rep.kiqTlbFlushUs < timeoutUs; rep.kiqTlbFlushUs += 10) {
+			if (RREG32(dev, s1) == 0x7B1F1005u) { rep.kiqTlbFlushOk = true; break; }
+			IODelay(10);
+		}
+		rep.tlbAckAfter = RREG32(dev, g0(R::GCVM_INVALIDATE_ENG17_ACK));
+	}
+
 	grbm_select(dev, 0, 0, 0, 0);
 	rep.gfxHqdActive = RREG32(dev, g0(G::CP_GFX_HQD_ACTIVE));
 	rep.gfxMqdBaseLo = RREG32(dev, g0(G::CP_GFX_MQD_BASE_ADDR));

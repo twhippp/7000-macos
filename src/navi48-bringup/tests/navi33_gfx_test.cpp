@@ -149,6 +149,11 @@ struct Rig {
 				kiqMapped = true;
 			}
 			if (op == 0x37 && (a[0] & 0xF00) == 0) regs[a[1]] = a[3];          // WRITE_DATA to a register
+			if (op == 0x3C && (a[0] & 0x40)) {                                   // WAIT_REG_MEM write-wait-write
+				regs[a[1]] = a[3];
+				r(kGc0, 0x16ce) = 1;   // the hub acks
+				if ((regs[a[2]] & a[4]) != a[4]) break;
+			}
 			kiqDone += n + 2;
 		}
 		if (!kiqMapped) return;
@@ -300,6 +305,7 @@ int main() {
 		      "stage 9: KIQ maps the gfx queue, gfx ring writes SCRATCH_REG0");
 		check(gq.kiqActive && gq.kiqProcessed && gq.gfxHqdActive == 1 && gq.gfxRptr == 256, "  ...KIQ ran, gfx HQD active, gfx rptr 256");
 		check((k.r(kGc1, 0x098a) & 0xFF) == 0xB8, "  ...RLC_CP_SCHEDULERS = KIQ me1 pipe3 queue0");
+		check(gq.kiqTlbFlushOk && k.r(kGc0, 0x16bc) != 0, "  ...GFXHUB TLB flush through the KIQ (WAIT_REG_MEM on ENG17) acked");
 		uint32_t gq128[2]; std::memcpy(gq128, &k.vram[k.dev.vramBase + kN33GfxVramOffset + 0xF000 + 128 * 4], 8);
 		check(gq128[0] == (uint32_t)(kMcBase + k.dev.vramBase + kN33GfxVramOffset + 0xF000), "  ...gfx MQD points at itself");
 		N33GfxQReport none {};

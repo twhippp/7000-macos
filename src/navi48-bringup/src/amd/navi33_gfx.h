@@ -176,6 +176,11 @@ struct N33GfxQReport {
 	uint32_t scratch;            // SCRATCH_REG0 after the test
 	uint32_t gfxWaitedUs;
 	uint32_t pfpPc;
+	// gmc_v11_0_flush_gpu_tlb's normal path once the KIQ runs (amdgpu_gmc_fw_reg_write_reg_wait):
+	// the KIQ writes GCVM_INVALIDATE_ENG17_REQ and waits for ENG17_ACK itself.
+	bool     kiqTlbFlushOk;
+	uint32_t kiqTlbFlushUs;
+	uint32_t tlbAckAfter;        // ENG17_ACK as the CPU reads it afterwards
 	bool     passed;
 	const char *stage;
 };
