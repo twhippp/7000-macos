@@ -38,6 +38,10 @@ is in: `N33,Native` says ready.
 - `radvprobe --triangle` on the RX 7600: clear + one triangle (vertex/fragment, dynamic rendering)
   + copy back -> TRIANGLE OK, 2016 red / 2080 blue / 0 other, identical to lavapipe. First
   graphics work on Navi 33 under macOS.
+- `radvprobe --present` on the RX 7600 (kext CI run 41268991458, copy-to-console scanout): console
+  1920x1080 pitch 1920; rendered pixels correct; acquire/register/present/release all 0; the
+  triangle was SEEN on the monitor for 5 s and the desktop came back (restore retired). First
+  GPU-rendered frame on screen on Navi 33 under macOS. No vsync (copy, not flip): tearing expected.
 - Known limits: only the gfx queue (compute/transfer submits are refused by cs_parse), all BOs in
   the BAR0-visible pool (216 MiB), GTT requests also land there.
 
@@ -46,4 +50,6 @@ is in: `N33,Native` says ready.
 4. Things gfx11 RADV may want that gfx12 didn't: check for READ_MMR_REG of anything beyond
    GB_ADDR_CONFIG, and the firmware versions RADV gates features on (canned me 2390 / pfp 2530 /
    mec 2600 vs what the kext loaded).
-5. Then scanout (copy into the boot framebuffer first; DCN 3.2 later).
+5. Scanout: copy-to-console done (above). Real flips on DCN 3.2 (vsync, no console fight) later.
+6. Next big piece: the Metal side (tools/native/navi48metal) on Navi 33, so macOS itself draws
+   through RADV. Then more VRAM (the hi pool above BAR0), compute/SDMA queues.
