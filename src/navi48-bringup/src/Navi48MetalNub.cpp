@@ -7,6 +7,7 @@
 #include "Navi48MetalNub.hpp"
 #include "Navi48Bringup.hpp"
 #include "Navi48MetalOps.h"
+#include "Navi48NativeClient.hpp"   // 0.0.656 (G6): op_native_open creates the client on the accelerator route
 #include "amd/native_metal_pure.h"
 #include "amd/native_s1b.h"
 #include "amd/native_s1c.h"
@@ -27,6 +28,8 @@ static_assert(n48metal::kNotReady == (uint32_t)kIOReturnNotReady && n48metal::kB
               n48metal::kBusy == (uint32_t)kIOReturnBusy && n48metal::kNoMemory == (uint32_t)kIOReturnNoMemory && n48metal::kOk == (uint32_t)kIOReturnSuccess,
               "the pure header's codes are the IOReturn.h values");
 
+static_assert(N48_METAL_UC_N48N == N48N_UC_TYPE, "the aux kext's copy of the 'N48N' type equals the user-client ABI's");
+
 OSDefineMetaClassAndStructors(Navi48MetalNub, IOService)
 
 // 0.0.613: the mask the aux kext's factories see (op_factory_mask below, and the display glue's fact check): the boot-arg navi48-metal-fact mask, read on every call as before, plus the
@@ -45,11 +48,13 @@ namespace {
 IOLock                *gLock;         // created on first publish
 Navi48MetalNub        *gNub;          // our reference while Published
 volatile uint32_t      gState = 0;    // n48metal::State
+volatile uint32_t      gEverPublished = 0;   // 0.0.653: sticky, 1 once a nub was published this boot (fbpublish refuses after that)
 volatile uint32_t      gReadyNo = 0;  // 0.0.612: sticky, 1 once the HUNG latch tripped this boot (Navi48,Ready is 0 from then on, never 1 again)
 struct Dev {                          // the per-device state the aux kext's device_open hook gets
 	uint32_t                    magic;
 	IOBufferMemoryDescriptor   *md;
 	volatile uint32_t          *va;
+	void                       *accel;   // 0.0.656 (G6): the accelerator device_open was called for (identity only, NOT retained): the accelerator route's one valid provider
 };
 constexpr uint32_t kDevMagic = 0x4D44564Eu;   // 'NVDM'
 Dev *gDev;                            // one accelerator per boot
@@ -58,8 +63,7 @@ const char kAccelName[] = "Navi48 Accelerator";   // IOAccelConfig +0: a pointer
 
 // ---- the ops table's hooks (Navi48MetalOps.h). The aux kext calls these; each decision is n48metal:: pure code. ---------------------------------------------
 void *op_device_open(void *accel, void *nub) {
-	(void)accel;
-	if (!nub || gDev) return nullptr;                                            // one device
+	if (!nub || !accel || gDev) return nullptr;                                  // one device (0.0.656: and an accelerator to bind it to)
 	const mach_vm_address_t mask = n48metal::kStampPhysMask;
 	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
 		kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone, n48metal::kStampBytes, mask);
@@ -75,7 +79,7 @@ void *op_device_open(void *accel, void *nub) {
 	bzero(cpu, n48metal::kStampBytes);                                             // stamps stay 0: nothing is ever submitted at #9
 	Dev *d = (Dev *)IOMalloc(sizeof(Dev));
 	if (!d) { md->complete(); md->release(); return nullptr; }
-	d->magic = kDevMagic; d->md = md; d->va = (volatile uint32_t *)cpu;
+	d->magic = kDevMagic; d->md = md; d->va = (volatile uint32_t *)cpu; d->accel = accel;
 	gDev = d;
 	MNLOG("device_open: stamp page phys %#llx kva %p", (unsigned long long)phys, cpu);
 	return d;
@@ -84,7 +88,7 @@ void op_device_close(void *ctx) {
 	Dev *d = (Dev *)ctx;
 	if (!d || d != gDev || d->magic != kDevMagic) return;                          // idempotent: only the live device, once
 	gDev = nullptr;
-	d->magic = 0;
+	d->magic = 0; d->accel = nullptr;
 	if (d->md) { d->md->complete(); d->md->release(); d->md = nullptr; }
 	IOFree(d, sizeof(Dev));
 	MNLOG("device_close");
@@ -147,25 +151,51 @@ int op_vhook(void *ctx, uint32_t cls, uint32_t slot, void *self, const uint64_t 
 	return h;
 }
 
-// 0.0.613 (ABI 2): the display-pipe hook and the PCI getter (notes/design/NATIVE-S4-M11H.md section 3.4). The aux kext calls them only from a table of abi >= 2 that carries N48_DISP_F_ON.
+// 0.0.656 (G6, ops ABI 3): the accelerator's newUserClient hands an 'N48N' open here. The client it returns is the SAME IOAccelNavi48NativeClient WindowServer gets, attached to the accelerator (route kRouteAccelerator),
+// with Navi48Bringup as its owner (all engine state). Admission is the client's own initWithTask (allow-list / root / WindowServer identity, kauth on this thread); nothing is decided here beyond identity.
+// Lock order: gLock is NOT held across create (create takes the client lock, and hungLatched takes gLock under it): the nub is retained under the lock and the lock is dropped first.
+int32_t op_native_open(void *ctx, void *accel, void *task, void *securityID, uint32_t type, void **handler) {
+	if (!handler) return (int32_t)kIOReturnBadArgument;
+	Dev *d = (Dev *)ctx;
+	const bool live = d != nullptr && d == __atomic_load_n(&gDev, __ATOMIC_ACQUIRE) && d->magic == kDevMagic;
+	const bool isAccel = live && accel != nullptr && accel == d->accel;
+	Navi48MetalNub *nub = nullptr;
+	if (gLock) { IOLockLock(gLock); nub = gNub; if (nub) nub->retain(); IOLockUnlock(gLock); }
+	const uint32_t v = n48metal::native_open_verdict(type == N48_METAL_UC_N48N, live, isAccel, nub != nullptr);
+	if (v != n48metal::kOk) { if (nub) nub->release(); return (int32_t)v; }
+	Navi48Bringup *owner = OSDynamicCast(Navi48Bringup, nub->getProvider());
+	IOReturn rc = kIOReturnNotReady;
+	if (owner) {
+		IOUserClient *uc = nullptr;
+		rc = IOAccelNavi48NativeClient::create(owner, static_cast<IOService *>(accel), n48native::policy::kRouteAccelerator, (task_t)task, securityID, type, nullptr, &uc);
+		if (rc == kIOReturnSuccess) { if (uc) *handler = uc; else rc = kIOReturnInternalError; }
+	}
+	nub->release();
+	return (int32_t)rc;
+}
+
+// 0.0.613 (ABI 2): the display-pipe hook and the PCI getter (an internal design note section 3.4). The aux kext calls them only from a table of abi >= 2 that carries N48_DISP_F_ON.
 int op_disp_hook(void *ctx, uint32_t cls, uint32_t slot, void *self, const uint64_t *args, uint32_t nargs, uint64_t *ret) { return n48disp_hook(ctx, cls, slot, self, args, nargs, ret); }
 void *op_pci_device(void *ctx) { return n48disp_pci_device(ctx); }
 
-// TWO tables, the one published chosen by the latch (n48disp::ops_shape): ABI 2 / 144 bytes with the display flag ONLY with boot-arg navi48-metal-disp=1; otherwise the ABI-1 / 120-byte table
-// 0.0.612 published (its members are the same, the trailing ABI-2 members are outside its size and zero): the aux kext then takes every 0.0.2 default.
+// TWO tables, the one published chosen by the latch (n48disp::ops_shape): with the display flag ONLY with boot-arg navi48-metal-disp=1 (gOps); otherwise gOpsOff, whose display members are zero (the aux kext then takes every
+// 0.0.2 display default). Both are ABI 3 / 152 bytes since 0.0.656 (G6): native_open is the last member and carries its own capability bit.
 const N48MetalOps gOps = {
-	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 620u, n48metal::kOpsFlags, 0u,
+	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,
 	op_device_open, op_device_close, op_populate_config, op_stamp_memory, op_stamp_va, op_task_window,
 	op_factory_mask, op_mm_hook, op_trace,
 	op_vhook, n48metal::kOpsCaps, 0,
 	N48_DISP_F_ON, 0u, op_disp_hook, op_pci_device,
+	op_native_open,
 };
-const N48MetalOps gOpsV1 = {
-	N48_METAL_OPS_MAGIC, N48_METAL_ABI_MIN, N48_METAL_OPS_MIN, 620u, n48metal::kOpsFlags, 0u,
+// 0.0.656: the OFF table is ABI 3 too (native_open must exist with the display OFF, the normal case): the display members are zero (flags 0, no hook, no PCI getter), which is "display off" to every aux kext.
+const N48MetalOps gOpsOff = {
+	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,
 	op_device_open, op_device_close, op_populate_config, op_stamp_memory, op_stamp_va, op_task_window,
 	op_factory_mask, op_mm_hook, op_trace,
 	op_vhook, n48metal::kOpsCaps, 0,
 	0u, 0u, nullptr, nullptr,
+	op_native_open,
 };
 
 void ensure_lock() {
@@ -180,22 +210,28 @@ n48metal::GateIn gate_now(uint64_t flags, bool wantBootArg) {
 	if (amdgpu::n33n_available()) {
 		// Navi 33: the engine is available only once stages 1-12 passed this boot, which is what the S1b
 		// POSITIVE PASS stands for on a gfx12 card. The gfx11 engine has no HUNG latch (a submit that never
-		// retires times out in the wait, it does not poison the session).
+		// retires times out in the wait, it does not poison the session). No multi-display, no display nub.
 		g.hello = amdgpu::n33n_hello_done();
 		g.s1bGateOn = g.s1bRan = g.s1bPositive = true; g.s1bStopped = false;
 		g.hung = false;
+		g.m6 = false;
+		g.dispNub = false;
 	} else {
 		const amdgpu::NativeS1bState &s = amdgpu::native_s1b_state();
 		g.hello = amdgpu::n1c_hello_done();
 		g.s1bGateOn = (s.gate == n48native::kGateOn);
 		g.s1bRan = s.ran; g.s1bPositive = s.positivePass; g.s1bStopped = s.stopped;
 		g.hung = amdgpu::n1c_hung();
+		g.m6 = n48m6_latched_on();                                                       // 0.0.659 (M6 Stage 1a, R3): boot-arg navi48-m6 == 1 (latched): the display-nub interlock below is lifted
+		g.dispNub = n48fb_nub_exists();                                                 // 0.0.652 (M5): a Navi48DisplayNub is published: the Metal nub (and the display machine behind it) is REFUSED (n48metal::publish_verdict)
 	}
 	uint32_t v = 0;
 	g.bootarg = wantBootArg && PE_parse_boot_argn("navi48-metal", &v, sizeof(v)) && v == 1u;
 	return g;
 }
 } // namespace
+
+bool n48metal_nub_published(void) { return __atomic_load_n(&gEverPublished, __ATOMIC_ACQUIRE) != 0u; }   // 0.0.653
 
 // ---- the selectors --------------------------------------------------------------------------------------------------------------------------------------
 IOReturn Navi48MetalNub::selectorPublish(Navi48Bringup *owner, uint64_t flags, uint64_t out[4]) {
@@ -232,6 +268,7 @@ IOReturn Navi48MetalNub::selectorPublish(Navi48Bringup *owner, uint64_t flags, u
 			if (nub->attach(owner)) {
 				gNub = nub;                                                       // our reference (from alloc) is kept until withdraw
 				gState = n48metal::sm_after_publish((n48metal::State)gState);
+				__atomic_store_n(&gEverPublished, 1u, __ATOMIC_RELEASE);
 				out[0] = 1; out[1] = nub->getRegistryEntryID(); out[2] = shape.abi; out[3] = (uint64_t)shape.size;
 				rc = kIOReturnSuccess;
 			}
@@ -291,6 +328,32 @@ void Navi48MetalNub::hungLatched() {
 
 IOService *Navi48MetalNub::published() { return gNub; }   // 0.0.613: identity only (NOT retained)
 
+// 0.0.659 (M6): properties of the published nub that the bundle (in WindowServer) reads: the latch word and the surface table (native_m6_pure.h). false = no nub is published / no memory. Takes this file's lock only (the caller holds none of ours).
+bool Navi48MetalNub::setPublishedData(const char *key, const void *bytes, uint32_t len) {
+	if (!key || !bytes || !len || !gLock) return false;
+	OSData *d = OSData::withBytes(bytes, len);
+	if (!d) return false;
+	IOLockLock(gLock);
+	Navi48MetalNub *nub = gNub;
+	const bool ok = nub && nub->setProperty(key, d);
+	IOLockUnlock(gLock);
+	d->release();
+	return ok;
+}
+bool Navi48MetalNub::setPublishedNumber(const char *key, uint64_t v) {
+	if (!key || !gLock) return false;
+	IOLockLock(gLock);
+	Navi48MetalNub *nub = gNub;
+	const bool ok = nub && nub->setProperty(key, v, 32);
+	IOLockUnlock(gLock);
+	return ok;
+}
+
+IOService *Navi48MetalNub::registeredAccelerator() {      // 0.0.656 (G6): identity only (NOT retained)
+	Dev *d = __atomic_load_n(&gDev, __ATOMIC_ACQUIRE);
+	return (d && d->magic == kDevMagic) ? static_cast<IOService *>(d->accel) : nullptr;
+}
+
 void Navi48MetalNub::shutdown() {
 	if (!gLock) return;
 	IOLockLock(gLock);
@@ -304,7 +367,7 @@ void Navi48MetalNub::shutdown() {
 IOReturn Navi48MetalNub::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3, void *param4) {
 	if (functionName && functionName->isEqualTo(N48_METAL_FN_SYMBOL)) {
 		if (!param1) return kIOReturnBadArgument;
-		*(const N48MetalOps **)param1 = n48disp::ops_shape(disp_on()).abi >= 2u ? &gOps : &gOpsV1;
+		*(const N48MetalOps **)param1 = n48disp::ops_shape(disp_on()).dispFlags != 0u ? &gOps : &gOpsOff;   // disp_on(): never on a Navi 33
 		return kIOReturnSuccess;
 	}
 	return super::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);

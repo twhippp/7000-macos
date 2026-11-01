@@ -24,6 +24,10 @@ using namespace n48native::s1c;
 
 constexpr uint32_t kVmid = 8;
 constexpr uint32_t kBuild = 33012;                 // reported by Hello / QueryInfo
+// The ABI minor this engine reports (Hello, QueryInfo.reserved[2]): 8, not the header's current minor. What 1.9..1.12
+// added is not here on gfx11: host import (21), the per-session VRAM budget in QueryInfo (1.10), the multi-display
+// scanout (22..26). A client that sees 8 does not try them (Mesa's userptr, budget and scanx paths are gated on it).
+constexpr uint32_t kAbiMinor = 8u;
 constexpr uint64_t kBlk = 64ull << 10;
 constexpr uint32_t kMaxBlk = 4096;                 // 256 MiB of BAR0 / 64 KiB
 constexpr uint64_t kPtArena = 8ull << 20;
@@ -233,7 +237,7 @@ IOReturn n33n_hello(uint64_t clientAbi, uint64_t flags, uint64_t out[4]) {
 	if (clientAbi != N48N_ABI_VERSION) return kIOReturnUnsupported;
 	IOLockLock(gLock);
 	gS.hello = true;
-	out[0] = (flags & N48N_HELLO_F_MINOR) ? (uint64_t)N48N_ABI_VERSION | ((uint64_t)N48N_ABI_MINOR << 16) : (uint64_t)N48N_ABI_VERSION;
+	out[0] = (flags & N48N_HELLO_F_MINOR) ? (uint64_t)N48N_ABI_VERSION | ((uint64_t)kAbiMinor << 16) : (uint64_t)N48N_ABI_VERSION;
 	out[1] = kBuild; out[2] = N48N_MAX_IBS; out[3] = kVmid;
 	IOLockUnlock(gLock);
 	return kIOReturnSuccess;
@@ -253,7 +257,7 @@ IOReturn n33n_query_info(n48n_info *o) {
 	o->gtt_cap = kGttCap; o->gtt_max_bo = kGttMaxBo;
 	o->pt_cap = kPtArena;
 	for (uint32_t i = 0; i < kPtPages; i++) o->pt_used += gS.ptUsed[i] ? kPage : 0;
-	o->reserved[2] = N48N_ABI_MINOR;
+	o->reserved[2] = kAbiMinor;
 	o->seq_emitted = gS.emitted; o->seq_retired = retired();
 	o->va_low_first = kVaFirst; o->va_low_last = 0x00007FFFFFFFFFFFull;
 	o->va_high_first = 0xFFFF800000000000ull; o->va_high_last = 0xFFFFFFFFFFFFFFFFull;

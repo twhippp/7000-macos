@@ -1,7 +1,7 @@
 From 6ad43301d07dfa9c31f3d6d5d22dd0d549696df3 Mon Sep 17 00:00:00 2001
 From: Navi48-MacOS contributors <noreply@example.invalid>
 Date: Thu, 1 Jan 2026 00:00:00 +0000
-Subject: [PATCH 1/5] radv: Darwin (macOS) backend with canned gfx1201 device
+Subject: [PATCH 1/9] radv: Darwin (macOS) backend with canned gfx1201 device
  info (Navi48 S1a)
 
 Build RADV for Darwin without libdrm and without a DRM node.  meson: allow
@@ -17,7 +17,6 @@ vkCreateDevice succeeds; the first real stub then is CS submit.
 Stand-in headers for xf86drm.h, amdgpu.h (libdrm's, verbatim) and libsync.h
 live in include/darwin.
 
-Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---
  cross-x86_64.ini                              |   13 +
  include/darwin/amdgpu.h                       | 2102 +++++++++++++++++
