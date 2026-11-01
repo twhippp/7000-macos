@@ -115,9 +115,10 @@ IOReturn IOAccelNavi48NativeClient::externalMethod(uint32_t selector, IOExternal
 		return kIOReturnNotPrivileged;
 	}
 	// Navi 33: selectors 0..8 run on the gfx11 engine, 9..14 (scanout) on its copy-to-console present (navi33_native.cpp);
-	// DAL, mode, Metal nub and host import are not there yet. The n48dcn display layer (DCN 4.1) is never bound on a Navi 33.
+	// DAL, mode and host import are not there yet; the Metal nub (19/20) is. The n48dcn display layer (DCN 4.1) is never bound on a Navi 33.
 #define N33(fn) (n33 ? amdgpu::n33n_##fn : amdgpu::n1c_##fn)
-	if (n33 && selector > N48N_SEL_SCAN_RELEASE) return kIOReturnUnsupported;
+	if (n33 && selector > N48N_SEL_SCAN_RELEASE && selector != N48N_SEL_METAL_NUB_PUBLISH && selector != N48N_SEL_METAL_NUB_WITHDRAW)
+		return kIOReturnUnsupported;   // 19/20 (the Metal nub) are GPU-independent: the nub reads the Navi 33 gate itself
 	if (n33 && selector >= N48N_SEL_SCAN_QUERY) {
 		switch (selector) {
 		case N48N_SEL_SCAN_QUERY:

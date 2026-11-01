@@ -19,6 +19,7 @@ bool n33n_available();
 IOReturn n33n_open();
 void     n33n_close(const char *how);
 bool     n33n_is_open();
+bool     n33n_hello_done();   // a session is open and said Hello (the Metal nub's publish gate)
 
 IOReturn n33n_hello(uint64_t clientAbi, uint64_t flags, uint64_t out[4]);
 IOReturn n33n_query_info(n48n_info *out);

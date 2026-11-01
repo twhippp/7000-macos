@@ -12,6 +12,7 @@
 #include "amd/native_s1c.h"
 #include "amd/native_disp.h"         // 0.0.613: the display pipe glue (behind boot-arg navi48-metal-disp=1)
 #include "amd/native_disp_pure.h"
+#include "amd/navi33_native.h"      // Navi 33: the gate reads the gfx11 engine, the display pipe stays off
 #include "amd/amdgpu_log.h"
 
 #include <IOKit/IOLib.h>
@@ -30,10 +31,13 @@ OSDefineMetaClassAndStructors(Navi48MetalNub, IOService)
 
 // 0.0.613: the mask the aux kext's factories see (op_factory_mask below, and the display glue's fact check): the boot-arg navi48-metal-fact mask, read on every call as before, plus the
 // fact bits `pipe adopt` turned on at run time. With boot-arg navi48-metal-disp absent the OR is a no-op (n48disp::fact_mask returns the base mask): the 0.0.612 value, bit for bit.
+// The display pipe (n48disp) drives DCN 4.1: never on a Navi 33, whatever the boot-args say.
+static bool disp_on() { return n48disp_latched_on() && !amdgpu::n33n_available(); }
+
 uint32_t n48metal_factory_mask_now(void) {
 	uint32_t v = 0;
 	const bool present = PE_parse_boot_argn("navi48-metal-fact", &v, sizeof(v));
-	return n48disp::fact_mask(n48disp_latched_on(), n48metal::factory_mask(present, v), n48disp_fact_bits());
+	return n48disp::fact_mask(disp_on(), n48metal::factory_mask(present, v), n48disp_fact_bits());
 }
 
 // ---- state (one nub per boot at a time) -----------------------------------------------------------------------------------------------------------------
@@ -123,7 +127,7 @@ int op_mm_hook(void *ctx, uint32_t op, void *obj) {
 }
 void op_trace(uint32_t event, uint64_t a, uint64_t b) {
 	MNLOG("aux trace: event %u a %#llx b %#llx", event, (unsigned long long)a, (unsigned long long)b);
-	n48disp_on_trace(event, a, b);                                                 // 0.0.613: the display pipe's trace events (a no-op unless boot-arg navi48-metal-disp=1)
+	if (disp_on()) n48disp_on_trace(event, a, b);                                                 // 0.0.613: the display pipe's trace events (a no-op unless boot-arg navi48-metal-disp=1)
 }
 
 // The generic virtual hook (0.0.611): the optional VidMemory / Resource output-parameter slots are handled only when their factory bit is on (default mask 0 = nothing
@@ -135,7 +139,7 @@ int op_vhook(void *ctx, uint32_t cls, uint32_t slot, void *self, const uint64_t 
 	uint32_t mask = 0;
 	if (cls == N48_VC_VIDMEMORY || cls == N48_VC_RESOURCE) mask = op_factory_mask(nullptr);
 	int h = 0;
-	if (cls == N48_VC_RESOURCE && slot == 62u) h = n48disp_res62(self, args, nargs, ret);   // 0.0.613: type 0xC0 surfaces (11h.1 F3); 0 at once unless boot-arg navi48-metal-disp=1
+	if (cls == N48_VC_RESOURCE && slot == 62u && disp_on()) h = n48disp_res62(self, args, nargs, ret);   // 0.0.613: type 0xC0 surfaces (11h.1 F3); 0 at once unless boot-arg navi48-metal-disp=1
 	if (!h) h = n48metal::vhook_handle(mask, cls, slot, args, nargs, ret, n48metal::kKernelMin);
 	const uint32_t k = n48metal::vhook_log_kind(n);
 	if (k == n48metal::kVhLogFull) MNLOG("vhook: cls %u slot %u nargs %u call %u: %s", cls, slot, nargs, n, h ? "handled" : "not handled (default)");
@@ -172,12 +176,21 @@ void ensure_lock() {
 
 n48metal::GateIn gate_now(uint64_t flags, bool wantBootArg) {
 	n48metal::GateIn g {};
-	const amdgpu::NativeS1bState &s = amdgpu::native_s1b_state();
 	g.flags = flags;
-	g.hello = amdgpu::n1c_hello_done();
-	g.s1bGateOn = (s.gate == n48native::kGateOn);
-	g.s1bRan = s.ran; g.s1bPositive = s.positivePass; g.s1bStopped = s.stopped;
-	g.hung = amdgpu::n1c_hung();
+	if (amdgpu::n33n_available()) {
+		// Navi 33: the engine is available only once stages 1-12 passed this boot, which is what the S1b
+		// POSITIVE PASS stands for on a gfx12 card. The gfx11 engine has no HUNG latch (a submit that never
+		// retires times out in the wait, it does not poison the session).
+		g.hello = amdgpu::n33n_hello_done();
+		g.s1bGateOn = g.s1bRan = g.s1bPositive = true; g.s1bStopped = false;
+		g.hung = false;
+	} else {
+		const amdgpu::NativeS1bState &s = amdgpu::native_s1b_state();
+		g.hello = amdgpu::n1c_hello_done();
+		g.s1bGateOn = (s.gate == n48native::kGateOn);
+		g.s1bRan = s.ran; g.s1bPositive = s.positivePass; g.s1bStopped = s.stopped;
+		g.hung = amdgpu::n1c_hung();
+	}
 	uint32_t v = 0;
 	g.bootarg = wantBootArg && PE_parse_boot_argn("navi48-metal", &v, sizeof(v)) && v == 1u;
 	return g;
@@ -202,12 +215,13 @@ IOReturn Navi48MetalNub::selectorPublish(Navi48Bringup *owner, uint64_t flags, u
 	OSDictionary *props = OSDictionary::withCapacity(4);
 	IOReturn rc = kIOReturnNoMemory;
 	if (nub && props && nub->init(props)) {
-		OSString *model = OSString::withCString("AMD Radeon RX 9070 XT");
-		const n48disp::OpsShape shape = n48disp::ops_shape(n48disp_latched_on());   // 0.0.613: OFF reports what 0.0.612 did (ABI 1, 120 bytes)
+		const bool n33 = amdgpu::n33n_available();
+		OSString *model = OSString::withCString(n33 ? "AMD Radeon RX 7600" : "AMD Radeon RX 9070 XT");
+		const n48disp::OpsShape shape = n48disp::ops_shape(disp_on());   // 0.0.613: OFF reports what 0.0.612 did (ABI 1, 120 bytes)
 		OSNumber *abi = OSNumber::withNumber((uint64_t)shape.abi, 32);
 		OSNumber *va = OSNumber::withNumber((uint64_t)n48metal::kTaskVaSize, 64);
 		amdgpu::BringupContext *ctx = owner->bringupContext();
-		OSNumber *vram = OSNumber::withNumber(ctx ? ctx->gmc.real_vram_size : 0ull, 64);
+		OSNumber *vram = OSNumber::withNumber(n33 ? owner->deviceContext()->vramSizeBytes : (ctx ? ctx->gmc.real_vram_size : 0ull), 64);
 		OSNumber *ready = OSNumber::withNumber((uint64_t)n48metal::ready_at_publish(__atomic_load_n(&gReadyNo, __ATOMIC_ACQUIRE) != 0u, g.hung), 32);   // 0.0.612: 1 while usable
 		if (model && abi && va && vram && ready) {
 			nub->setProperty("model", model);
@@ -290,7 +304,7 @@ void Navi48MetalNub::shutdown() {
 IOReturn Navi48MetalNub::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3, void *param4) {
 	if (functionName && functionName->isEqualTo(N48_METAL_FN_SYMBOL)) {
 		if (!param1) return kIOReturnBadArgument;
-		*(const N48MetalOps **)param1 = n48disp::ops_shape(n48disp_latched_on()).abi >= 2u ? &gOps : &gOpsV1;
+		*(const N48MetalOps **)param1 = n48disp::ops_shape(disp_on()).abi >= 2u ? &gOps : &gOpsV1;
 		return kIOReturnSuccess;
 	}
 	return super::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
