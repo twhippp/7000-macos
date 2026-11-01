@@ -35,6 +35,9 @@ is in: `N33,Native` says ready.
   GB_ADDR_CONFIG 0x343, VRAM 216 MiB visible + 0 hi, GTT cap 512 MiB.
   `radvprobe --fill`: device created, vkCmdFillBuffer 64 KiB (RADV's compute-shader fill on the
   gfx queue, VMID 8) -> FILL OK, 16384/16384 0xdeadbeef. First Vulkan work on Navi 33 under macOS.
+- `radvprobe --triangle` on the RX 7600: clear + one triangle (vertex/fragment, dynamic rendering)
+  + copy back -> TRIANGLE OK, 2016 red / 2080 blue / 0 other, identical to lavapipe. First
+  graphics work on Navi 33 under macOS.
 - Known limits: only the gfx queue (compute/transfer submits are refused by cs_parse), all BOs in
   the BAR0-visible pool (216 MiB), GTT requests also land there.
 
