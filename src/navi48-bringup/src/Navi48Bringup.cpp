@@ -1156,7 +1156,9 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 	N48LOG("psp-stage12: %s", vm.stage);
 	// The app door: with VMID 8 proven, the N48N user client runs on this card (navi33_native.cpp).
 	if (vm.passed) {
-		amdgpu::n33n_attach(dev, bootFbOff, bootFbLen);
+		uint32_t conW = 0, conH = 0, conRow = 0;
+		if (!consoleGeometry(nullptr, nullptr, &conW, &conH, &conRow)) conW = conH = conRow = 0;   // scanout refused without it
+		amdgpu::n33n_attach(dev, bootFbOff, bootFbLen, conW, conH, conRow);
 		setProperty("N33,Native", amdgpu::n33n_available() ? "ready" : "not-ready");
 	}
 }

@@ -64,6 +64,31 @@ struct Session {
 Session gS;
 uint32_t gSubmit[3 + 4 * N48N_MAX_IBS + 16];
 
+// ---- scanout, copy-to-console variant ----
+// Navi 33's display engine (DCN 3.2) is not driven here. The boot console the GOP left lit stays the scanout
+// surface; a Present COPIES the registered buffer into it on the gfx queue (CP DMA in an IB at VMID 0, after a
+// WAIT on the seqno so every earlier submit has finished), then a RELEASE_MEM writes back L2 and bumps the seqno.
+// Acquire saves the console into a backup in the pool; Release (and the close of the client) copies it back.
+// Nothing here writes a display register, so a fault costs a picture or a GPU hang, never the display state.
+struct Console { uint64_t off, len; uint32_t w, h, row; bool ok; };
+Console gCon;
+uint64_t gT0;
+constexpr uint32_t kDmaChunk = 32736;     // gfx11 CP DMA: 32767 bytes per packet, 32-aligned (radv_cp_dma.c)
+constexpr uint32_t kDmaDw = 7;            // PACKET3(DMA_DATA, 5)
+enum : uint32_t { kIbSave = N48N_SCAN_MAX_SLOTS, kIbRestore = N48N_SCAN_MAX_SLOTS + 1, kIbCount = N48N_SCAN_MAX_SLOTS + 2 };
+struct ScanSlot { bool used; uint32_t handle; uint64_t mc; uint32_t presents; uint64_t lastSeq; };
+struct Scan {
+	bool acquired;
+	uint32_t backupBlk, backupNblk;       // the saved console
+	uint32_t ibBlk, ibNblk;               // kIbCount IBs of ibBytes each
+	uint64_t ibBytes;                     // one IB, rounded up to 256 bytes
+	uint32_t ibDw;                        // dwords of one copy IB
+	ScanSlot slot[N48N_SCAN_MAX_SLOTS];
+	uint32_t front;
+	uint64_t presents, refused, lastPresentSeq;
+};
+Scan gScan;
+
 inline uint64_t pa_of(uint64_t vramOff) { return gFbOff + vramOff; }
 inline uint64_t off_of(uint64_t pa) { return pa - gFbOff; }
 inline uint64_t slot_off() { return navi33_slot_off(*gDev); }
@@ -143,8 +168,13 @@ void release_all() {
 }
 } // namespace
 
-void n33n_attach(DeviceContext &dev, uint64_t bootFbOff, uint64_t bootFbLen) {
+void n33n_attach(DeviceContext &dev, uint64_t bootFbOff, uint64_t bootFbLen, uint32_t conW, uint32_t conH, uint32_t conRow) {
 	gDev = &dev;
+	gCon = Console{};
+	if (bootFbOff != ~0ull && bootFbLen && conW && conH && conRow && (conRow & 3u) == 0 && conRow / 4u >= conW &&
+	    (uint64_t)conRow * conH == bootFbLen && bootFbOff + bootFbLen <= dev.bar0Size && (bootFbOff & 255u) == 0)
+		gCon = Console{ bootFbOff, bootFbLen, conW, conH, conRow, true };
+	gT0 = now_ns();
 	gFbOff = (uint64_t)RREG32(dev, navi33_gc_reg(dev, 0x15a7 /*GCMC_VM_FB_OFFSET*/, 0)) << 24;
 	gBlkFirst = (uint32_t)((dev.vramBase + (32ull << 20) + kBlk - 1) / kBlk);
 	gBlkEnd = (uint32_t)(dev.bar0Size / kBlk);
@@ -154,8 +184,9 @@ void n33n_attach(DeviceContext &dev, uint64_t bootFbOff, uint64_t bootFbLen) {
 		for (uint64_t b = bootFbOff / kBlk; b <= (bootFbOff + bootFbLen - 1) / kBlk && b < kMaxBlk; b++) gBlkState[b] = 2;
 	if (!gLock) gLock = IOLockAlloc();
 	gAvail = gLock != nullptr && gBlkEnd > gBlkFirst + (uint32_t)(kPtArena / kBlk) && navi33_queues_ready();
-	N33N_LOG("attach: pool vram+[%#llx, %#llx) %s, fb offset %#llx", (unsigned long long)gBlkFirst * kBlk,
-	         (unsigned long long)gBlkEnd * kBlk, gAvail ? "available" : "NOT available", (unsigned long long)gFbOff);
+	N33N_LOG("attach: pool vram+[%#llx, %#llx) %s, fb offset %#llx, console %ux%u row %u at vram+%#llx%s", (unsigned long long)gBlkFirst * kBlk,
+	         (unsigned long long)gBlkEnd * kBlk, gAvail ? "available" : "NOT available", (unsigned long long)gFbOff,
+	         conW, conH, conRow, (unsigned long long)bootFbOff, gCon.ok ? "" : " (no scanout: geometry unusable)");
 }
 bool n33n_available() { return gAvail; }
 bool n33n_is_open() { return __atomic_load_n(&gOpen, __ATOMIC_ACQUIRE) != 0; }
@@ -181,9 +212,12 @@ IOReturn n33n_open() {
 	return rc;
 }
 
+namespace { bool scan_end_locked(); }   // below, with the scanout
+
 void n33n_close(const char *how) {
 	if (!n33n_is_open()) return;
 	IOLockLock(gLock);
+	(void)scan_end_locked();                          // the console goes back before anything is freed
 	const bool idle = idle_wait();
 	if (idle) release_all();                          // a busy GPU keeps its memory (leaked until reboot)
 	gS.hello = false;
@@ -270,6 +304,8 @@ IOReturn n33n_bo_free(uint64_t handle) {
 		for (uint32_t i = 0; i < kMaxMaps; i++)
 			if (va_ent_used(gS.maps[i]) && gS.maps[i].handle == h) { if (idle) pt_unmap(gS.maps[i].start, gS.maps[i].size / kPage); gS.maps[i] = VaEnt{0, 0, 0, 0, 0}; unmapped = true; }
 		if (unmapped && idle) (void)flush();
+		for (uint32_t i = 0; i < N48N_SCAN_MAX_SLOTS; i++)
+			if (gScan.slot[i].used && gScan.slot[i].handle == h) gScan.slot[i] = ScanSlot{};   // a freed BO is no longer presentable
 		if (idle) { blk_free(gS.bo[h].blk, gS.bo[h].nblk); gS.vramUsed -= (uint64_t)gS.bo[h].nblk * kBlk; }
 		else rc = kIOReturnTimeout;                     // the memory is leaked: the GPU may still use it
 		gS.boUsed[h] = 0; gS.bo[h] = Bo{};
@@ -395,6 +431,188 @@ IOReturn n33n_wait(uint64_t target, uint64_t timeoutNs, uint64_t out[3]) {
 		if (el >= to) { out[0] = 1; out[1] = re; out[2] = em; return kIOReturnSuccess; }
 		if (el < 5000000ull) IODelay(2); else IOSleep(1);
 	}
+}
+
+namespace {
+uint64_t frame_now() { return (now_ns() - gT0) / 16666667ull; }   // no OTG read on Navi 33: a 60 Hz clock, for pacing only
+uint64_t ib_off(uint32_t which) { return (uint64_t)gScan.ibBlk * kBlk + (uint64_t)which * gScan.ibBytes; }
+
+// One copy IB: DMA_DATA packets moving `len` bytes from srcMc to dstMc through L2 (as RADV's CP DMA does on gfx11);
+// CP_SYNC on the last so the ME waits for every DMA before the RELEASE_MEM that follows the IB.
+void build_copy_ib(uint32_t which, uint64_t srcMc, uint64_t dstMc, uint64_t len) {
+	const uint64_t base = ib_off(which);
+	uint32_t pk[kDmaDw];
+	uint32_t dw = 0;
+	for (uint64_t done = 0; done < len; done += kDmaChunk) {
+		const uint32_t n = (uint32_t)((len - done) < kDmaChunk ? (len - done) : kDmaChunk);
+		const bool last = done + n >= len;
+		pk[0] = (3u << 30) | (5u << 16) | (0x50u << 8);                       // PACKET3(DMA_DATA, 5)
+		pk[1] = (3u << 20) /*DST_SEL L2*/ | (3u << 29) /*SRC_SEL L2*/ | (last ? 1u << 31 : 0u) /*CP_SYNC*/;   // ENGINE ME
+		pk[2] = (uint32_t)(srcMc + done); pk[3] = (uint32_t)((srcMc + done) >> 32);
+		pk[4] = (uint32_t)(dstMc + done); pk[5] = (uint32_t)((dstMc + done) >> 32);
+		pk[6] = n;                                                             // BYTE_COUNT
+		bar0_memcpy_to_vram(*gDev, base + (uint64_t)dw * 4, pk, sizeof(pk));
+		dw += kDmaDw;
+	}
+}
+
+// Ring: wait until every earlier submit has retired, run IB `which` (VMID 0), then bump the seqno. Caller holds gLock.
+bool run_copy_ib(uint32_t which, uint64_t *seqOut) {
+	uint32_t k = 0;
+	gSubmit[k++] = (3u << 30) | (5u << 16) | (0x3Cu << 8);                     // PACKET3(WAIT_REG_MEM, 5)
+	gSubmit[k++] = 5u /*>=*/ | (1u << 4) /*memory*/;                            // operation: wait; engine: ME
+	const uint64_t seqMc = gDev->vramMC(slot_off() + kSeqOff);
+	gSubmit[k++] = (uint32_t)seqMc & 0xFFFFFFFCu; gSubmit[k++] = (uint32_t)(seqMc >> 32);
+	gSubmit[k++] = (uint32_t)gS.emitted; gSubmit[k++] = 0xFFFFFFFFu; gSubmit[k++] = 4u;   // ref, mask, poll interval
+	const uint64_t ibMc = gDev->vramMC(ib_off(which));
+	gSubmit[k++] = (3u << 30) | (2u << 16) | (0x3Fu << 8);                     // PACKET3(INDIRECT_BUFFER, 2), as n33n_submit
+	gSubmit[k++] = (uint32_t)ibMc & 0xFFFFFFFCu; gSubmit[k++] = (uint32_t)(ibMc >> 32);
+	gSubmit[k++] = gScan.ibDw | (0u << 24);                                     // VMID 0: the IB and its addresses are MC
+	const uint64_t seq = gS.emitted + 1;
+	k += release_mem(gSubmit + k, seqMc, seq);
+	amdgpu_hdp_flush(*gDev);
+	if (!navi33_gfx_emit(*gDev, gSubmit, k)) return false;
+	gS.emitted = seq;
+	if (seqOut) *seqOut = seq;
+	return true;
+}
+
+// Puts the console back and frees the scanout memory. Caller holds gLock. True when the restore retired.
+bool scan_end_locked() {
+	if (!gScan.acquired) return true;
+	bool ok = run_copy_ib(kIbRestore, nullptr) && idle_wait();
+	if (ok) { blk_free(gScan.backupBlk, gScan.backupNblk); blk_free(gScan.ibBlk, gScan.ibNblk); }   // else leaked: the GPU may still read them
+	gScan = Scan{};
+	N33N_LOG("scanout: released, console restore %s", ok ? "retired" : "DID NOT retire");
+	return ok;
+}
+} // namespace
+
+IOReturn n33n_scan_query(n48n_scan_query *o) {
+	if (!hello()) return kIOReturnNotReady;
+	IOLockLock(gLock);
+	memset(o, 0, sizeof(*o));
+	if (gCon.ok) {
+		o->h_active = gCon.w; o->v_active = gCon.h; o->pitch_px = gCon.row / 4u;
+		o->hubp_format = N48N_SCAN_FMT_ARGB8888;
+		o->flags = N48N_SCANQ_LIT | N48N_SCANQ_NATIVE | N48N_SCANQ_GEOM_OK | (gScan.acquired ? N48N_SCANQ_ACQUIRED : 0u);
+		o->frame_count = frame_now();
+		o->console_mc = o->plane_mc = o->earliest_mc = gDev->vramMC(gCon.off);   // never flipped: the console stays the surface
+		o->acquired = gScan.acquired ? 1u : 0u;
+		o->plane_w = gCon.w; o->plane_h = gCon.h;
+	}
+	IOLockUnlock(gLock);
+	return kIOReturnSuccess;
+}
+
+IOReturn n33n_scan_acquire(uint64_t flags, uint64_t out[2]) {
+	if (!hello()) return kIOReturnNotReady;
+	if (flags != 0ull) return kIOReturnBadArgument;
+	if (!gCon.ok) return kIOReturnUnsupported;
+	IOLockLock(gLock);
+	IOReturn rc = kIOReturnSuccess;
+	do {
+		if (gScan.acquired) { rc = kIOReturnBusy; break; }
+		Scan sc {};
+		sc.ibDw = (uint32_t)((gCon.len + kDmaChunk - 1) / kDmaChunk) * kDmaDw;
+		sc.ibBytes = ((uint64_t)sc.ibDw * 4 + 255) & ~255ull;
+		sc.backupNblk = (uint32_t)((gCon.len + kBlk - 1) / kBlk);
+		sc.ibNblk = (uint32_t)((sc.ibBytes * kIbCount + kBlk - 1) / kBlk);
+		if (!blk_alloc(sc.backupNblk, 1, &sc.backupBlk)) { rc = kIOReturnNoMemory; break; }
+		if (!blk_alloc(sc.ibNblk, 1, &sc.ibBlk)) { blk_free(sc.backupBlk, sc.backupNblk); rc = kIOReturnNoMemory; break; }
+		sc.front = N48N_SCAN_NO_SLOT;
+		gScan = sc;
+		const uint64_t conMc = gDev->vramMC(gCon.off), bakMc = gDev->vramMC((uint64_t)sc.backupBlk * kBlk);
+		build_copy_ib(kIbSave, conMc, bakMc, gCon.len);
+		build_copy_ib(kIbRestore, bakMc, conMc, gCon.len);
+		if (!run_copy_ib(kIbSave, nullptr) || !idle_wait()) {
+			// the save did not retire: keep the memory (the GPU may still write it), give up the acquisition
+			N33N_LOG("scanout: acquire - the console save did not retire");
+			gScan = Scan{};
+			rc = kIOReturnTimeout; break;
+		}
+		gScan.acquired = true;
+		out[0] = conMc; out[1] = frame_now();
+		N33N_LOG("scanout: acquired %ux%u row %u, copy IB %u dwords", gCon.w, gCon.h, gCon.row, sc.ibDw);
+	} while (false);
+	IOLockUnlock(gLock);
+	return rc;
+}
+
+IOReturn n33n_scan_register(const n48n_scan_reg *in, uint64_t out[2]) {
+	if (!hello()) return kIOReturnNotReady;
+	if (in->reserved0 != 0u) return kIOReturnBadArgument;
+	IOLockLock(gLock);
+	IOReturn rc = kIOReturnSuccess;
+	do {
+		if (!gScan.acquired) { rc = kIOReturnNotReady; break; }
+		if (!id_live(gS.boUsed, N48N_MAX_BOS - 1, in->handle)) { rc = kIOReturnNotFound; break; }
+		if (in->format != N48N_SCAN_FMT_ARGB8888 || in->width != gCon.w || in->height != gCon.h || in->pitch_bytes != gCon.row ||
+		    (in->offset & 255ull) != 0) { rc = kIOReturnBadArgument; break; }
+		const Bo &b = gS.bo[in->handle];
+		if (in->offset > (uint64_t)b.nblk * kBlk || gCon.len > (uint64_t)b.nblk * kBlk - in->offset) { rc = kIOReturnBadArgument; break; }
+		uint32_t id = N48N_SCAN_NO_SLOT;
+		for (uint32_t i = 0; i < N48N_SCAN_MAX_SLOTS && id == N48N_SCAN_NO_SLOT; i++) if (!gScan.slot[i].used) id = i;
+		if (id == N48N_SCAN_NO_SLOT) { rc = kIOReturnNoResources; break; }
+		const uint64_t mc = gDev->vramMC(b.off + in->offset);
+		build_copy_ib(id, mc, gDev->vramMC(gCon.off), gCon.len);
+		gScan.slot[id] = ScanSlot{ true, in->handle, mc, 0, 0 };
+		out[0] = id; out[1] = mc;
+	} while (false);
+	IOLockUnlock(gLock);
+	return rc;
+}
+
+IOReturn n33n_scan_present(uint64_t slot, uint64_t flags, uint64_t out[3]) {
+	if (!hello()) return kIOReturnNotReady;
+	IOLockLock(gLock);
+	IOReturn rc = kIOReturnSuccess;
+	do {
+		if (!gScan.acquired) { rc = kIOReturnNotReady; break; }
+		if (flags != 0ull || slot >= N48N_SCAN_MAX_SLOTS || !gScan.slot[slot].used) { gScan.refused++; rc = kIOReturnBadArgument; break; }
+		uint64_t seq = 0;
+		if (!run_copy_ib((uint32_t)slot, &seq)) { gScan.refused++; rc = kIOReturnTimeout; break; }
+		ScanSlot &sl = gScan.slot[slot];
+		sl.presents++; sl.lastSeq = seq;
+		gScan.front = (uint32_t)slot; gScan.presents++; gScan.lastPresentSeq = seq;
+		out[0] = seq; out[1] = frame_now() + 1; out[2] = 0;
+	} while (false);
+	IOLockUnlock(gLock);
+	return rc;
+}
+
+IOReturn n33n_scan_status(n48n_scan_status *o) {
+	if (!hello()) return kIOReturnNotReady;
+	IOLockLock(gLock);
+	memset(o, 0, sizeof(*o));
+	const uint64_t re = retired();
+	o->acquired = gScan.acquired ? 1u : 0u;
+	o->front_slot = gScan.acquired ? gScan.front : N48N_SCAN_NO_SLOT;
+	o->pending_slot = N48N_SCAN_NO_SLOT;
+	if (gScan.acquired && gScan.lastPresentSeq > re) o->pending_slot = gScan.front;   // the copy has not retired yet
+	o->frame_count = frame_now();
+	if (gCon.ok) o->console_mc = o->plane_mc = o->earliest_mc = gDev->vramMC(gCon.off);
+	o->presents = gScan.presents;
+	o->latched = gScan.presents - (gScan.lastPresentSeq > re ? 1u : 0u);   // a present "latches" when its copy retired
+	o->refused = gScan.refused;
+	for (uint32_t i = 0; i < N48N_SCAN_MAX_SLOTS; i++) {
+		const ScanSlot &sl = gScan.slot[i];
+		if (!sl.used) continue;
+		o->slot[i].mc = sl.mc; o->slot[i].used = 1u; o->slot[i].presents = sl.presents;
+		o->slot[i].latches = sl.presents - (sl.lastSeq > re ? 1u : 0u);
+		o->slot[i].flags = sl.lastSeq > re ? N48N_SCANSLOT_PENDING : N48N_SCANSLOT_REUSABLE;
+	}
+	IOLockUnlock(gLock);
+	return kIOReturnSuccess;
+}
+
+IOReturn n33n_scan_release(uint64_t out[2]) {
+	if (!hello()) return kIOReturnNotReady;
+	IOLockLock(gLock);
+	const bool ok = scan_end_locked();
+	out[0] = ok ? 1u : 0u; out[1] = gCon.ok ? gDev->vramMC(gCon.off) : 0;
+	IOLockUnlock(gLock);
+	return kIOReturnSuccess;
 }
 
 IOReturn n33n_memory_for_handle(uint32_t handle, IOOptionBits *options, IOMemoryDescriptor **memory) {

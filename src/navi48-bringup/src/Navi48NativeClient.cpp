@@ -114,9 +114,32 @@ IOReturn IOAccelNavi48NativeClient::externalMethod(uint32_t selector, IOExternal
 		if (gSelRefusedLogged < 16u && OSIncrementAtomic((volatile SInt32 *)&gSelRefusedLogged) < 16) NCLOG("selector %u refused: not permitted for a uid-88 (non-administrator) client", selector);
 		return kIOReturnNotPrivileged;
 	}
-	// Navi 33: selectors 0..8 run on the gfx11 engine; scanout, DAL, mode, Metal nub and host import are not there yet.
+	// Navi 33: selectors 0..8 run on the gfx11 engine, 9..14 (scanout) on its copy-to-console present (navi33_native.cpp);
+	// DAL, mode, Metal nub and host import are not there yet. The n48dcn display layer (DCN 4.1) is never bound on a Navi 33.
 #define N33(fn) (n33 ? amdgpu::n33n_##fn : amdgpu::n1c_##fn)
-	if (n33 && selector > N48N_SEL_WAITSEQ) return kIOReturnUnsupported;
+	if (n33 && selector > N48N_SEL_SCAN_RELEASE) return kIOReturnUnsupported;
+	if (n33 && selector >= N48N_SEL_SCAN_QUERY) {
+		switch (selector) {
+		case N48N_SEL_SCAN_QUERY:
+			if (!shape(0, 0, 0, sizeof(n48n_scan_query))) return kIOReturnBadArgument;
+			return amdgpu::n33n_scan_query(static_cast<n48n_scan_query *>(args->structureOutput));
+		case N48N_SEL_SCAN_ACQUIRE:
+			if (!shape(1, 2, 0, 0)) return kIOReturnBadArgument;
+			return amdgpu::n33n_scan_acquire(si[0], so);
+		case N48N_SEL_SCAN_REGISTER:
+			if (!shape(0, 2, sizeof(n48n_scan_reg), 0)) return kIOReturnBadArgument;
+			return amdgpu::n33n_scan_register(static_cast<const n48n_scan_reg *>(args->structureInput), so);
+		case N48N_SEL_SCAN_PRESENT:
+			if (!shape(2, 3, 0, 0)) return kIOReturnBadArgument;
+			return amdgpu::n33n_scan_present(si[0], si[1], so);
+		case N48N_SEL_SCAN_STATUS:
+			if (!shape(0, 0, 0, sizeof(n48n_scan_status))) return kIOReturnBadArgument;
+			return amdgpu::n33n_scan_status(static_cast<n48n_scan_status *>(args->structureOutput));
+		default:   // N48N_SEL_SCAN_RELEASE
+			if (!shape(0, 2, 0, 0)) return kIOReturnBadArgument;
+			return amdgpu::n33n_scan_release(so);
+		}
+	}
 	switch (selector) {
 	case N48N_SEL_HELLO:
 		if (!shape(2, 4, 0, 0)) return kIOReturnBadArgument;

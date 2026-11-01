@@ -1,6 +1,7 @@
 //
 //  navi33_native.h - the N48N engine for Navi 33 (gfx11): the same selectors as native_s1c (n1c_*),
-//  on the queues and the VMID-8 address space that stages 9-12 brought up. Scanout is not here yet.
+//  on the queues and the VMID-8 address space that stages 9-12 brought up. Scanout (9..14) presents by
+//  COPYING the registered buffer into the boot console on the gfx queue; the display engine is never touched.
 //
 #pragma once
 #include <IOKit/IOTypes.h>
@@ -10,8 +11,9 @@
 
 namespace amdgpu {
 
-// Called once stage 12 passed: the engine becomes available to the user client.
-void n33n_attach(DeviceContext &dev, uint64_t bootFbOff, uint64_t bootFbLen);
+// Called once stage 12 passed: the engine becomes available to the user client. The console geometry
+// (width, height, row bytes) is 0 when start() could not locate the boot framebuffer: scanout is then refused.
+void n33n_attach(DeviceContext &dev, uint64_t bootFbOff, uint64_t bootFbLen, uint32_t conW, uint32_t conH, uint32_t conRow);
 bool n33n_available();
 
 IOReturn n33n_open();
@@ -28,5 +30,13 @@ IOReturn n33n_ctx(const n48n_ctx *in, n48n_ctx *out);
 IOReturn n33n_submit(const uint8_t *in, uint32_t size, uint64_t *seqOut);
 IOReturn n33n_wait(uint64_t target, uint64_t timeoutNs, uint64_t out[3]);
 IOReturn n33n_memory_for_handle(uint32_t handle, IOOptionBits *options, IOMemoryDescriptor **memory);
+
+// ABI 1.1 scanout, copy-to-console variant (see navi33_native.cpp "scanout").
+IOReturn n33n_scan_query(n48n_scan_query *out);
+IOReturn n33n_scan_acquire(uint64_t flags, uint64_t out[2]);
+IOReturn n33n_scan_register(const n48n_scan_reg *in, uint64_t out[2]);
+IOReturn n33n_scan_present(uint64_t slot, uint64_t flags, uint64_t out[3]);
+IOReturn n33n_scan_status(n48n_scan_status *out);
+IOReturn n33n_scan_release(uint64_t out[2]);
 
 } // namespace amdgpu
