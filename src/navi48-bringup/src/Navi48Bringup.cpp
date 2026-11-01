@@ -8022,6 +8022,10 @@ bool Navi48Bringup::start(IOService *provider) {
 			if (profile->gen == amdgpu::GpuGeneration::Navi33) stagePSPNavi33();
 
 			N48LOG("start: survey complete — attaching read-only so `navi48test log` can read it back.");
+			// Register like the full path below does: IOServiceGetMatchingService (Mesa's
+			// ac_darwin_iokit.c, navi48test) only sees registered services, so without this
+			// the N33 app door is loaded and "ready" but no client can find it to open.
+			registerService();
 			return true;
 		}
 
@@ -8051,6 +8055,7 @@ bool Navi48Bringup::start(IOService *provider) {
 		const amdgpu::AsicProfile *profile = amdgpu::activeProfile();
 		if (profile != nullptr && profile->gen == amdgpu::GpuGeneration::Navi33) {
 			N48LOG("start: Navi33 refuses to continue past discovery — the DCN 4.1 and accel paths are gfx12-only.");
+			registerService();   // findable by clients, as above
 			return true;
 		}
 	}
