@@ -1,20 +1,21 @@
-From 7908c3225a23084f48b6ee384b66e8e4ae6da480 Mon Sep 17 00:00:00 2001
+From 1073cb553a66f53e71554af756785d1817e53d0c Mon Sep 17 00:00:00 2001
 From: Navi48-MacOS contributors <noreply@example.invalid>
-Date: Sat, 31 Oct 2026 10:51:58 -0700
-Subject: [PATCH 6/6] radv: Darwin: pick the canned device from the kext's GC
+Date: Sun, 1 Nov 2026 11:14:10 -0800
+Subject: [PATCH 10/10] radv: Darwin: pick the canned device from the kext's GC
  version (Navi 33 / gfx1102)
 
 The Darwin backend always answered device-info queries from the canned
 gfx1201 (Navi 48) entry.  The kext reports its GC version in QueryInfo, so
 the handshake now picks the drm-shim entry from it: 12.0.1 -> "gfx1201",
 11.0.2 -> "navi33" (RX 7600, device 0x7480, the entry Mesa already ships).
-GB_ADDR_CONFIG is checked against the chosen entry's own recorded value
-instead of the gfx1201 constant.  The marketing name follows the device too
-(7480 -> "AMD Radeon RX 7600").  RADV_DARWIN_CANNED=<name> overrides the
-choice (and picks the entry for the RADV_DARWIN_HOST_BO stand-in, default
-gfx1201).  RADV_DARWIN_MOCK_N33=1 makes the mock answer as the RX 7600 kext
-(GC 11.0.2, GB_ADDR_CONFIG 0x343).  The PRT half-VA reservation stays: Linux
-uses it for gfx11 too.
+GB_ADDR_CONFIG (from QueryInfo, ReadRegs as the fallback, as 0007 does) is
+checked against the chosen entry's own recorded value instead of the gfx1201
+constant.  The marketing name follows the device too (7480 -> "AMD Radeon
+RX 7600").  RADV_DARWIN_CANNED=<name> overrides the choice (and picks the
+entry for the RADV_DARWIN_HOST_BO stand-in, default gfx1201).
+RADV_DARWIN_MOCK_N33=1 makes the mock answer as the RX 7600 kext (GC 11.0.2,
+GB_ADDR_CONFIG 0x343).  The PRT half-VA reservation stays: Linux uses it for
+gfx11 too.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -25,10 +26,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 108 insertions(+), 27 deletions(-)
 
 diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
-index ea10051..f02b27c 100644
+index 9e35f84..05a5bac 100644
 --- a/src/amd/common/darwin/ac_darwin_drm.c
 +++ b/src/amd/common/darwin/ac_darwin_drm.c
-@@ -25,8 +25,6 @@
+@@ -26,8 +26,6 @@
  #define ACD_DRM_MAJOR AC_AMDGPU_DRM_MAJOR
  #define ACD_DRM_MINOR AC_AMDGPU_DRM_MINOR
  
@@ -37,7 +38,7 @@ index ea10051..f02b27c 100644
  
  #define ACD_METADATA_MAX 256
  /* How long a submit blocks on a dependency that was never submitted (WAIT_FOR_SUBMIT). */
-@@ -60,6 +58,7 @@ struct acd_core {
+@@ -61,6 +59,7 @@ struct acd_core {
     int refcount;
     uint32_t minor; /* ABI minor the kernel reported */
     bool shared; /* the process-wide core (false: the private HOST_BO stand-in core) */
@@ -45,7 +46,7 @@ index ea10051..f02b27c 100644
     struct acd_kext *kext; /* NULL in the HOST_BO stand-in */
     struct amdgpu_va_manager *va_mgr;
     struct util_sync_provider *sync; /* master; every device holds a clone */
-@@ -113,9 +112,45 @@ env_is_1(const char *name)
+@@ -114,9 +113,45 @@ env_is_1(const char *name)
     return v && v[0] == '1';
  }
  
@@ -92,7 +93,7 @@ index ea10051..f02b27c 100644
  {
     struct acd_hello h;
     int r = acd_kext_hello(kext, &h);
-@@ -141,6 +176,16 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+@@ -142,6 +177,16 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
        return r;
     }
  
@@ -106,12 +107,12 @@ index ea10051..f02b27c 100644
 +      return -ENODEV;
 +   }
 +
-    /* GB_ADDR_CONFIG: the tiling layout the canned info and S1d's image assume. */
-    uint32_t gb = 0;
-    r = acd_kext_read_regs(kext, ACD_GB_ADDR_CONFIG_REG, 1, &gb);
-@@ -148,10 +193,10 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
-       fprintf(stderr, "radv-darwin: ReadRegs(GB_ADDR_CONFIG) failed: %d\n", r);
-       return r;
+    /* GB_ADDR_CONFIG: the tiling layout the canned info and S1d's image assume. QueryInfo carries the live value
+     * (n48n_info.gb_addr_config); ReadRegs is root-only and refused for a user-application (G4 APP) session, so it is
+     * only the fallback for a kernel that left the field 0. */
+@@ -153,10 +198,10 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+          return r;
+       }
     }
 -   if (gb != ACD_GB_ADDR_CONFIG_GFX1201 && !env_is_1("RADV_DARWIN_ALLOW_ADDRCFG")) {
 -      fprintf(stderr, "radv-darwin: live GB_ADDR_CONFIG 0x%08x != canned gfx1201 0x%08x (set "
@@ -123,7 +124,7 @@ index ea10051..f02b27c 100644
        return -ENODEV;
     }
  
-@@ -172,11 +217,13 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+@@ -177,11 +222,13 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
     static bool logged;
     if (!logged) {
        logged = true;
@@ -140,7 +141,7 @@ index ea10051..f02b27c 100644
     return 0;
  }
  
-@@ -188,10 +235,13 @@ acd_device_kext(acd_device_handle dev, uint32_t *abi_minor)
+@@ -193,10 +240,13 @@ acd_device_kext(acd_device_handle dev, uint32_t *abi_minor)
     return dev->core->kext;
  }
  
@@ -156,7 +157,7 @@ index ea10051..f02b27c 100644
     struct acd_core *c = calloc(1, sizeof(*c));
     if (!c)
        return -ENOMEM;
-@@ -201,7 +251,7 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+@@ -206,7 +256,7 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
     if (!host_bo) {
        int r = acd_kext_open(&c->kext);
        if (r == 0)
@@ -165,7 +166,7 @@ index ea10051..f02b27c 100644
        if (r) {
           acd_kext_destroy(c->kext);
           pthread_mutex_destroy(&c->bo_lock);
-@@ -210,6 +260,20 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+@@ -215,6 +265,20 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
        }
     }
  
@@ -186,7 +187,7 @@ index ea10051..f02b27c 100644
     const struct acd_sync_backend be = {.wait_seq = acd_backend_wait_seq, .ctx = c->kext};
     c->sync = acd_sync_provider_create(c->kext ? &be : NULL);
     c->va_mgr = amdgpu_va_manager_alloc();
-@@ -224,7 +288,7 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+@@ -229,7 +293,7 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
     }
  
     const struct drm_amdgpu_info_device *di = &canned->dev;
@@ -195,7 +196,7 @@ index ea10051..f02b27c 100644
     amdgpu_va_manager_init2(c->va_mgr, di->virtual_address_offset, di->virtual_address_max, di->high_va_offset,
                             di->high_va_max, di->virtual_address_alignment, AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT);
     *out = c;
-@@ -252,25 +316,19 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+@@ -257,25 +321,19 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
     if (!dev)
        return -ENOMEM;
  
@@ -223,7 +224,7 @@ index ea10051..f02b27c 100644
           if (r == 0) {
              g_core->shared = true;
              dev->core = g_core;
-@@ -282,6 +340,7 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+@@ -287,6 +345,7 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
        free(dev);
        return r;
     }
@@ -231,15 +232,12 @@ index ea10051..f02b27c 100644
  
     dev->sync = dev->core->sync->clone(dev->core->sync);
     if (!dev->sync) {
-@@ -323,10 +382,15 @@ acd_device_get_sync_provider(acd_device_handle dev)
-    return dev->sync;
- }
- 
-+/* amdgpu.ids names for the canned devices: 7550,C0 and 7480,CF. */
+@@ -331,7 +390,12 @@ acd_device_get_sync_provider(acd_device_handle dev)
  const char *
  acd_get_marketing_name(acd_device_handle dev)
  {
 -   return ACD_MARKETING_NAME;
++   /* amdgpu.ids names for the canned devices: 7550,C0 and 7480,CF. */
 +   switch (dev->canned->dev.device_id) {
 +   case 0x7550: return "AMD Radeon RX 9070 XT";
 +   case 0x7480: return "AMD Radeon RX 7600";
@@ -266,10 +264,10 @@ index 0d92684..4066a7a 100644
   * kext's native client (ac_darwin_kext.c, contract NATIVE-S1C-ABI.md).
   *
 diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
-index b65ea41..12f220b 100644
+index 115188e..b36e46f 100644
 --- a/src/amd/common/darwin/ac_darwin_kext.h
 +++ b/src/amd/common/darwin/ac_darwin_kext.h
-@@ -64,6 +64,7 @@ enum acd_sel {
+@@ -73,6 +73,7 @@ enum acd_sel {
  
  #define ACD_TIMEOUT_INFINITE    0xffffffffffffffffull /* == AMDGPU_TIMEOUT_INFINITE */
  #define ACD_GB_ADDR_CONFIG_GFX1201 0x08200545u
