@@ -91,6 +91,10 @@ fill_test(VkPhysicalDevice pd)
    DLOAD(vkQueueSubmit);
    DLOAD(vkWaitForFences);
    DLOAD(vkDeviceWaitIdle);
+   DLOAD(vkDestroyFence);
+   DLOAD(vkDestroyCommandPool);
+   DLOAD(vkDestroyBuffer);
+   DLOAD(vkFreeMemory);
    DLOAD(vkDestroyDevice);
 
    VkQueue q;
@@ -161,8 +165,13 @@ fill_test(VkPhysicalDevice pd)
       return 3;
    }
    printf("FILL OK: all %llu dwords are 0x%08x\n", (unsigned long long)(size / 4), magic);
+   fflush(stdout);
    vkDeviceWaitIdle(dev);
-   vkDestroyDevice(dev, NULL); /* the rest is freed with the device and at process exit */
+   vkDestroyFence(dev, fence, NULL);
+   vkDestroyCommandPool(dev, pool, NULL);
+   vkDestroyBuffer(dev, buf, NULL);
+   vkFreeMemory(dev, mem, NULL);
+   vkDestroyDevice(dev, NULL);
    return 0;
 }
 
@@ -239,6 +248,15 @@ triangle_test(VkPhysicalDevice pd)
    DLOAD(vkQueueSubmit);
    DLOAD(vkWaitForFences);
    DLOAD(vkDeviceWaitIdle);
+   DLOAD(vkDestroyFence);
+   DLOAD(vkDestroyCommandPool);
+   DLOAD(vkDestroyPipeline);
+   DLOAD(vkDestroyPipelineLayout);
+   DLOAD(vkDestroyShaderModule);
+   DLOAD(vkDestroyBuffer);
+   DLOAD(vkDestroyImageView);
+   DLOAD(vkDestroyImage);
+   DLOAD(vkFreeMemory);
    DLOAD(vkDestroyDevice);
 
    VkQueue q;
@@ -416,12 +434,26 @@ triangle_test(VkPhysicalDevice pd)
          printf("wrote triangle.ppm\n");
       }
       printf("TRIANGLE WRONG\n");
-      return 3;
+   } else {
+      printf("TRIANGLE OK: red top-left half, blue bottom-right half\n");
    }
-   printf("TRIANGLE OK: red top-left half, blue bottom-right half\n");
+   fflush(stdout);
+
+   /* Every child object goes before the device: Mesa's debug build asserts on leftovers. */
    vkDeviceWaitIdle(dev);
+   vkDestroyFence(dev, fence, NULL);
+   vkDestroyCommandPool(dev, pool, NULL);
+   vkDestroyPipeline(dev, pipe, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyShaderModule(dev, vs, NULL);
+   vkDestroyShaderModule(dev, fs, NULL);
+   vkDestroyBuffer(dev, buf, NULL);
+   vkFreeMemory(dev, bmem, NULL);
+   vkDestroyImageView(dev, view, NULL);
+   vkDestroyImage(dev, img, NULL);
+   vkFreeMemory(dev, imem, NULL);
    vkDestroyDevice(dev, NULL);
-   return 0;
+   return ok ? 0 : 3;
 }
 
 int
