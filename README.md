@@ -59,6 +59,15 @@ monitors needed, and many pieces work around one specific macOS build.
 - Display modes from each monitor's EDID instead of fixed modes
 - Hardware video decoding
 
+## RX 7600 (Navi 33 / gfx1102) port
+
+This fork extends the kext to the RX 7600 (PCI 0x7480). Working on real hardware: the full bring-up
+(PSP, SMU, gfx/compute/SDMA queues, VMID-8 page tables), RADV on the Darwin backend (Mesa patch 0010
+picks the canned `navi33` device from the GC version the kext reports), a compute fill, a triangle and a
+full-screen present (copied into the boot console; the DCN 3.2 display engine is not driven yet). The
+Metal side is next. Build Mesa on the Mac with `tools/build-mesa-mac.sh`; status and next steps are in
+`notes/NAVI33-NEXT.md`.
+
 ## Can I install this?
 
 **Not yet.** Wait for the first public release; it will come with an installer and a
