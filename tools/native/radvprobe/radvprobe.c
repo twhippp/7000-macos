@@ -2,7 +2,7 @@
  * radvprobe: load libvulkan_radeon.dylib directly (no Vulkan loader), create an instance and
  * print the physical device RADV enumerates: name, PCI id, API version, queues, memory heaps.
  *
- *   radvprobe [path/to/libvulkan_radeon.dylib] [--fill] [--triangle]
+ *   radvprobe [path/to/libvulkan_radeon.dylib] [--fill] [--triangle] [--present]
  *
  * --fill also creates a device, fills a 64 KiB host-visible buffer with vkCmdFillBuffer on the
  * first graphics/compute queue, waits up to 5 s on a fence and checks every dword. That is the
@@ -13,12 +13,16 @@
  * the corners and the red pixel count (2016..2080 of 4096: the 64 pixels on the diagonal go either
  * way by the fill rule). On failure it writes the pixels to triangle.ppm for a look.
  *
+ * --present draws the same picture at the console's size and shows it through the kext's scanout
+ * (radv_darwin_scanout_*): acquire, register, present, hold 5 s, release (the console comes back).
+ *
  * Safe check with no GPU access:  RADV_DARWIN_MOCK=1 RADV_DARWIN_MOCK_N33=1 radvprobe <dylib>
  * Exit: 0 ok, 1 load/instance failure, 2 no device, 3 fill failed or wrong data.
  *
  * Build: clang -std=gnu11 -O1 -I <mesa>/include radvprobe.c -o radvprobe
  */
 #include <dlfcn.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +36,25 @@ typedef VkResult (*PFN_icdNegotiate)(uint32_t *);
 
 static PFN_icdGIPA gipa;
 static VkInstance inst;
+static void *g_lib;
+
+/* radv_darwin_scanout.h (Mesa patch 0003), looked up with dlsym; the structs are those of the kext ABI. */
+struct n48n_scan_query {
+   uint32_t h_active, v_active, h_total, v_total, pitch_px, hubp_format, sw_mode, otg;
+   uint32_t refresh_mhz, pix_clk_khz, dcc_en, flags;
+   uint64_t frame_count, console_mc, plane_mc, earliest_mc;
+   uint32_t acquired, plane_w, plane_h, reserved;
+};
+struct n48n_scan_status_head { /* the first 64 bytes of n48n_scan_status (256 B) */
+   uint32_t acquired, flags, front_slot, pending_slot;
+   uint64_t frame_count, console_mc, plane_mc, earliest_mc, presents, latched;
+};
+typedef int (*PFN_scan_query)(VkDevice, struct n48n_scan_query *);
+typedef int (*PFN_scan_acquire)(VkDevice, uint64_t *, uint64_t *);
+typedef int (*PFN_scan_register)(VkDevice, VkDeviceMemory, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t *, uint64_t *);
+typedef int (*PFN_scan_present)(VkDevice, uint32_t, uint64_t[3]);
+typedef int (*PFN_scan_status)(VkDevice, void *);
+typedef int (*PFN_scan_release)(VkDevice, uint64_t[2]);
 
 #define LOAD(name) PFN_##name name = (PFN_##name)gipa(inst, #name)
 #define CHECK(call)                                                                                \
@@ -185,11 +208,13 @@ find_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t bits, VkMemoryPro
    return UINT32_MAX;
 }
 
+/* present == 0: the 64x64 RGBA8 check.  present == 1: the same picture at the console's size in B8G8R8A8, copied
+ * into a registered scanout buffer and presented through the kext; held for 5 s, then the console is given back. */
 static int
-triangle_test(VkPhysicalDevice pd)
+triangle_test(VkPhysicalDevice pd, int present)
 {
-   enum { W = 64, H = 64 };
-   const VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+   uint32_t W = 64, H = 64, rowPx = 64;
+   const VkFormat fmt = present ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
    LOAD(vkGetPhysicalDeviceQueueFamilyProperties);
    LOAD(vkGetPhysicalDeviceMemoryProperties);
    LOAD(vkCreateDevice);
@@ -264,6 +289,36 @@ triangle_test(VkPhysicalDevice pd)
    VkPhysicalDeviceMemoryProperties mp;
    vkGetPhysicalDeviceMemoryProperties(pd, &mp);
 
+   PFN_scan_query scan_query = NULL;
+   PFN_scan_acquire scan_acquire = NULL;
+   PFN_scan_register scan_register = NULL;
+   PFN_scan_present scan_present = NULL;
+   PFN_scan_status scan_status = NULL;
+   PFN_scan_release scan_release = NULL;
+   if (present) {
+      scan_query = (PFN_scan_query)dlsym(g_lib, "radv_darwin_scanout_query");
+      scan_acquire = (PFN_scan_acquire)dlsym(g_lib, "radv_darwin_scanout_acquire");
+      scan_register = (PFN_scan_register)dlsym(g_lib, "radv_darwin_scanout_register");
+      scan_present = (PFN_scan_present)dlsym(g_lib, "radv_darwin_scanout_present");
+      scan_status = (PFN_scan_status)dlsym(g_lib, "radv_darwin_scanout_status");
+      scan_release = (PFN_scan_release)dlsym(g_lib, "radv_darwin_scanout_release");
+      if (!scan_query || !scan_acquire || !scan_register || !scan_present || !scan_status || !scan_release) {
+         fprintf(stderr, "radvprobe: this driver has no radv_darwin_scanout_* (not the macOS RADV build)\n");
+         return 3;
+      }
+      struct n48n_scan_query sq;
+      int r = scan_query(dev, &sq);
+      if (r || !sq.plane_w || !sq.plane_h || sq.pitch_px < sq.plane_w) {
+         fprintf(stderr, "radvprobe: scanout query -> %d, plane %ux%u pitch %u px, flags 0x%x\n", r, sq.plane_w, sq.plane_h,
+                 sq.pitch_px, sq.flags);
+         return 3;
+      }
+      W = sq.plane_w;
+      H = sq.plane_h;
+      rowPx = sq.pitch_px;
+      printf("scanout: console %ux%u, pitch %u px, flags 0x%x\n", W, H, rowPx, sq.flags);
+   }
+
    /* the render target */
    VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
                             .format = fmt, .extent = {W, H, 1}, .mipLevels = 1, .arrayLayers = 1,
@@ -287,16 +342,19 @@ triangle_test(VkPhysicalDevice pd)
    VkImageView view;
    CHECK(vkCreateImageView(dev, &vci, NULL, &view));
 
-   /* the readback buffer */
-   const VkDeviceSize bytes = W * H * 4;
+   /* the readback buffer; for --present the scanout buffer (visible VRAM, the console's pitch) */
+   const VkDeviceSize bytes = (VkDeviceSize)rowPx * H * 4;
    VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
    VkBuffer buf;
    CHECK(vkCreateBuffer(dev, &bci, NULL, &buf));
    vkGetBufferMemoryRequirements(dev, buf, &mr);
-   t = find_type(&mp, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+   t = find_type(&mp, mr.memoryTypeBits,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                    (present ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0));
    if (t == UINT32_MAX) {
-      fprintf(stderr, "radvprobe: no host-visible coherent memory type for the readback buffer\n");
+      fprintf(stderr, "radvprobe: no host-visible coherent%s memory type for the %s buffer\n", present ? " device-local" : "",
+              present ? "scanout" : "readback");
       return 3;
    }
    mai.allocationSize = mr.size;
@@ -306,7 +364,8 @@ triangle_test(VkPhysicalDevice pd)
    CHECK(vkBindBufferMemory(dev, buf, bmem, 0));
    uint32_t *px;
    CHECK(vkMapMemory(dev, bmem, 0, bytes, 0, (void **)&px));
-   memset(px, 0x55, bytes); /* neither red nor blue: an untouched buffer cannot pass */
+   if (!present)
+      memset(px, 0x55, bytes); /* neither red nor blue: an untouched buffer cannot pass */
 
    /* the pipeline */
    VkShaderModuleCreateInfo smi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -388,7 +447,8 @@ triangle_test(VkPhysicalDevice pd)
    ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
                         NULL, 0, NULL, 1, &ib);
-   VkBufferImageCopy reg = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {W, H, 1}};
+   VkBufferImageCopy reg = {.bufferRowLength = rowPx, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                            .imageExtent = {W, H, 1}};
    vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
@@ -406,6 +466,43 @@ triangle_test(VkPhysicalDevice pd)
       return 3;
    }
 
+   int ok;
+   if (present) {
+      /* B8G8R8A8 dword = 0xAARRGGBB: spot-check two pixels through the (slow, uncached) CPU map */
+      const uint32_t tl = px[2 * rowPx + 2], br = px[(H - 3) * rowPx + (W - 3)];
+      printf("rendered %ux%u: top-left 0x%08x (want 0xffff0000), bottom-right 0x%08x (want 0xff0000ff)\n", W, H, tl, br);
+      uint64_t con = 0, fc = 0, so[3] = {0, 0, 0}, ro[2] = {0, 0};
+      uint32_t slot = 0;
+      uint64_t slot_mc = 0;
+      int r = scan_acquire(dev, &con, &fc);
+      printf("scanout acquire -> %d (console MC 0x%llx)\n", r, (unsigned long long)con);
+      if (!r) {
+         r = scan_register(dev, bmem, 0, rowPx * 4, W, H, &slot, &slot_mc);
+         printf("scanout register -> %d (slot %u, MC 0x%llx)\n", r, slot, (unsigned long long)slot_mc);
+      }
+      if (!r) {
+         r = scan_present(dev, slot, so);
+         printf("scanout present -> %d (present id %llu)\n", r, (unsigned long long)so[0]);
+      }
+      if (!r) {
+         printf("ON SCREEN NOW: red triangle top-left, blue bottom-right. Holding 5 s...\n");
+         fflush(stdout);
+         for (int i = 0; i < 5; i++) {
+            sleep(1);
+            uint8_t st[256];
+            memset(st, 0, sizeof(st));
+            if (!scan_status(dev, st)) {
+               const struct n48n_scan_status_head *h = (const void *)st;
+               printf("  status: presents %llu, done %llu, front slot %u\n", (unsigned long long)h->presents,
+                      (unsigned long long)h->latched, h->front_slot);
+            }
+         }
+      }
+      int rr = scan_release(dev, ro);
+      printf("scanout release -> %d (console restored: %s)\n", rr, ro[0] ? "yes" : "NO");
+      ok = !r && !rr && ro[0];
+      printf("%s\n", ok ? "PRESENT OK (did the picture show?)" : "PRESENT FAILED");
+   } else {
    /* check: R8G8B8A8 little-endian dword = 0xAABBGGRR */
    const uint32_t RED = 0xFF0000FFu, BLUE = 0xFFFF0000u;
    uint32_t red = 0, blue = 0, other = 0, first_other = 0;
@@ -419,7 +516,7 @@ triangle_test(VkPhysicalDevice pd)
    }
    const uint32_t tl = px[2 * W + 2], br = px[(H - 3) * W + (W - 3)];
    printf("pixels: %u red, %u blue, %u other; top-left 0x%08x, bottom-right 0x%08x\n", red, blue, other, tl, br);
-   const int ok = tl == RED && br == BLUE && other == 0 && red >= 2016 && red <= 2080;
+   ok = tl == RED && br == BLUE && other == 0 && red >= 2016 && red <= 2080;
    if (!ok) {
       if (other)
          printf("first other pixel at (%u,%u) = 0x%08x\n", first_other % W, first_other / W, px[first_other]);
@@ -437,6 +534,7 @@ triangle_test(VkPhysicalDevice pd)
    } else {
       printf("TRIANGLE OK: red top-left half, blue bottom-right half\n");
    }
+   } /* !present */
    fflush(stdout);
 
    /* Every child object goes before the device: Mesa's debug build asserts on leftovers. */
@@ -460,17 +558,20 @@ int
 main(int argc, char **argv)
 {
    const char *path = "libvulkan_radeon.dylib";
-   int fill = 0, tri = 0;
+   int fill = 0, tri = 0, pres = 0;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--fill"))
          fill = 1;
       else if (!strcmp(argv[i], "--triangle"))
          tri = 1;
+      else if (!strcmp(argv[i], "--present"))
+         pres = 1;
       else
          path = argv[i];
    }
 
    void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+   g_lib = lib;
    if (!lib) {
       fprintf(stderr, "radvprobe: dlopen %s: %s\n", path, dlerror());
       return 1;
@@ -539,7 +640,12 @@ main(int argc, char **argv)
       if (r)
          return r;
    }
-   if (tri)
-      return triangle_test(pds[0]);
+   if (tri) {
+      int r = triangle_test(pds[0], 0);
+      if (r)
+         return r;
+   }
+   if (pres)
+      return triangle_test(pds[0], 1);
    return 0;
 }
