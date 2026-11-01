@@ -30,11 +30,16 @@ is in: `N33,Native` says ready.
   `~/navi48-native/tools`. The tools/build-mesa-mac.sh handles both.
 - Kext with the GB_ADDR_CONFIG fix: CI run 41226717600 (workflow_dispatch on this branch).
 
+- 2026-10-31, real RX 7600 (kext build 33012 + registerService fix, CI run 41261603715):
+  radvprobe lists "AMD Radeon RX 7600 (RADV NAVI33)", 0x7480, GC 11.0.2 -> canned navi33,
+  GB_ADDR_CONFIG 0x343, VRAM 216 MiB visible + 0 hi, GTT cap 512 MiB.
+  `radvprobe --fill`: device created, vkCmdFillBuffer 64 KiB (RADV's compute-shader fill on the
+  gfx queue, VMID 8) -> FILL OK, 16384/16384 0xdeadbeef. First Vulkan work on Navi 33 under macOS.
+- Known limits: only the gfx queue (compute/transfer submits are refused by cs_parse), all BOs in
+  the BAR0-visible pool (216 MiB), GTT requests also land there.
+
 ## Next
-1. Mock check (`RADV_DARWIN_MOCK=1 RADV_DARWIN_MOCK_N33=1`); needs a vulkaninfo or a small
-   vkEnumeratePhysicalDevices test, none on the Mac yet.
-2. Load the new kext, then real `vulkaninfo` against it: expect "GC 11.0.2 -> canned navi33".
-3. First real submit (a vkCmdFillBuffer / compute dispatch) on the gfx queue through VMID 8.
+1-3. Done (mock check, real enumerate, first submit: see Status).
 4. Things gfx11 RADV may want that gfx12 didn't: check for READ_MMR_REG of anything beyond
    GB_ADDR_CONFIG, and the firmware versions RADV gates features on (canned me 2390 / pfp 2530 /
    mec 2600 vs what the kext loaded).
