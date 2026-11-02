@@ -216,6 +216,7 @@ void n33n_attach(DeviceContext &dev, uint64_t bootFbOff, uint64_t bootFbLen, uin
 bool n33n_available() { return gAvail; }
 bool n33n_is_open() { return __atomic_load_n(&gOpen, __ATOMIC_ACQUIRE) != 0; }
 bool n33n_hello_done() { return hello(); }
+bool n33n_scan_acquired() { return __atomic_load_n(&gScan.acquired, __ATOMIC_ACQUIRE); }   // 0.0.670: the display pipe's "a native client owns the plane"
 
 IOReturn n33n_open() {
 	if (!gAvail) return kIOReturnNotReady;

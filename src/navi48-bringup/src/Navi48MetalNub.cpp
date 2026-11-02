@@ -35,7 +35,9 @@ OSDefineMetaClassAndStructors(Navi48MetalNub, IOService)
 // 0.0.613: the mask the aux kext's factories see (op_factory_mask below, and the display glue's fact check): the boot-arg navi48-metal-fact mask, read on every call as before, plus the
 // fact bits `pipe adopt` turned on at run time. With boot-arg navi48-metal-disp absent the OR is a no-op (n48disp::fact_mask returns the base mask): the 0.0.612 value, bit for bit.
 // The display pipe (n48disp) drives DCN 4.1: never on a Navi 33, whatever the boot-args say.
-static bool disp_on() { return n48disp_latched_on() && !amdgpu::n33n_available(); }
+// 0.0.670: on a Navi 33 too: the display pipe glue (native_disp.cpp) writes no display register; its vblank stamps run on a 60 Hz clock there and its
+// "plane owned" test is the copy-to-console scanout. Still OFF unless boot-arg navi48-metal-disp=1.
+static bool disp_on() { return n48disp_latched_on(); }
 
 uint32_t n48metal_factory_mask_now(void) {
 	uint32_t v = 0;

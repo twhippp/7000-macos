@@ -21,6 +21,7 @@
 #include "native_disp.h"
 #include "native_disp_flow.h"
 #include "../dcn/navi48_dcn.hpp"   // 0.0.617 (K6): n48dcn::scanActive()
+#include "navi33_native.h"   // 0.0.670: n33n_available / n33n_scan_acquired (the Navi 33 copy-to-console scanout)
 #include "native_s1c.h"      // n1c_hung(): the HUNG latch (0.0.616: the prepared-descriptor cache leaks instead of completing under it)
 #include "amdgpu_log.h"
 #include "Navi48MetalNub.hpp"
@@ -157,7 +158,10 @@ struct KernelEnv {
         uint64_t perSec = 0;
         nanoseconds_to_absolutetime(1000000000ull, &perSec);
         if (perSec == 0ull || perSec > 0xffffffffull) return false;
-        if (!n48dcn::vblSample(&s->periodNs, &s->delayNs, &s->nowAbs)) return false;
+        if (amdgpu::n33n_available()) {   // 0.0.670: a Navi 33 has no OTG driven by us; the console is stamped on a 60 Hz clock (the GOP mode's refresh)
+            uint64_t now = 0, ns = 0; clock_get_uptime(&now); absolutetime_to_nanoseconds(now, &ns);
+            s->periodNs = 16666667ull; s->delayNs = s->periodNs - (ns % s->periodNs); s->nowAbs = now;
+        } else if (!n48dcn::vblSample(&s->periodNs, &s->delayNs, &s->nowAbs)) return false;
         s->numer = 1000000000u; s->denom = (uint32_t)perSec;
         return true;
     }
@@ -171,7 +175,7 @@ struct KernelEnv {
             DLOG("vbl stamps: %s (reason %u) #%llu; t_vbl %llu next %llu (abs), period %llu ns, to next vblank %llu ns", n48disp::vbl_name(r), (unsigned)r, (unsigned long long)n,
                  (unsigned long long)p.t, (unsigned long long)p.next, (unsigned long long)periodNs, (unsigned long long)delayNs);
     }
-    bool scan_active() { return n48dcn::scanActive(); }                  // 0.0.617 (K6): one atomic load
+    bool scan_active() { return amdgpu::n33n_available() ? amdgpu::n33n_scan_acquired() : n48dcn::scanActive(); }   // 0.0.670: the Navi 33 copy-to-console plane                  // 0.0.617 (K6): one atomic load
     void note_scan_owned_submit() { __atomic_add_fetch(&gD.submitScanSkipped, 1ull, __ATOMIC_RELAXED); }
     // -- 0.0.659 (M6 Stage 1a): the latch, the framebuffer -> instance map, the surface table, the routing guard's counters (flows: native_disp_flow.h m6_*) --
     bool m6_on() { return n48m6_latched_on(); }
@@ -730,13 +734,13 @@ uint32_t n48disp_verb(uint32_t action, uint64_t arg, uint64_t *out, unsigned cou
                  (unsigned long long)gD.vblLastPeriodNs, (unsigned long long)gD.vblLastPeriodAbs, (unsigned long long)gD.vblLastDelayNs);
         } else {                                                                                               // 0.0.617 (K6), page 3
             out[3] = gD.reasons[n48disp::kPfScanOwned]; out[4] = gD.submitScanSkipped; out[5] = gD.ivl.d.n; out[6] = gD.ivl.d.min; out[7] = n48disp::dur_avg(gD.ivl.d); out[8] = gD.ivl.d.max;
-            out[9] = n48dcn::scanActive() ? 1u : 0u;                                                          // out[9]: a native client owns the scanout plane right now
+            out[9] = (amdgpu::n33n_available() ? amdgpu::n33n_scan_acquired() : n48dcn::scanActive()) ? 1u : 0u;                                                          // out[9]: a native client owns the scanout plane right now
         }
         DLOG("pipe stat page %llu: auto-disarmed: %s (count %llu); flags %#x (BAR0 %s) facts %#x, copied %llu disarmed %llu, bytes %llu, perform ns min/avg/max %llu/%llu/%llu (%llu frames), submit %llu will-perform %llu pass-through, slot 62 %llu calls %llu handled; scan-owned: perform %llu submit-skip %llu active %d, submit interval ns min/avg/max %llu/%llu/%llu (%llu); md cache prepared %llu hits %llu misses %llu prepFail %llu evicted %llu evictBlocked %llu full %llu torn %llu leaked %llu drainFail %llu",
              (unsigned long long)arg, n48disp::auto_cause_name(__atomic_load_n(&gD.autoCause, __ATOMIC_ACQUIRE)), (unsigned long long)gD.autoDisarms, (unsigned)flags_word(), (flags_word() & n48disp::kFlagBar0Wc) ? "WC" : "UNCACHED", (unsigned)n48metal_factory_mask_now(), (unsigned long long)gD.reasons[n48disp::kPfCopied], (unsigned long long)gD.reasons[n48disp::kPfDisarmed],
              (unsigned long long)gD.bytes, (unsigned long long)gD.dur.min, (unsigned long long)n48disp::dur_avg(gD.dur), (unsigned long long)gD.dur.max, (unsigned long long)gD.dur.n,
              (unsigned long long)gD.submitWill, (unsigned long long)gD.submitPass, (unsigned long long)gD.res62Calls, (unsigned long long)gD.res62Handled,
-             (unsigned long long)gD.reasons[n48disp::kPfScanOwned], (unsigned long long)gD.submitScanSkipped, (int)n48dcn::scanActive(), (unsigned long long)gD.ivl.d.min, (unsigned long long)n48disp::dur_avg(gD.ivl.d), (unsigned long long)gD.ivl.d.max, (unsigned long long)gD.ivl.d.n,
+             (unsigned long long)gD.reasons[n48disp::kPfScanOwned], (unsigned long long)gD.submitScanSkipped, (int)(amdgpu::n33n_available() ? amdgpu::n33n_scan_acquired() : n48dcn::scanActive()), (unsigned long long)gD.ivl.d.min, (unsigned long long)n48disp::dur_avg(gD.ivl.d), (unsigned long long)gD.ivl.d.max, (unsigned long long)gD.ivl.d.n,
              (unsigned long long)gD.mdc.prepared, (unsigned long long)gD.mdc.hits, (unsigned long long)gD.mdc.misses, (unsigned long long)gD.mdc.prepFail, (unsigned long long)gD.mdc.evicted,
              (unsigned long long)gD.mdc.evictBlocked, (unsigned long long)gD.mdc.full, (unsigned long long)gD.mdc.tornDown, (unsigned long long)gD.mdc.leaked, (unsigned long long)gD.mdc.drainFail);
     } else if (action == n48disp::kActM6Stat) {                          // 0.0.659 (M6): READ-ONLY - per pipe transactions, surface IDs, ambiguous, refused presents, stamps per OTG
