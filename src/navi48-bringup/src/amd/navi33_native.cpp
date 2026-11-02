@@ -13,6 +13,7 @@
 #include "navi33_native.h"
 #include "navi33_gfx.h"
 #include "native_s1c_pure.h"
+#include "native_hostimport_pure.h"
 #include "amdgpu_log.h"
 
 #define N33N_LOG(fmt, ...) AMDGPU_LOG("navi33-native", fmt, ##__VA_ARGS__)
@@ -24,10 +25,10 @@ using namespace n48native::s1c;
 
 constexpr uint32_t kVmid = 8;
 constexpr uint32_t kBuild = 33012;                 // reported by Hello / QueryInfo
-// The ABI minor this engine reports (Hello, QueryInfo.reserved[2]): 8, not the header's current minor. What 1.9..1.12
-// added is not here on gfx11: host import (21), the per-session VRAM budget in QueryInfo (1.10), the multi-display
-// scanout (22..26). A client that sees 8 does not try them (Mesa's userptr, budget and scanx paths are gated on it).
-constexpr uint32_t kAbiMinor = 8u;
+// The ABI minor this engine reports (Hello, QueryInfo.reserved[2]): 9, not the header's current minor. 1.9's host import
+// (21) is here (n33n_bo_import_host); what 1.10..1.12 added is not on gfx11 yet: the per-session VRAM budget in QueryInfo
+// (1.10), the multi-display scanout (22..26). A client that sees 9 does not try them (Mesa's budget and scanx paths are gated on it).
+constexpr uint32_t kAbiMinor = 9u;
 constexpr uint64_t kBlk = 64ull << 10;
 constexpr uint32_t kMaxBlk = 4096;                 // 256 MiB of BAR0 / 64 KiB
 constexpr uint64_t kPtArena = 8ull << 20;
@@ -43,7 +44,9 @@ constexpr uint32_t kCtxBaseLo = 0x16f3 + 2 * kVmid, kCtxBaseHi = 0x16f4 + 2 * kV
 // would be added to the base a second time.
 constexpr uint32_t kGbAddrConfig = 0x13de;
 
-struct Bo { uint8_t used; uint32_t blk, nblk; uint64_t off, size; };
+// kind 0: VRAM blocks [blk, blk + nblk). kind 1 (host import, ABI 1.9): the caller's wired pages hpages[0 .. hpageCount), held by hmd (prepare()d).
+struct Bo { uint8_t used, kind; uint32_t blk, nblk; uint64_t off, size; IOMemoryDescriptor *hmd; uint64_t *hpages; uint32_t hpageCount; };
+constexpr uint8_t kBoVram = 0, kBoHost = 1;
 
 DeviceContext *gDev;
 bool gAvail;
@@ -64,6 +67,7 @@ struct Session {
 	uint64_t rootPa;
 	uint64_t emitted;
 	uint64_t vramUsed;
+	uint64_t importedBytes;
 };
 Session gS;
 uint32_t gSubmit[3 + 4 * N48N_MAX_IBS + 16];
@@ -166,8 +170,25 @@ bool idle_wait(uint64_t ns = 2000000000ull) {
 }
 bool hello() { return __atomic_load_n(&gOpen, __ATOMIC_ACQUIRE) && gS.hello; }
 
+// Unwire a host import's pages (only once the GPU can no longer touch them: after idle and the unmap).
+void host_release(Bo &b) {
+	if (b.hpages) IOFree(b.hpages, (vm_size_t)b.hpageCount * sizeof(uint64_t));
+	if (b.hmd) { b.hmd->complete(); b.hmd->release(); }
+	b.hpages = nullptr; b.hmd = nullptr; b.hpageCount = 0;
+}
+// Map `pages` 4 KiB pages at `va` to the scattered list pagePa (a host import). Tables first, then the leaves: a failure leaves no leaf written.
+uint32_t pt_map_list(uint64_t va, uint64_t pages, const uint64_t *pagePa, uint64_t flags) {
+	for (uint64_t p = 0; p < pages; p += 512 - idx_ptb(va + p * kPage))
+		if (!pt_ptb(va + p * kPage, true)) return kNoMemory;
+	for (uint64_t p = 0; p < pages; p++) pt_wr(pt_ptb(va + p * kPage, false), idx_ptb(va + p * kPage), (pagePa[p] & kAddr) | flags);
+	return kOk;
+}
+
 void release_all() {
-	for (uint32_t h = 1; h < N48N_MAX_BOS; h++) if (gS.boUsed[h]) blk_free(gS.bo[h].blk, gS.bo[h].nblk);
+	for (uint32_t h = 1; h < N48N_MAX_BOS; h++) {
+		if (!gS.boUsed[h]) continue;
+		if (gS.bo[h].kind == kBoHost) host_release(gS.bo[h]); else blk_free(gS.bo[h].blk, gS.bo[h].nblk);
+	}
 	blk_free(gS.ptBlk, (uint32_t)(kPtArena / kBlk));
 }
 } // namespace
@@ -311,8 +332,9 @@ IOReturn n33n_bo_free(uint64_t handle) {
 		if (unmapped && idle) (void)flush();
 		for (uint32_t i = 0; i < N48N_SCAN_MAX_SLOTS; i++)
 			if (gScan.slot[i].used && gScan.slot[i].handle == h) gScan.slot[i] = ScanSlot{};   // a freed BO is no longer presentable
-		if (idle) { blk_free(gS.bo[h].blk, gS.bo[h].nblk); gS.vramUsed -= (uint64_t)gS.bo[h].nblk * kBlk; }
-		else rc = kIOReturnTimeout;                     // the memory is leaked: the GPU may still use it
+		if (idle && gS.bo[h].kind == kBoHost) { gS.importedBytes = import_after_free(gS.importedBytes, gS.bo[h].size); host_release(gS.bo[h]); }
+		else if (idle) { blk_free(gS.bo[h].blk, gS.bo[h].nblk); gS.vramUsed -= (uint64_t)gS.bo[h].nblk * kBlk; }
+		else rc = kIOReturnTimeout;                     // the memory is leaked (a host import stays wired): the GPU may still use it
 		gS.boUsed[h] = 0; gS.bo[h] = Bo{};
 	}
 	IOLockUnlock(gLock);
@@ -329,12 +351,14 @@ IOReturn n33n_gem_va(const n48n_gem_va *in) {
 	do {
 		if (!id_live(gS.boUsed, N48N_MAX_BOS - 1, in->handle)) { rc = kIOReturnNotFound; break; }
 		const Bo &b = gS.bo[in->handle];
-		if (!range_in_bo(in->offset_in_bo, in->map_size, (uint64_t)b.nblk * kBlk)) { rc = kIOReturnBadArgument; break; }
+		const bool host = b.kind == kBoHost;
+		if (!range_in_bo(in->offset_in_bo, in->map_size, host ? b.size : (uint64_t)b.nblk * kBlk)) { rc = kIOReturnBadArgument; break; }
 		if (in->operation == N48N_VA_OP_MAP) {
 			if (va_overlap(gS.maps, kMaxMaps, q.stripped, in->map_size) >= 0) { rc = kIOReturnBadArgument; break; }
 			const int slot = va_insert(gS.maps, kMaxMaps, VaEnt{ q.stripped, in->map_size, in->offset_in_bo, in->handle, in->flags });
 			if (slot < 0) { rc = kIOReturnNoResources; break; }
-			const uint32_t r = pt_map(q.stripped, in->map_size / kPage, pa_of(b.off + in->offset_in_bo), leaf(in->flags));
+			const uint32_t r = host ? pt_map_list(q.stripped, in->map_size / kPage, b.hpages + in->offset_in_bo / kPage, leaf(in->flags) | kSys | kSnoop)
+			                        : pt_map(q.stripped, in->map_size / kPage, pa_of(b.off + in->offset_in_bo), leaf(in->flags));
 			if (r != kOk) { pt_unmap(q.stripped, in->map_size / kPage); gS.maps[slot] = VaEnt{0, 0, 0, 0, 0}; rc = (IOReturn)r; break; }
 			rc = (IOReturn)flush();
 		} else {
@@ -627,12 +651,79 @@ IOReturn n33n_memory_for_handle(uint32_t handle, IOOptionBits *options, IOMemory
 	if (!id_live(gS.boUsed, N48N_MAX_BOS - 1, handle)) rc = kIOReturnNotFound;
 	else {
 		const Bo &b = gS.bo[handle];
+		if (b.kind == kBoHost) { IOLockUnlock(gLock); return kIOReturnUnsupported; }   // the caller already maps its own pages
 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)(gDev->bar0Phys + b.off),
 		                                                                 (IOByteCount)((uint64_t)b.nblk * kBlk), kIODirectionInOut);
 		if (!md) rc = kIOReturnNoMemory;
 		else { *memory = md; if (options) *options |= kIOMapWriteCombineCache; }
 	}
 	IOLockUnlock(gLock);
+	return rc;
+}
+
+// ---- BoImportHost (ABI 1.9) on gfx11 -----------------------------------------------------------------------------------------------
+// The caller's page-aligned range is wired (prepare) and its physical pages become a SYSTEM|SNOOPED BO, mapped at gpuVa when one is
+// given (same contract as n1c_bo_import_host: import_check's limits, 64 MiB per BO, the per-client cap). A page inside this GPU's BAR0
+// is refused. Nothing is mapped before every page is known; a failure unwires everything.
+namespace {
+struct N33Seg {
+	IOMemoryDescriptor *md;
+	uint64_t phys(uint64_t off, uint64_t *len) {
+		IOByteCount seg = 0;
+		const addr64_t pa = md->getPhysicalSegment((IOByteCount)off, &seg, kIOMemoryMapperNone);
+		*len = pa != 0 ? (uint64_t)seg : 0ull;
+		return (uint64_t)pa;
+	}
+};
+}
+IOReturn n33n_bo_import_host(task_t task, uint64_t hostVa, uint64_t size, uint64_t flags, uint64_t gpuVa, uint64_t out[4]) {
+	if (!hello()) return kIOReturnNotReady;
+	if (task == nullptr || out == nullptr) return kIOReturnBadArgument;
+	const ImportChk pre = import_check(hostVa, size, flags, gpuVa, __atomic_load_n(&gS.importedBytes, __ATOMIC_RELAXED));
+	if (pre.rc != kOk) return (IOReturn)pre.rc;
+	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)hostVa, (mach_vm_size_t)size, kIODirectionInOut, task);
+	if (md == nullptr) return kIOReturnNoMemory;
+	if (md->prepare() != kIOReturnSuccess) { md->release(); return kIOReturnBadArgument; }   // not (fully) mapped in the caller
+	const vm_size_t listBytes = (vm_size_t)(pre.pages * sizeof(uint64_t));
+	uint64_t *pages = static_cast<uint64_t *>(IOMalloc(listBytes));
+	if (pages == nullptr) { md->complete(); md->release(); return kIOReturnNoMemory; }
+	N33Seg seg { md };
+	uint32_t crc = collect_pages(seg, size, pages, kImportMaxPages);
+	if (crc == kOk)
+		for (uint64_t i = 0; i < pre.pages; i++)
+			if (pages[i] >= gDev->bar0Phys && pages[i] < gDev->bar0Phys + gDev->bar0Size) { crc = kBadArg; break; }   // device memory: never
+	if (crc != kOk) {
+		IOFree(pages, listBytes); md->complete(); md->release();
+		N33N_LOG("import refused (%#x): %#llx + %llu KiB", crc, (unsigned long long)hostVa, (unsigned long long)(size >> 10));
+		return (IOReturn)crc;
+	}
+	IOLockLock(gLock);
+	IOReturn rc = kIOReturnSuccess;
+	bool taken = false;
+	do {
+		if (!gS.hello) { rc = kIOReturnNotReady; break; }
+		const ImportChk c = import_check(hostVa, size, flags, gpuVa, gS.importedBytes);   // authoritative, under the lock
+		if (c.rc != kOk) { rc = (IOReturn)c.rc; break; }
+		const uint32_t h = lowest_free(gS.boUsed, 1, N48N_MAX_BOS - 1);
+		if (h == 0) { rc = kIOReturnNoResources; break; }
+		int slot = -1;
+		if (c.gpuStripped != 0ull) {
+			if (va_overlap(gS.maps, kMaxMaps, c.gpuStripped, size) >= 0) { rc = kIOReturnBadArgument; break; }
+			slot = va_insert(gS.maps, kMaxMaps, VaEnt{ c.gpuStripped, size, 0, h, (uint32_t)flags });
+			if (slot < 0) { rc = kIOReturnNoResources; break; }
+			const uint32_t r = pt_map_list(c.gpuStripped, c.pages, pages, leaf((uint32_t)flags) | kSys | kSnoop);
+			if (r != kOk) { pt_unmap(c.gpuStripped, c.pages); gS.maps[slot] = VaEnt{0, 0, 0, 0, 0}; rc = (IOReturn)r; break; }
+		}
+		Bo b {};
+		b.used = 1; b.kind = kBoHost; b.size = size; b.hmd = md; b.hpages = pages; b.hpageCount = (uint32_t)c.pages;
+		gS.bo[h] = b; gS.boUsed[h] = 1;
+		gS.importedBytes += size;
+		taken = true;
+		if (slot >= 0) rc = (IOReturn)flush();
+		out[0] = h; out[1] = size; out[2] = slot >= 0 ? va_canonicalize(c.gpuStripped) : 0ull; out[3] = N48N_PLACED_HOST_IMPORT;
+	} while (false);
+	IOLockUnlock(gLock);
+	if (!taken) { IOFree(pages, listBytes); md->complete(); md->release(); }
 	return rc;
 }
 

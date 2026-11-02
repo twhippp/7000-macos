@@ -5,6 +5,7 @@
 //
 #pragma once
 #include <IOKit/IOTypes.h>
+#include <mach/mach_types.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include "Navi48NativeABI.h"
 #include "amdgpu_regs.h"
@@ -30,6 +31,7 @@ IOReturn n33n_gem_va(const n48n_gem_va *in);
 IOReturn n33n_ctx(const n48n_ctx *in, n48n_ctx *out);
 IOReturn n33n_submit(const uint8_t *in, uint32_t size, uint64_t *seqOut);
 IOReturn n33n_wait(uint64_t target, uint64_t timeoutNs, uint64_t out[3]);
+IOReturn n33n_bo_import_host(task_t task, uint64_t hostVa, uint64_t size, uint64_t flags, uint64_t gpuVa, uint64_t out[4]);   // ABI 1.9 (21)
 IOReturn n33n_memory_for_handle(uint32_t handle, IOOptionBits *options, IOMemoryDescriptor **memory);
 
 // ABI 1.1 scanout, copy-to-console variant (see navi33_native.cpp "scanout").

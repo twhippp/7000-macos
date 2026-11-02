@@ -28,6 +28,8 @@ public:
 	//   withdraw: in [0] flags (0)  out [0] previous state
 	static IOReturn selectorPublish(Navi48Bringup *owner, uint64_t flags, uint64_t out[4]);
 	static IOReturn selectorWithdraw(uint64_t flags, uint64_t out[1]);
+	// Navi 33: publish from start() when the boot-args navi48-metal=1 and navi48-metal-boot=1 are set (no-op otherwise).
+	static void autoPublishNavi33(Navi48Bringup *owner);
 	// Navi48Bringup::stop: terminate the nub if it is published (no-op otherwise).
 	static void shutdown();
 	// 0.0.612: the HUNG latch tripped (native_s1c.cpp hang_announce, the only caller). Sets the sticky boot-wide "not ready" state and writes "Navi48,Ready" = 0 on the published nub

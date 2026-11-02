@@ -8158,6 +8158,7 @@ bool Navi48Bringup::start(IOService *provider) {
 			// ac_darwin_iokit.c, navi48test) only sees registered services, so without this
 			// the N33 app door is loaded and "ready" but no client can find it to open.
 			registerService();
+			if (profile->gen == amdgpu::GpuGeneration::Navi33) Navi48MetalNub::autoPublishNavi33(this);   // boot-arg navi48-metal-boot=1
 			return true;
 		}
 

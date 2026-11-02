@@ -178,8 +178,8 @@ IOReturn IOAccelNavi48NativeClient::externalMethod(uint32_t selector, IOExternal
 	}
 	// Navi 33: selectors 0..8 run on the gfx11 engine, 9..14 (scanout) on its copy-to-console present (navi33_native.cpp),
 	// 19/20 (the Metal nub) read the Navi 33 gate themselves. DAL / mode (15..18), host import (21) and the multi-display
-	// scanout (22..26) are not there yet. The n48dcn display layer (DCN 4.1) is never bound on a Navi 33.
-	if (n33 && selector > N48N_SEL_SCAN_RELEASE && selector != N48N_SEL_METAL_NUB_PUBLISH && selector != N48N_SEL_METAL_NUB_WITHDRAW)
+	// scanout (22..26) are not there yet; host import (21) is (navi33_native.cpp, ABI 1.9). The n48dcn display layer (DCN 4.1) is never bound on a Navi 33.
+	if (n33 && selector > N48N_SEL_SCAN_RELEASE && selector != N48N_SEL_METAL_NUB_PUBLISH && selector != N48N_SEL_METAL_NUB_WITHDRAW && selector != N48N_SEL_BO_IMPORT_HOST)
 		return kIOReturnUnsupported;
 	if (n33 && selector >= N48N_SEL_SCAN_QUERY && selector <= N48N_SEL_SCAN_RELEASE) {
 		switch (selector) {
@@ -322,7 +322,7 @@ IOReturn IOAccelNavi48NativeClient::externalMethod(uint32_t selector, IOExternal
 			if (OSCompareAndSwap(0, 1, &gImportCallerLogged)) NCLOG("import refused: the caller is not the task that opened this client (logged once)");
 			return kIOReturnNotPermitted;
 		}
-		return amdgpu::n1c_bo_import_host(r, task, si[0], si[1], si[2], si[3], so);
+		return n33 ? amdgpu::n33n_bo_import_host(task, si[0], si[1], si[2], si[3], so) : amdgpu::n1c_bo_import_host(r, task, si[0], si[1], si[2], si[3], so);
 	default:
 		break;
 	}

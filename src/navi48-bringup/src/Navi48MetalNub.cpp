@@ -204,6 +204,8 @@ void ensure_lock() {
 	if (l && !OSCompareAndSwapPtr(nullptr, l, &gLock)) IOLockFree(l);
 }
 
+bool gAutoPublishing;   // true only inside Navi48MetalNub::autoPublishNavi33 (under no lock: start() runs once, before any client)
+
 n48metal::GateIn gate_now(uint64_t flags, bool wantBootArg) {
 	n48metal::GateIn g {};
 	g.flags = flags;
@@ -211,7 +213,7 @@ n48metal::GateIn gate_now(uint64_t flags, bool wantBootArg) {
 		// Navi 33: the engine is available only once stages 1-12 passed this boot, which is what the S1b
 		// POSITIVE PASS stands for on a gfx12 card. The gfx11 engine has no HUNG latch (a submit that never
 		// retires times out in the wait, it does not poison the session). No multi-display, no display nub.
-		g.hello = amdgpu::n33n_hello_done();
+		g.hello = amdgpu::n33n_hello_done() || gAutoPublishing;   // at boot (navi48-metal-boot=1) no client has said Hello: stages 1-12 passing is the gate
 		g.s1bGateOn = g.s1bRan = g.s1bPositive = true; g.s1bStopped = false;
 		g.hung = false;
 		g.m6 = false;
@@ -292,6 +294,18 @@ IOReturn Navi48MetalNub::selectorPublish(Navi48Bringup *owner, uint64_t flags, u
 	nub->registerService();                                                       // outside the lock: matching may run the aux kext's probe, which calls back into the ops
 	nub->release();                                                               // the extra reference taken under the lock
 	return kIOReturnSuccess;
+}
+
+// Navi 33 at boot: with navi48-metal=1 AND navi48-metal-boot=1 the nub is published from start() (once stages 1-12 passed), so the aux
+// kext and WindowServer find the GPU without a manual `n48nub publish`. Same gates as the selector otherwise.
+void Navi48MetalNub::autoPublishNavi33(Navi48Bringup *owner) {
+	uint32_t v = 0;
+	if (!amdgpu::n33n_available() || !PE_parse_boot_argn("navi48-metal-boot", &v, sizeof(v)) || v != 1u) return;
+	uint64_t out[4] = { 0 };
+	gAutoPublishing = true;
+	const IOReturn rc = selectorPublish(owner, 0, out);
+	gAutoPublishing = false;
+	MNLOG("boot publish (navi48-metal-boot=1): %#x, nub id %llu", (unsigned)rc, (unsigned long long)out[1]);
 }
 
 IOReturn Navi48MetalNub::selectorWithdraw(uint64_t flags, uint64_t out[1]) {
