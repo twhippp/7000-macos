@@ -63,7 +63,11 @@ def gate_b(k):
 def gate_c():
     problems = []
     tmp = tempfile.mkdtemp(prefix='n48gen')
-    env = dict(os.environ, N48_GEN_OUT=tmp)
+    # gen_header.py reads and writes $C64_LAYOUT_OUT: regenerate from a copy of generated/ minus the header
+    import shutil
+    shutil.rmtree(tmp); shutil.copytree(os.path.join(LAYOUT, 'generated'), tmp)
+    os.remove(os.path.join(tmp, 'IOAccelFamily2_decl.h'))
+    env = dict(os.environ, N48_GEN_OUT=tmp, C64_LAYOUT_OUT=tmp)
     r = subprocess.run([sys.executable, os.path.join(LAYOUT, 'gen_header.py')], env=env, capture_output=True, text=True)
     if r.returncode:
         problems.append('gen_header.py failed: ' + r.stderr[-300:])
