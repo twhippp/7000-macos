@@ -21,4 +21,8 @@ say "mtlprobe triangle"
 sudo env N48M_ALLOW=1 N48M_TEST_INPROC=1 "$REPO/tools/native/mtlprobe/mtlprobe" triangle "$HOME/navi48-native/metal-tri.png"; echo "triangle rc=$?"
 say "kernel log (last 40 Navi48 lines)"
 log show --last 3m --predicate 'sender CONTAINS "Navi48" OR sender CONTAINS "accelprobe"' 2>/dev/null | tail -40
+say "card readings (temperatures, fan, clocks)"
+ioreg -l -w0 -c Navi48Bringup | grep -E '"N33,(Temps|Fan|Clocks|MetricsResp|SmuDriverIf|Native)"|"SMU,(Setup|FeaturesRunning)"'
+say "framebuffers (what the screen is driven by)"
+ioreg -l -w0 -c IOFramebuffer | grep -E '"IOClass"|"IOFBCurrentPixelCount"|"IOProviderClass"|IOFramebuffer  ' | head -12
 say "done: $LOG"

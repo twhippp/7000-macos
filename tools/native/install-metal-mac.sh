@@ -24,6 +24,28 @@ clang -fobjc-arc -O1 -arch x86_64 -mmacosx-version-min=13.0 "$REPO/tools/native/
 echo "built n48nub and mtlprobe"
 
 BUNDLE_ONLY=0; [ "${1:-}" = "--bundle" ] && BUNDLE_ONLY=1   # --bundle: only reinstall the Metal bundle (no reboot needed)
+# --kext <Navi48Bringup.kext>: put a new bring-up kext on the OPENCORE volume (old one kept as Navi48Bringup.kext.<version>) and add
+# navi48-metal-boot=1 (the kext publishes the Metal device by itself at boot). Needs a reboot.
+if [ "${1:-}" = "--kext" ]; then
+  K="${2:?usage: install-metal-mac.sh --kext /path/to/Navi48Bringup.kext}"
+  [ -f "$K/Contents/Info.plist" ] || { echo "not a kext: $K"; exit 1; }
+  sudo -v
+  [ -f "$OC" ] || sudo diskutil mount OPENCORE >/dev/null
+  KD=/Volumes/OPENCORE/EFI/OC/Kexts
+  old=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$KD/Navi48Bringup.kext/Contents/Info.plist" 2>/dev/null || echo old)
+  new=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$K/Contents/Info.plist")
+  [ -d "$KD/Navi48Bringup.kext" ] && sudo mv "$KD/Navi48Bringup.kext" "$HOME/navi48-staging/Navi48Bringup.kext.$old.$(date +%s)"
+  sudo cp -R "$K" "$KD/Navi48Bringup.kext"; sudo xattr -cr "$KD/Navi48Bringup.kext"
+  say "kext $old -> $new on OPENCORE (old one in ~/navi48-staging)"
+  cur=$(/usr/libexec/PlistBuddy -c "Print $BA" "$OC")
+  if [[ " $cur " != *" navi48-metal-boot=1 "* ]]; then
+    sudo cp "$OC" "$OC.pre-metal-boot.backup"
+    sudo /usr/libexec/PlistBuddy -c "Set $BA $cur navi48-metal-boot=1" "$OC"
+  fi
+  say "boot-args: $(/usr/libexec/PlistBuddy -c "Print $BA" "$OC")"
+  say "KEXT OK. Reboot, then run tools/native/metal-check-mac.sh"
+  exit 0
+fi
 sudo -v
 if [ $BUNDLE_ONLY = 0 ]; then
 say "2/4 boot-arg navi48-metal=1"

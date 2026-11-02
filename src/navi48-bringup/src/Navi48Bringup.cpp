@@ -36,7 +36,8 @@
 #include "amd/native_g4_pure.h"        // 0.0.640 (GPU-apps G4): appallow (verb 104, boot-args navi48-apps=1 + navi48-multisession=1)
 #include "dcn/navi48_fbname.hpp"
 #include <IOKit/IOLib.h>
-#include <kern/thread.h>            // current_thread() - the MM-window priority owner identity (0.0.433)
+#include <kern/thread.h>
+#include <kern/thread_call.h>       // 0.0.666: the Navi 33 telemetry refresh            // current_thread() - the MM-window priority owner identity (0.0.433)
 #include <sys/proc.h>               // build 0.0.512 Part B: proc_selfpid/proc_name on the clock88w watch lines
 #include "apple/gfx_clock88.h"      // build 0.0.512 Part B: the clock88 watch (pure)
 #include "apple/gfx_ks81.h"         // build 0.0.526: the marker-holder gate in switch 37's yield (pure)
@@ -887,8 +888,60 @@ void Navi48Bringup::navi33SmuFeatures() {
 	smuMailbox(PPSMC::GetRunningSmuFeaturesHigh, 0, &fHi, kSlowMs);
 	setProperty("SMU,FeaturesRunning", (static_cast<uint64_t>(fHi) << 32) | fLo, 64);
 	setProperty("SMU,Setup", en == n48::kSmuRespOK ? "features-enabled" : "enable-failed");
+	if (en == n48::kSmuRespOK) navi33MetricsStart();   // 0.0.666: temperatures / fan / clocks in ioreg, every 10 s
 	N48LOG("psp-stage3: SMU setup — driver table mc 0x%llx, EnableAllSmuFeatures resp 0x%x, running 0x%08x_%08x",
 	       mc, en, fHi, fLo);
+}
+
+// Navi 33 telemetry (0.0.666): the SMU 13.0.7 metrics table (TABLE_SMU_METRICS = 5, TransferTableSmu2Dram) decoded per
+// smu13_driver_if_v13_0_7.h SmuMetrics_t: CurrClock[13] @0, AverageGfxActivity @104, AverageSocketPower @116,
+// AvgTemperature[13] @120 (EDGE, HOTSPOT, HOTSPOT_G, HOTSPOT_M, MEM, ...; degrees C), AvgFanPwm @150 (u8), AvgFanRpm @152 (u16).
+// Read-only: one message, then the driver table read back through the MM window (the GPU's own view; the SMU's DMA bypasses HDP).
+// Published as N33,Temps etc. at the end of stage 3 and every 10 s after (a thread call), so `ioreg` shows what the fan reacts to.
+static thread_call_t gN33MetricsCall;
+static Navi48Bringup *gN33MetricsOwner;
+static volatile UInt32 gN33MetricsStop;
+static void n33_metrics_tick(thread_call_param_t, thread_call_param_t) {
+	if (gN33MetricsStop || gN33MetricsOwner == nullptr) return;
+	gN33MetricsOwner->navi33SmuMetrics();
+	if (!gN33MetricsStop && gN33MetricsCall) thread_call_enter_delayed(gN33MetricsCall, ({ uint64_t d; clock_interval_to_deadline(10, kSecondScale, &d); d; }));
+}
+void navi33_metrics_stop() {
+	gN33MetricsStop = 1;
+	if (gN33MetricsCall) { thread_call_cancel_wait(gN33MetricsCall); thread_call_free(gN33MetricsCall); gN33MetricsCall = nullptr; }
+	gN33MetricsOwner = nullptr;
+}
+void Navi48Bringup::navi33SmuMetrics() {
+	using namespace amdgpu;
+	if (dev.vramMcBase == 0 || dev.vramLimit == 0) return;
+	uint32_t ifv = 0;
+	smuMailbox(PPSMC::GetDriverIfVersion, 0, &ifv, 2000);
+	const uint32_t resp = smuMailbox(PPSMC::TransferTableSmu2Dram, kSMUTableMetrics, nullptr, 2000);
+	setProperty("N33,MetricsResp", static_cast<uint64_t>(resp), 32);
+	setProperty("N33,SmuDriverIf", static_cast<uint64_t>(ifv), 32);
+	if (resp != n48::kSmuRespOK) return;
+	const uint64_t off = dev.vramBase + kSMUDriverTableVRAMOffset;
+	uint32_t m[40];
+	for (uint32_t i = 0; i < 40; i++) m[i] = RVRAM32_via_mm(dev, off + i * 4ull);
+	auto u16 = [&](uint32_t byteOff) { return (m[byteOff / 4] >> ((byteOff & 2) * 8)) & 0xFFFFu; };
+	auto u8  = [&](uint32_t byteOff) { return (m[byteOff / 4] >> ((byteOff & 3) * 8)) & 0xFFu; };
+	char buf[160];
+	snprintf(buf, sizeof buf, "edge %u C, hotspot %u C, memory %u C", u16(120), u16(122), u16(128));
+	setProperty("N33,Temps", buf);
+	snprintf(buf, sizeof buf, "%u RPM, PWM %u (0-255)", u16(152), u8(150));
+	setProperty("N33,Fan", buf);
+	snprintf(buf, sizeof buf, "gfx %u MHz, mem %u MHz, gfx busy %u%%, power %u W", m[0], m[2], u16(104), u16(116));
+	setProperty("N33,Clocks", buf);
+	static uint32_t logged;
+	if (logged++ < 3) N48LOG("n33 metrics: if %#x, edge %u C hotspot %u C mem %u C, fan %u RPM pwm %u, gfx %u MHz busy %u%%, %u W",
+	                         ifv, u16(120), u16(122), u16(128), u16(152), u8(150), m[0], u16(104), u16(116));
+}
+void Navi48Bringup::navi33MetricsStart() {
+	navi33SmuMetrics();
+	if (gN33MetricsCall) return;
+	gN33MetricsStop = 0; gN33MetricsOwner = this;
+	gN33MetricsCall = thread_call_allocate(n33_metrics_tick, nullptr);
+	if (gN33MetricsCall) { uint64_t d; clock_interval_to_deadline(10, kSecondScale, &d); thread_call_enter_delayed(gN33MetricsCall, d); }
 }
 
 // navi33-psp=2: GPCOM ring, LOAD_TOC, SMU firmware, SETUP_TMR — Linux psp_hw_start for
@@ -9758,6 +9811,7 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 }
 
 void Navi48Bringup::stop(IOService *provider) {
+	navi33_metrics_stop();   // 0.0.666: the Navi 33 telemetry thread call (no-op when never started)
 	// : never leave a patched className behind in a kext that is going away.
 	n48fbname::restore_on_unload();
 	// 0.0.603 (native S2a): the console plane back and every scanout watchdog thread finished BEFORE anything is unmapped (both need the registers).

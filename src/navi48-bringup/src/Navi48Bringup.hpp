@@ -44,6 +44,8 @@ class Navi48Bringup : public IOService {
 	using super = IOService;
 
 public:
+	void navi33SmuMetrics();    // 0.0.666: SMU 13.0.7 metrics -> N33,Temps / N33,Fan / N33,Clocks (read-only)
+	void navi33MetricsStart();  // first read + a 10 s refresh
 	IOService *probe(IOService *provider, SInt32 *score) override;
 	bool       start(IOService *provider) override;
 	void       stop(IOService *provider) override;
