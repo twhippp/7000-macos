@@ -25,7 +25,8 @@
 #include "native_s1c.h"      // n1c_hung(): the HUNG latch (0.0.616: the prepared-descriptor cache leaks instead of completing under it)
 #include "amdgpu_log.h"
 #include "Navi48MetalNub.hpp"
-#include "Navi48DisplayNub.hpp"     // 0.0.659 (M6): framebufferOf(index)
+#include "Navi48DisplayNub.hpp"
+#include "../Navi48DisplayOps.h"   // N48_DISP_N33_INDEX     // 0.0.659 (M6): framebufferOf(index)
 
 #define DLOG(fmt, ...) AMDGPU_LOG("disp", fmt, ##__VA_ARGS__)
 
@@ -397,6 +398,7 @@ struct KernelEnv {
         return true;
     }
     IOService *find_fb() {                                               // RDNA4FB under either name (the renamed class keeps matching by the registration name)
+        if (amdgpu::n33n_available()) return Navi48DisplayNub::framebufferOf(N48_DISP_N33_INDEX);   // 0.0.672: on a Navi 33 the screen is the aux Navi48Framebuffer on the console nub (retained, like the lookup below)
         static const char *const kNames[2] = { "RDNA4FB", "AMDRDNA4FB" };
         for (unsigned i = 0; i < 2; ++i) {
             OSDictionary *m = IOService::serviceMatching(kNames[i]);
@@ -430,7 +432,7 @@ struct KernelEnv {
             if (fb) {
                 const OSMetaClass *mc = fb->getMetaClass();
                 const char *cn = mc ? mc->getClassName() : nullptr;
-                p.fbOurs = cn && (strcmp(cn, "RDNA4FB") == 0 || strcmp(cn, "AMDRDNA4FB") == 0);
+                p.fbOurs = cn && (strcmp(cn, "RDNA4FB") == 0 || strcmp(cn, "AMDRDNA4FB") == 0 || (amdgpu::n33n_available() && strcmp(cn, "Navi48Framebuffer") == 0));
                 p.backFb = ok && f == static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fb));
                 fb->release();
             }

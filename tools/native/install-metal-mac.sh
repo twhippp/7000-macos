@@ -26,6 +26,23 @@ echo "built n48nub and mtlprobe"
 BUNDLE_ONLY=0; [ "${1:-}" = "--bundle" ] && BUNDLE_ONLY=1   # --bundle: only reinstall the Metal bundle (no reboot needed)
 # --kext <Navi48Bringup.kext>: put a new bring-up kext on the OPENCORE volume (old one kept as Navi48Bringup.kext.<version>) and add
 # navi48-metal-boot=1 (the kext publishes the Metal device by itself at boot). Needs a reboot.
+# --desktop-bootargs: the boot-args the GPU desktop needs (upstream's ...-metal-disp-amfi variant): navi48-metal-disp=1 (display pipe glue),
+# navi48-metal-ws=1 (WindowServer may open the GPU), amfi=0x80 (WindowServer may load the ad-hoc signed Metal bundle). navi48-metal-boot is
+# REMOVED: the desktop script publishes the Metal device after the framebuffer, so WindowServer finds the GPU only when it is armed.
+# --plain-bootargs: back to the plain Metal boot-args. Both back the config up first. Need a reboot.
+if [ "${1:-}" = "--desktop-bootargs" ] || [ "${1:-}" = "--plain-bootargs" ]; then
+  sudo -v
+  [ -f "$OC" ] || sudo diskutil mount OPENCORE >/dev/null
+  cur=$(/usr/libexec/PlistBuddy -c "Print $BA" "$OC")
+  sudo cp "$OC" "$OC.pre-bootargs.$(date +%s).backup"
+  new=" $cur "
+  for a in navi48-metal-boot=1 navi48-metal-disp=1 navi48-metal-ws=1 amfi=0x80; do new=${new// $a / }; done
+  new=$(echo $new)
+  [ "$1" = "--desktop-bootargs" ] && new="$new navi48-metal-disp=1 navi48-metal-ws=1 amfi=0x80"
+  sudo /usr/libexec/PlistBuddy -c "Set $BA $new" "$OC"
+  say "boot-args: $(/usr/libexec/PlistBuddy -c "Print $BA" "$OC")"
+  exit 0
+fi
 if [ "${1:-}" = "--kext" ]; then
   K="${2:?usage: install-metal-mac.sh --kext /path/to/Navi48Bringup.kext}"
   [ -f "$K/Contents/Info.plist" ] || { echo "not a kext: $K"; exit 1; }

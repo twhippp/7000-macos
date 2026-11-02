@@ -1431,8 +1431,9 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 			pciDevice->setProperty("VRAM,totalMB", vram >> 20, 32);
 			pciDevice->setProperty("VRAM,totalsize", vram, 64);
 		}
-		uint32_t cg = 0;   // 0.0.669: navi33-cg=1 turns GFX clock gating on at boot (default off until proven on the bench)
-		if (amdgpu::n33n_available() && PE_parse_boot_argn("navi33-cg", &cg, sizeof(cg)) && cg == 1u) (void)n33ClockGating(true);
+		uint32_t cg = 1;   // 0.0.672: GFX clock gating ON at boot by default, as Linux does after init; navi33-cg=0 leaves it off
+		PE_parse_boot_argn("navi33-cg", &cg, sizeof(cg));
+		if (amdgpu::n33n_available() && cg != 0u) (void)n33ClockGating(true);
 	}
 }
 
