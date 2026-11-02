@@ -290,7 +290,11 @@ IOReturn n33n_query_info(n48n_info *o) {
 IOReturn n33n_read_regs(uint64_t off, uint64_t count, uint64_t instance, uint32_t *out) {
 	if (!hello()) return kIOReturnNotReady;
 	const uint64_t first = navi33_gc_reg(*gDev, kGbAddrConfig, 0);
-	if (count < 1 || count > 16 || instance != 0xFFFFFFFFull || off < first || off + count > first + 4) return kIOReturnBadArgument;
+	// 0.0.667: besides Mesa's GB_ADDR_CONFIG window, the GRBM / CP status block (gc 0x0d00..0x0fff) and the gfx/compute HQD block
+	// (gc 0x1e00..0x1fff), BASE_IDX 0: plain status registers, read-only diagnostics (n48nub regs).
+	auto in = [&](uint32_t lo, uint32_t hi) { const uint64_t a = navi33_gc_reg(*gDev, lo, 0), b = navi33_gc_reg(*gDev, hi, 0); return off >= a && off + count <= b; };
+	if (count < 1 || count > 16 || instance != 0xFFFFFFFFull) return kIOReturnBadArgument;
+	if (!(off >= first && off + count <= first + 4) && !in(0x0d00, 0x1000) && !in(0x1e00, 0x2000)) return kIOReturnBadArgument;
 	for (uint64_t i = 0; i < count; i++) out[i] = RREG32(*gDev, (uint32_t)(off + i));
 	return kIOReturnSuccess;
 }

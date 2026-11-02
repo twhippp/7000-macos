@@ -932,6 +932,16 @@ void Navi48Bringup::navi33SmuMetrics() {
 	setProperty("N33,Fan", buf);
 	snprintf(buf, sizeof buf, "gfx %u MHz, mem %u MHz, gfx busy %u%%, power %u W", m[0], m[2], u16(104), u16(116));
 	setProperty("N33,Clocks", buf);
+	// 0.0.667: what keeps GFX busy? GRBM / CP status and the gfx ring pointers (reads only; gc_11_0_0_offset.h, BASE_IDX 0).
+	{
+		const uint32_t g1 = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0da4, 0)), g2 = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0da2, 0));   // GRBM_STATUS, GRBM_STATUS2
+		const uint32_t cps = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0f40, 0)), rb0r = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0f60, 0));   // CP_STAT, CP_RB0_RPTR
+		const uint32_t ha = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x1e80, 0)), hr = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x1e88, 0)), hw = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x1e91, 0));   // CP_GFX_HQD_ACTIVE / RPTR / WPTR
+		const uint32_t se0 = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0da6, 0)), cpb = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0f3f, 0));   // GRBM_STATUS_SE0, CP_BUSY_STAT
+		snprintf(buf, sizeof buf, "GRBM %08x GRBM2 %08x SE0 %08x CP_STAT %08x CP_BUSY %08x RB0_RPTR %x GFX_HQD act %x rptr %x wptr %x",
+		         g1, g2, se0, cps, cpb, rb0r, ha, hr, hw);
+		setProperty("N33,Busy", buf);
+	}
 	static uint32_t logged;
 	if (logged++ < 3) N48LOG("n33 metrics: if %#x, edge %u C hotspot %u C mem %u C, fan %u RPM pwm %u, gfx %u MHz busy %u%%, %u W",
 	                         ifv, u16(120), u16(122), u16(128), u16(152), u8(150), m[0], u16(104), u16(116));
