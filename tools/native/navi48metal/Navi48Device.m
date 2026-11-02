@@ -5250,7 +5250,7 @@ N48_DNR(N48RenderEncoder)
     if (!vb) return;
     if (![vb isKindOfClass:[N48Buffer class]] || ![(N48Buffer *)vb contents]) { N48_ONCE("occlusion: the visibility result buffer is not a CPU-mapped N48Buffer; its offsets are not written"); return; }
     int acc = 0;
-    if ([d respondsToSelector:@selector(visibilityResultType)]) acc = (long)[(id)d visibilityResultType] == 1;   // MTLVisibilityResultTypeAccumulate
+    { SEL vrt = NSSelectorFromString(@"visibilityResultType"); if ([d respondsToSelector:vrt]) acc = ((long (*)(id, SEL))objc_msgSend)(d, vrt) == 1; }   // MTLVisibilityResultTypeAccumulate
     n48occ *o = [_cb n48OccNew:(N48Buffer *)vb accumulate:acc pool:&_qp base:&_qbase];
     if (!o) return;
     _occ = o;
