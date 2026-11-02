@@ -42,6 +42,10 @@ is in: `N33,Native` says ready.
   1920x1080 pitch 1920; rendered pixels correct; acquire/register/present/release all 0; the
   triangle was SEEN on the monitor for 5 s and the desktop came back (restore retired). First
   GPU-rendered frame on screen on Navi 33 under macOS. No vsync (copy, not flip): tearing expected.
+- 2026-11-01: merged upstream Cobalt64 (kext 0.0.664 -> ours 0.0.665, Mesa 0001-0009 + our 0010). On macOS
+  Tahoe 26.6.2 (25G83), SMBIOS MacPro7,1: all 12 stages, ABI 1.8 reported, fill / triangle / present all OK
+  (CI run 41340553721). The Navi 33 engine is one exclusive session; APP sessions, host import (21), VRAM budget
+  (1.10) and the multi-display scanout (22..26) are not on gfx11 yet.
 - Known limits: only the gfx queue (compute/transfer submits are refused by cs_parse), all BOs in
   the BAR0-visible pool (216 MiB), GTT requests also land there.
 
