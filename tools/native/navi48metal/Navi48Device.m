@@ -6259,7 +6259,21 @@ static void n48_census_log(void) {
 // (SUSPECTED from -[_MTLDevice name] at 0x7ff80f49a2f6; fallback string "Unnamed_GPU") -> "AMD Radeon RX 9070 XT".
 - (NSString *)vendorName  { return @"AMD"; }
 - (NSString *)familyName  { return @"Radeon"; }
-- (NSString *)productName { return @"RX 9070 XT"; }
+// The nub's "model" (the bring-up kext sets "AMD Radeon RX 7600" on a Navi 33, "AMD Radeon RX 9070 XT" otherwise), minus "AMD Radeon ".
+- (NSString *)productName {
+    static NSString *pn; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        pn = @"RX 9070 XT";
+        io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("Navi48MetalNub"));
+        if (s) {
+            CFTypeRef v = IORegistryEntryCreateCFProperty(s, CFSTR("model"), kCFAllocatorDefault, 0);
+            if (v && CFGetTypeID(v) == CFStringGetTypeID()) { NSString *m = (__bridge NSString *)v; pn = [m hasPrefix:@"AMD Radeon "] ? [m substringFromIndex:11] : [m copy]; }
+            if (v) CFRelease(v);
+            IOObjectRelease(s);
+        }
+    });
+    return pn;
+}
 
 // featureProfile: -[AppleParavirtDevice featureProfile] (pvm.x86 0xacc3) is `mov eax,0x2710; ret` = 10000 (CONFIRMED).
 - (NSUInteger)featureProfile { return 10000; }

@@ -23,7 +23,9 @@ clang -fobjc-arc -O1 -arch x86_64 -mmacosx-version-min=13.0 "$REPO/tools/native/
   -o "$REPO/tools/native/mtlprobe/mtlprobe"
 echo "built n48nub and mtlprobe"
 
+BUNDLE_ONLY=0; [ "${1:-}" = "--bundle" ] && BUNDLE_ONLY=1   # --bundle: only reinstall the Metal bundle (no reboot needed)
 sudo -v
+if [ $BUNDLE_ONLY = 0 ]; then
 say "2/4 boot-arg navi48-metal=1"
 [ -f "$OC" ] || sudo diskutil mount OPENCORE >/dev/null
 [ -f "$OC" ] || { echo "cannot find $OC"; exit 1; }
@@ -47,6 +49,7 @@ kmutil libraries -p "$AUX_DST" -a x86_64 2>&1 | tail -5 || true
 echo "asking macOS to load it once ('not approved' is expected the first time):"
 sudo kmutil load -p "$AUX_DST" 2>&1 | tail -5 || true
 
+fi
 say "4/4 Metal bundle -> /Library/GPUBundles"
 U=$(mktemp -d)
 tar -xf "$TAR" -C "$U"

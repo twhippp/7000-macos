@@ -18,7 +18,7 @@ ioreg -r -w0 -c Navi48Accelerator 2>/dev/null | grep -E "MetalPlugin|\"IOClass\"
 say "mtlprobe list"
 sudo env N48M_ALLOW=1 "$REPO/tools/native/mtlprobe/mtlprobe" list
 say "mtlprobe triangle"
-sudo env N48M_ALLOW=1 "$REPO/tools/native/mtlprobe/mtlprobe" triangle "$HOME/navi48-native/metal-tri.png"; echo "triangle rc=$?"
+sudo env N48M_ALLOW=1 N48M_TEST_INPROC=1 "$REPO/tools/native/mtlprobe/mtlprobe" triangle "$HOME/navi48-native/metal-tri.png"; echo "triangle rc=$?"
 say "kernel log (last 40 Navi48 lines)"
 log show --last 3m --predicate 'sender CONTAINS "Navi48" OR sender CONTAINS "accelprobe"' 2>/dev/null | tail -40
 say "done: $LOG"
