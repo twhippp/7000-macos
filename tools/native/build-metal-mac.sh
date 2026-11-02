@@ -9,6 +9,10 @@
 # Outputs: tools/native/navi48accel/build/Navi48Accel.kext, tools/native/navi48metal/build/Navi48Metal.bundle.tar
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+# the layout tools need these (same values make-layout.sh used)
+export C64_WORK="$REPO/tools/ioaccel-layout/c64-work"
+export C64_LAYOUT_OUT="$REPO/tools/ioaccel-layout/generated"
+export C64_MKSDK="$REPO/src/RDNA4FB/MacKernelSDK"
 NN="$HOME/navi48-native"
 M2V="$NN/metal2vulkan"
 M2V_SHA=43c46ac8a24adf1a6e872b8a52c706ec9614fad0      # third-party/metal2vulkan-n48/NOTICE
