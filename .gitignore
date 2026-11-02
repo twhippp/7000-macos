@@ -22,3 +22,8 @@ src/navi48-bringup/firmware/
 runs/
 *.log
 .DS_Store
+# Apple-derived, generated on your own Mac, never committed (tools/ioaccel-layout/README.md)
+tools/ioaccel-layout/generated/
+tools/ioaccel-layout/c64-work/
+tools/ioaccel-layout/layout-out/
+src/RDNA4FB/
