@@ -27,3 +27,5 @@ tools/ioaccel-layout/generated/
 tools/ioaccel-layout/c64-work/
 tools/ioaccel-layout/layout-out/
 src/RDNA4FB/
+tools/native/n48nub/n48nub
+tools/native/mtlprobe/mtlprobe

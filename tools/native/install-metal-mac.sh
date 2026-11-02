@@ -1,0 +1,60 @@
+#!/bin/zsh
+# install-metal-mac.sh - put the Metal side in place on the Navi 33 bench (run as yourself; it asks for your password once).
+#   1. builds n48nub + mtlprobe
+#   2. adds navi48-metal=1 to OpenCore's boot-args (config.plist backed up next to it)
+#   3. copies the aux kext to /Library/Extensions/Navi48Accel-0.0.7.kext and asks macOS to load it (the first answer is "not approved": expected)
+#   4. installs the Metal bundle into /Library/GPUBundles
+# Then: approve the kext in System Settings > Privacy & Security, reboot once, run tools/native/metal-check-mac.sh.
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+AUX_SRC="$REPO/tools/native/navi48accel/build/Navi48Accel.kext"
+TAR="$REPO/tools/native/navi48metal/build/Navi48Metal.bundle.tar"
+AUX_DST=/Library/Extensions/Navi48Accel-0.0.7.kext
+OC=/Volumes/OPENCORE/EFI/OC/config.plist
+BA=':NVRAM:Add:7C436110-AB2A-4BBB-A880-FE41995C9F82:boot-args'
+say() { print -r -- "== $*"; }
+
+[ -d "$AUX_SRC" ] && [ -f "$TAR" ] || { echo "run tools/native/build-metal-mac.sh first"; exit 1; }
+
+say "1/4 tools"
+clang -O1 "$REPO/tools/native/n48nub/n48nub.c" -framework IOKit -o "$REPO/tools/native/n48nub/n48nub"
+clang -fobjc-arc -O1 -arch x86_64 -mmacosx-version-min=13.0 "$REPO/tools/native/mtlprobe/mtlprobe.m" \
+  -framework Metal -framework Foundation -framework IOKit -framework CoreGraphics -framework ImageIO -framework IOSurface \
+  -o "$REPO/tools/native/mtlprobe/mtlprobe"
+echo "built n48nub and mtlprobe"
+
+sudo -v
+say "2/4 boot-arg navi48-metal=1"
+[ -f "$OC" ] || sudo diskutil mount OPENCORE >/dev/null
+[ -f "$OC" ] || { echo "cannot find $OC"; exit 1; }
+cur=$(/usr/libexec/PlistBuddy -c "Print $BA" "$OC")
+if [[ " $cur " == *" navi48-metal=1 "* ]]; then echo "already there: $cur"
+else
+  sudo cp "$OC" "$OC.pre-metal.backup"
+  sudo /usr/libexec/PlistBuddy -c "Set $BA $cur navi48-metal=1" "$OC"
+  echo "boot-args now: $(/usr/libexec/PlistBuddy -c "Print $BA" "$OC")"
+fi
+
+say "3/4 aux kext -> $AUX_DST"
+for p in /Library/Extensions/*.kext(N); do
+  [ "$p" = "$AUX_DST" ] && continue
+  if grep -q com.navi48.accelprobe "$p/Contents/Info.plist" 2>/dev/null; then sudo mv "$p" "$HOME/navi48-staging/$(basename $p).old.$(date +%s)"; echo "moved aside $p"; fi
+done
+sudo rm -rf "$AUX_DST"
+sudo cp -R "$AUX_SRC" "$AUX_DST"
+sudo chown -R root:wheel "$AUX_DST"; sudo chmod -R go-w "$AUX_DST"; sudo xattr -cr "$AUX_DST"
+kmutil libraries -p "$AUX_DST" -a x86_64 2>&1 | tail -5 || true
+echo "asking macOS to load it once ('not approved' is expected the first time):"
+sudo kmutil load -p "$AUX_DST" 2>&1 | tail -5 || true
+
+say "4/4 Metal bundle -> /Library/GPUBundles"
+U=$(mktemp -d)
+tar -xf "$TAR" -C "$U"
+sudo mkdir -p /Library/GPUBundles
+sudo rm -rf /Library/GPUBundles/Navi48Metal.bundle
+sudo cp -R "$U/Navi48Metal.bundle" /Library/GPUBundles/Navi48Metal.bundle
+sudo chown -R root:wheel /Library/GPUBundles/Navi48Metal.bundle; sudo xattr -cr /Library/GPUBundles/Navi48Metal.bundle
+codesign --verify -v /Library/GPUBundles/Navi48Metal.bundle 2>&1 | tail -2
+
+say "SIP: $(csrutil status 2>&1 | head -1)"
+say "INSTALL OK. Next: System Settings > Privacy & Security > allow the 'navi48' software (if asked), reboot, then run tools/native/metal-check-mac.sh"
