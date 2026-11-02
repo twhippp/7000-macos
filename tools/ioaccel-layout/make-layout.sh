@@ -43,8 +43,11 @@ for bid in com.apple.iokit.IOAcceleratorFamily2 com.apple.driver.AppleParavirtGP
 done
 
 say "MacKernelSDK (for check_layout)"
+# Acidanthera's MacKernelSDK, as the kext CI uses; placed where navi48accel's Makefile looks (src/RDNA4FB/MacKernelSDK).
 if [ ! -d "$C64_MKSDK/Headers" ]; then
-	git clone -q --depth 1 https://github.com/somestupidgirl/RDNA4FB "$REPO/src/RDNA4FB"
+	mkdir -p "$(dirname "$C64_MKSDK")"
+	rm -rf "$C64_MKSDK"
+	git clone -q --depth 1 https://github.com/acidanthera/MacKernelSDK.git "$C64_MKSDK"
 fi
 ls -d "$C64_MKSDK/Headers"
 
