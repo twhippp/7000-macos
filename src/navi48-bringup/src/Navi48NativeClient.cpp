@@ -182,6 +182,12 @@ IOReturn IOAccelNavi48NativeClient::externalMethod(uint32_t selector, IOExternal
 	// 0.0.667: on a Navi 33, selector 15 (the DAL step, gfx12-only) is the SMU power experiment instead: in [0] message [1] parameter,
 	// out [0] response [1] the parameter register after it. Administrator only (selector_allowed above); the message must be on
 	// Navi48Bringup::n33SmuExperiment's allow-list (power-saving / read-only messages of smu_v13_0_7_ppsmc.h).
+	// 0.0.667: selector 16 (the DAL mode trial, gfx12-only) publishes the Navi 33 boot console as display index 3 (Navi48DisplayNub::publishNavi33):
+	// in none, out [0] status [1] nub id [2] aperture phys [3] length. Administrator only, like 15.
+	if (n33 && selector == N48N_SEL_MODE_TRIAL) {
+		if (!shape(0, 4, 0, 0) || owner == nullptr) return kIOReturnBadArgument;
+		return owner->n33FbPublish(so);
+	}
 	if (n33 && selector == N48N_SEL_DAL_STEP) {
 		if (!shape(2, 2, 0, 0) || owner == nullptr) return kIOReturnBadArgument;
 		return owner->n33SmuExperiment((uint32_t)si[0], (uint32_t)si[1], so);

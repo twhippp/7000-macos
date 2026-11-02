@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.667</string>
+	<string>0.0.668</string>
 	<key>CFBundleVersion</key>
-	<string>0.0.667</string>
+	<string>0.0.668</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>Navi48AccelPeer</key>

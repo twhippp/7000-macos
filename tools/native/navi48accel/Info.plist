@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.7</string>
+	<string>0.0.8</string>
 	<key>CFBundleVersion</key>
-	<string>0.0.7</string>
+	<string>0.0.8</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>Navi48Framebuffer</key>
@@ -34,6 +34,22 @@
 			<dict>
 				<key>Navi48DisplayIndex</key>
 				<integer>1</integer>
+			</dict>
+		</dict>
+		<key>Navi48FramebufferN33</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.navi48.accelprobe</string>
+			<key>IOClass</key>
+			<string>Navi48Framebuffer</string>
+			<key>IOMatchCategory</key>
+			<string>IOFramebuffer</string>
+			<key>IOProviderClass</key>
+			<string>Navi48DisplayNub</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>Navi48DisplayIndex</key>
+				<integer>3</integer>
 			</dict>
 		</dict>
 		<key>Navi48Framebuffer2</key>

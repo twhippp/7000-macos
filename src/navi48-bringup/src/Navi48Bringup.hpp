@@ -44,6 +44,7 @@ class Navi48Bringup : public IOService {
 	using super = IOService;
 
 public:
+	IOReturn n33FbPublish(uint64_t out[4]);   // 0.0.667: N48N selector 16 on a Navi 33 (the console as display index 3)
 	IOReturn n33SmuExperiment(uint32_t msg, uint32_t param, uint64_t out[2]);   // 0.0.667: N48N selector 15 on a Navi 33
 	void navi33SmuMetrics();    // 0.0.666: SMU 13.0.7 metrics -> N33,Temps / N33,Fan / N33,Clocks (read-only)
 	void navi33MetricsStart();  // first read + a 10 s refresh

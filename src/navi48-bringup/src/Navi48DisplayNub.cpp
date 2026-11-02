@@ -32,7 +32,7 @@ OSDefineMetaClassAndStructors(Navi48DisplayNub, IOService)
 
 // ---- state (one nub per boot; never withdrawn) ------------------------------------------------------------------------------------------------------------------------------------------
 namespace {
-constexpr unsigned   kNubs = 2;        // 0.0.658: slot 0 = display index 1 (the monitor B), slot 1 = display index 2 (the monitor A): slot = index - 1
+constexpr unsigned   kNubs = 3;        // 0.0.658: slot 0 = display index 1 (the monitor B), slot 1 = display index 2 (the monitor A): slot = index - 1; 0.0.667: slot 2 = index 3, the Navi 33 console
 IOLock              *gLock;            // created on first use; held across a whole fbpublish (serialises two callers, of either instance)
 Navi48DisplayNub    *gNub[kNubs];      // our reference while the nub lives
 volatile uint32_t    gExists[kNubs];   // 1 from the moment the nub is attached; NEVER cleared (no re-publish of that index this boot, even if the object is freed)
@@ -102,7 +102,7 @@ bool rdna4fb_edid_prop(const char *name, uint8_t out[128]) {
 }  // namespace
 
 bool n48fb_nub_exists_idx(uint32_t index) { return index >= 1u && index <= kNubs && __atomic_load_n(&gExists[index - 1u], __ATOMIC_ACQUIRE) != 0u; }      // 0.0.658: the nub of ONE display index
-bool n48fb_nub_exists(void) { return n48fb_nub_exists_idx(N48_DISP_INDEX) || n48fb_nub_exists_idx(N48_DISPA_INDEX); }                                         // ANY display nub (the interlocks: pipeadopt, pipearm 1, the Metal publish)
+bool n48fb_nub_exists(void) { return n48fb_nub_exists_idx(N48_DISP_INDEX) || n48fb_nub_exists_idx(N48_DISPA_INDEX); }   // the DCN displays only: the Navi 33 console (index 3) is not one of the interlocks                                         // ANY display nub (the interlocks: pipeadopt, pipearm 1, the Metal publish)
 
 // ---- the verb ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 uint32_t Navi48DisplayNub::publishVerb(Navi48Bringup *owner, uint64_t arg, uint64_t *out, unsigned count) {
@@ -223,6 +223,62 @@ uint32_t Navi48DisplayNub::publishVerb(Navi48Bringup *owner, uint64_t arg, uint6
 	return n48fb::kOk;
 }
 
+// ---- 0.0.667: the Navi 33 console (display index 3) ---------------------------------------------------------------------------------------------------------------------------------
+// The screen the GOP lit stays the scanout (no DCN programming on a Navi 33); this nub describes it so the aux kext's Navi48Framebuffer can drive it: the same
+// IOFramebuffer the M5 monitor B used, its geometry the console's, no EDID. Published on request (N48N selector 16 on a Navi 33, `n48nub fbpublish`), once per
+// boot; nothing on the hardware is read or written. out: [0] status (0 ok) [1] nub registry id [2] aperture phys [3] length.
+uint32_t Navi48DisplayNub::publishNavi33(uint64_t aperPhys, uint64_t aperLen, uint32_t w, uint32_t h, uint32_t pitch, uint64_t mc, uint64_t out[4]) {
+	for (unsigned i = 0; i < 4; i++) out[i] = 0;
+	ensure_lock();
+	if (!gLock) { out[0] = n48fb::kPublishFailed; return n48fb::kPublishFailed; }
+	const unsigned slot = N48_DISP_N33_INDEX - 1u;
+	IOLockLock(gLock);
+	uint32_t st = n48fb::kPublishFailed;
+	Navi48DisplayNub *nub = nullptr;
+	do {
+		if (__atomic_load_n(&gExists[slot], __ATOMIC_ACQUIRE)) { st = n48fb::kOk; out[1] = gNub[slot] ? gNub[slot]->getRegistryEntryID() : 0; break; }   // already published: report it
+		N48DispSnap snap;
+		bzero(&snap, sizeof snap);
+		snap.index = N48_DISP_N33_INDEX; snap.w = w; snap.h = h; snap.pitchBytes = pitch; snap.fmt = N48_DISP_FMT_ARGB8888;
+		snap.refresh1616 = 60u << 16; snap.pixHz = 0; snap.aperPhys = aperPhys; snap.aperLen = aperLen;
+		snap.mcA = mc; snap.mcB = mc + aperLen; snap.edidLen = 0;
+		const uint32_t sv = n48disp_snap_valid(&snap);
+		if (sv != N48_DSV_OK) { FBLOG("n33 fbpublish: the console snapshot failed validation (verdict %u: %ux%u pitch %u aperture %#llx + %#llx)", sv, w, h, pitch, (unsigned long long)aperPhys, (unsigned long long)aperLen); st = n48fb::kSnapshot; break; }
+		IOService *pci = navi48_bringup_pci();
+		OSDictionary *props = OSDictionary::withCapacity(3);
+		nub = OSTypeAlloc(Navi48DisplayNub);
+		if (pci && props && nub && nub->init(props)) {
+			OSNumber *idx = OSNumber::withNumber((uint64_t)N48_DISP_N33_INDEX, 32);
+			OSNumber *abi = OSNumber::withNumber((uint64_t)N48_DISP_ABI, 32);
+			if (idx && abi) {
+				nub->setProperty(N48_DISP_INDEX_KEY, idx);
+				nub->setProperty("Navi48,DisplayABI", abi);
+				nub->setProperty("Navi48,N33Console", true);
+				gSnap[slot] = snap;
+				__atomic_store_n(&gHaveSnap[slot], 1u, __ATOMIC_RELEASE);
+				if (nub->attach(pci)) { gNub[slot] = nub; __atomic_store_n(&gExists[slot], 1u, __ATOMIC_RELEASE); st = n48fb::kOk; }
+				else __atomic_store_n(&gHaveSnap[slot], 0u, __ATOMIC_RELEASE);
+			}
+			if (idx) idx->release();
+			if (abi) abi->release();
+		}
+		if (props) props->release();
+		if (st != n48fb::kOk) break;
+		out[1] = nub->getRegistryEntryID(); out[2] = aperPhys; out[3] = aperLen;
+		nub->retain();
+	} while (false);
+	const bool fresh = st == n48fb::kOk && nub != nullptr;
+	IOLockUnlock(gLock);
+	if (st != n48fb::kOk) { if (nub && !n48fb_nub_exists_idx(N48_DISP_N33_INDEX)) nub->release(); out[0] = st; FBLOG("n33 fbpublish: FAILED: %s", n48fb::status_name(st)); return st; }
+	if (fresh) {
+		FBLOG("n33 fbpublish: console nub published (id %llu): %ux%u pitch %u, aperture %#llx + %#llx: the aux framebuffer may now match it", (unsigned long long)out[1], w, h, pitch, (unsigned long long)aperPhys, (unsigned long long)aperLen);
+		nub->registerService();
+		nub->release();
+	}
+	out[0] = n48fb::kOk;
+	return n48fb::kOk;
+}
+
 IOService *Navi48DisplayNub::framebufferOf(uint32_t index) {
 	if (index < 1u || index > kNubs || !gLock) return nullptr;
 	IOLockLock(gLock);
@@ -244,7 +300,7 @@ IOService *Navi48DisplayNub::framebufferOf(uint32_t index) {
 	return found;
 }
 
-IOService *Navi48DisplayNub::published() { return gNub[0] ? gNub[0] : gNub[1]; }      // 0.0.658: the first published nub (the monitor B's, else the monitor A's); NOT retained
+IOService *Navi48DisplayNub::published() { return gNub[0] ? gNub[0] : gNub[1] ? gNub[1] : gNub[2]; }      // 0.0.658: the first published nub (the monitor B's, else the monitor A's); NOT retained
 
 void Navi48DisplayNub::shutdown() {
 	if (!gLock) return;

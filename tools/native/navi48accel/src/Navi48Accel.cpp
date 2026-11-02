@@ -619,8 +619,10 @@ bool Navi48Framebuffer::start(IOService *provider) {
 	uint32_t wsv = 0, m6v = 0;
 	const bool metalWsArg = PE_parse_boot_argn("navi48-metal-ws", &wsv, sizeof(wsv));      // present with ANY value: that boot gives the DP to the GPU desktop
 	const bool m6On = m6_on(PE_parse_boot_argn("navi48-m6", &m6v, sizeof(m6v)), m6v);       // 0.0.7 (M6 Stage 1a, R1): navi48-m6=1 lifts the refusal (the bring-up kext's routing guard replaces it)
-	const bool metalWs = fb_metal_ws_blocks(metalWsArg, m6On);                                // what the verdict below judges: metal-ws present AND the M6 latch OFF
 	const bool isNub = n48_is_class(provider, N48_DISP_NUB_CLASS);
+	// aux 0.0.8: the Navi 33 console (index 3) is the very screen the GPU desktop uses, so navi48-metal-ws never blocks it
+	const bool n33Console = isNub && n48_provider_index(provider) == N48_DISP_N33_INDEX;
+	const bool metalWs = fb_metal_ws_blocks(metalWsArg, m6On || n33Console);                 // what the verdict below judges: metal-ws present AND the M6 latch OFF
 	const bool layoutOk = !metalWs && isNub && n48_layout_gate();         // the runtime layout gate runs HERE too: on an fb2 boot no accelerator is probed (the gate's other caller), and the framebuffer must never start unproven
 	const N48DispOps *o = layoutOk ? n48_get_dops(provider) : nullptr;
 	const uint32_t pidx = n48_provider_index(provider);                   // 0.0.6: which display this nub is (1 = the monitor B, 2 = the monitor A)

@@ -837,6 +837,14 @@ uint32_t Navi48Bringup::smuMailbox(uint32_t msgId, uint32_t param, uint32_t *ret
 	if (gSmuMbLock) IOLockUnlock(gSmuMbLock);
 	return r;
 }
+// 0.0.667: N48N selector 16 on a Navi 33: describe the boot console to the aux framebuffer (display index 3). Reads nothing on the GPU.
+IOReturn Navi48Bringup::n33FbPublish(uint64_t out[4]) {
+	uint64_t off = 0, len = 0; uint32_t w = 0, h = 0, row = 0;
+	if (!amdgpu::n33n_available() || !consoleGeometry(&off, &len, &w, &h, &row)) return kIOReturnNotReady;
+	const uint32_t st = Navi48DisplayNub::publishNavi33(bar0Phys + off, len, w, h, row, dev.vramMC(off), out);
+	N48LOG("n33 fbpublish: console vram+%#llx %ux%u row %u -> status %u", (unsigned long long)off, w, h, row, st);
+	return st == 0 ? kIOReturnSuccess : kIOReturnError;
+}
 // Messages a client may send on a Navi 33 (selector 15): power saving and reads only (smu_v13_0_7_ppsmc.h).
 IOReturn Navi48Bringup::n33SmuExperiment(uint32_t msg, uint32_t param, uint64_t out[2]) {
 	static const uint32_t kAllowed[] = { 0x02, 0x03, 0x0C, 0x0D, 0x19, 0x1A, 0x1D, 0x1E, 0x1F, 0x24, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x33, 0x35 };

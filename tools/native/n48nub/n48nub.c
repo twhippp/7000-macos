@@ -11,7 +11,8 @@
 int main(int argc, char **argv) {
     int regs = argc >= 3 && !strcmp(argv[1], "regs");
     int smu = argc >= 3 && !strcmp(argv[1], "smu");
-    if (!regs && !smu && (argc != 2 || (strcmp(argv[1], "publish") && strcmp(argv[1], "withdraw")))) { fprintf(stderr, "usage: n48nub publish|withdraw | regs <gc dword offset, hex> [count] | smu <msg hex> [param hex]\n"); return 64; }
+    int fbp = argc == 2 && !strcmp(argv[1], "fbpublish");
+    if (!regs && !smu && !fbp && (argc != 2 || (strcmp(argv[1], "publish") && strcmp(argv[1], "withdraw")))) { fprintf(stderr, "usage: n48nub publish|withdraw | regs <gc dword offset, hex> [count] | smu <msg hex> [param hex] | fbpublish\n"); return 64; }
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("Navi48Bringup"));
     if (!svc) { printf("n48nub: no Navi48Bringup service\n"); return 1; }
     io_connect_t c = 0;
@@ -23,6 +24,12 @@ int main(int argc, char **argv) {
     if (kr) { printf("n48nub: hello failed 0x%08x\n", kr); IOServiceClose(c); return 1; }
     printf("n48nub: hello ABI %llu.%llu\n", out[0] & 0xffff, out[0] >> 16);
     uint64_t f = 0; memset(out, 0, sizeof out);
+    if (fbp) {    /* Navi 33 (kext >= 0.0.667): the boot console as display index 3 for the aux framebuffer (selector 16) */
+        uint64_t so[4] = { 0 }; uint32_t sn = 4;
+        kr = IOConnectCallScalarMethod(c, 16, NULL, 0, so, &sn);
+        printf("fbpublish: %s 0x%08x status %llu nub id %#llx aperture %#llx + %#llx\n", kr ? "refused" : "ok", kr, so[0], so[1], so[2], so[3]);
+        IOServiceClose(c); return kr ? 1 : 0;
+    }
     if (smu) {    /* Navi 33 (kext >= 0.0.667): one allow-listed SMU 13.0.7 message (selector 15) */
         uint64_t si[2] = { strtoull(argv[2], NULL, 16), argc >= 4 ? strtoull(argv[3], NULL, 16) : 0 }, so[2] = { 0 }; uint32_t sn = 2;
         kr = IOConnectCallScalarMethod(c, 15, si, 2, so, &sn);

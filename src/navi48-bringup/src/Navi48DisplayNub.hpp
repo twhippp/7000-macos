@@ -25,6 +25,8 @@ class Navi48DisplayNub : public IOService {
 public:
 	// The verb `fbpublish 2` (the monitor B) / `fbpublish 1` (the monitor A, 0.0.658) (accel action 105): out[0..12] = the n48fb::Status and the published values; returns the status. All gating is n48fb::pre_verdict / live_verdict / data_verdict.
 	static uint32_t publishVerb(Navi48Bringup *owner, uint64_t arg, uint64_t *out, unsigned count);
+	// 0.0.667: the Navi 33 boot console as display index 3 (no hardware access); out[0] status [1] nub id [2] aperture phys [3] length.
+	static uint32_t publishNavi33(uint64_t aperPhys, uint64_t aperLen, uint32_t w, uint32_t h, uint32_t pitch, uint64_t mc, uint64_t out[4]);
 	// Navi48Bringup::stop: terminate the nub if it is published (no-op otherwise).
 	static void shutdown();
 	// The published nub (NOT retained: an identity), or NULL. 0.0.658: the first one (the monitor B's, else the monitor A's).

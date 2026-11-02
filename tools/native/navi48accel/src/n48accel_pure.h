@@ -152,7 +152,7 @@ inline FbStart fb_start_verdict(bool auxOn, bool metalWsPresent, bool providerIs
 // 0.0.6 (ABI 2, the monitor A): ONE class, TWO personalities (Navi48DisplayIndex 1 = the monitor B, 2 = the monitor A). The provider's index property decides which geometry the snapshot MUST carry: the ops table is checked FOR THAT INDEX
 // (n48disp_ops_check_for: index 2 needs an ABI-2 table, so an ABI-1 bring-up kext is refused cleanly) and the snapshot must be valid for its own index (n48disp_snap_valid: the per-index geometry table of Navi48DisplayOps.h)
 // AND carry exactly the index of the nub it was fetched from. Nothing is hard-wired to the monitor B's resolution here: the mode, the pixel format, the aperture and the EDID all come from the snapshot.
-inline uint32_t fb_provider_index(bool haveNumber, uint64_t value) { return (haveNumber && (value == N48_DISP_INDEX || value == N48_DISPA_INDEX)) ? (uint32_t)value : 0u; }
+inline uint32_t fb_provider_index(bool haveNumber, uint64_t value) { return (haveNumber && (value == N48_DISP_INDEX || value == N48_DISPA_INDEX || value == N48_DISP_N33_INDEX)) ? (uint32_t)value : 0u; }   // aux 0.0.8: 3 = the Navi 33 console
 inline uint32_t fb_snap_for_index(const N48DispSnap *s, uint32_t providerIndex) {
     const uint32_t v = n48disp_snap_valid(s);
     if (v != N48_DSV_OK) return v;

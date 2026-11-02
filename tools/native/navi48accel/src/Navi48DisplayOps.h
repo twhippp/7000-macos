@@ -43,6 +43,8 @@
 
 /* 0.0.658 (ABI 2): the monitor A SINK-B's mode (instance 1 = display index 2): 1920x1080 @ 60 Hz, 148.50 MHz, 2200 x 1125 total, DDC line 2. The aperture is the exact frame (8,294,400 = 2025 pages); the allocation behind it is 127 x 64 KiB = 8,323,072 bytes. */
 #define N48_DISPA_INDEX       2u
+/* 0.0.667: display index 3 = the Navi 33 boot console (the screen the GOP lit; no DCN programming): its geometry is the console's, carried in the snapshot (no fixed table row), EDID optional */
+#define N48_DISP_N33_INDEX    3u
 #define N48_DISPA_OTG         1u
 #define N48_DISPA_DDC_LINE    2u
 #define N48_DISPA_W           1920u
@@ -204,6 +206,7 @@ static inline uint32_t n48disp_ops_check_for(const struct N48DispOps *o, uint32_
     if (v != N48_DOV_OK) return v;
     if (index == N48_DISP_INDEX) return N48_DOV_OK;
     if (index == N48_DISPA_INDEX) return o->abi >= N48_DISP_ABI_MULTI ? N48_DOV_OK : N48_DOV_ABI;
+    if (index == N48_DISP_N33_INDEX) return o->abi >= N48_DISP_ABI_MULTI ? N48_DOV_OK : N48_DOV_ABI;
     return N48_DOV_ABI;
 }
 
@@ -233,6 +236,15 @@ static inline uint32_t n48disp_snap_valid(const struct N48DispSnap *s)
 {
     struct N48DispGeom g;
     if (!s) return N48_DSV_NULL;
+    if (s->index == N48_DISP_N33_INDEX) {   /* the Navi 33 console: sane geometry, a page-aligned aperture of exactly pitch * h, EDID absent or valid */
+        if (s->w < 640u || s->w > 7680u || s->h < 480u || s->h > 4320u || s->pitchBytes < s->w * 4u || (s->pitchBytes & 3u) != 0u || s->fmt != N48_DISP_FMT_ARGB8888 || s->refresh1616 == 0u) return N48_DSV_GEOMETRY;
+        if (s->aperPhys == 0u || (s->aperPhys & 0xFFFull) != 0u || s->aperLen != (uint64_t)s->pitchBytes * s->h || s->aperPhys + s->aperLen < s->aperPhys) return N48_DSV_APERTURE;
+        if (s->mcA == 0u || s->mcB == 0u || s->mcA == s->mcB) return N48_DSV_MC;
+        if (s->edidLen == 0u) return N48_DSV_OK;
+        if (s->edidLen != N48_DISP_EDID_BYTES) return N48_DSV_EDID_LEN;
+        if (!n48disp_edid_header_ok(s->edid)) return N48_DSV_EDID_HDR;
+        return N48_DSV_OK;
+    }
     if (!n48disp_geom_for_index(s->index, &g)) return N48_DSV_INDEX;       /* 0.0.658: index 1 = the monitor B (2560x1440), index 2 = the monitor A (1920x1080); anything else is refused */
     if (s->otg != g.otg || s->ddcLine != g.ddcLine || s->w != g.w || s->h != g.h || s->pitchBytes != g.pitchBytes ||
         s->fmt != g.fmt || s->refresh1616 != g.refresh1616 || s->pixHz != g.pixHz || s->aperLen != g.aperLen) return N48_DSV_GEOMETRY;
