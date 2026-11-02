@@ -1424,6 +1424,13 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 		if (!consoleGeometry(nullptr, nullptr, &conW, &conH, &conRow)) conW = conH = conRow = 0;   // scanout refused without it
 		amdgpu::n33n_attach(dev, bootFbOff, bootFbLen, conW, conH, conRow);
 		setProperty("N33,Native", amdgpu::n33n_available() ? "ready" : "not-ready");
+		if (pciDevice) {   // 0.0.671: what System Information / About This Mac show for the card (the IOPCIDevice's model and VRAM size)
+			static const char kModel[] = "AMD Radeon RX 7600";
+			const uint64_t vram = dev.vramSizeBytes ? dev.vramSizeBytes : (8ull << 30);
+			if (OSData *m = OSData::withBytes(kModel, sizeof(kModel))) { pciDevice->setProperty("model", m); m->release(); }
+			pciDevice->setProperty("VRAM,totalMB", vram >> 20, 32);
+			pciDevice->setProperty("VRAM,totalsize", vram, 64);
+		}
 		uint32_t cg = 0;   // 0.0.669: navi33-cg=1 turns GFX clock gating on at boot (default off until proven on the bench)
 		if (amdgpu::n33n_available() && PE_parse_boot_argn("navi33-cg", &cg, sizeof(cg)) && cg == 1u) (void)n33ClockGating(true);
 	}
