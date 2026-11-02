@@ -179,6 +179,13 @@ IOReturn IOAccelNavi48NativeClient::externalMethod(uint32_t selector, IOExternal
 	// Navi 33: selectors 0..8 run on the gfx11 engine, 9..14 (scanout) on its copy-to-console present (navi33_native.cpp),
 	// 19/20 (the Metal nub) read the Navi 33 gate themselves. DAL / mode (15..18), host import (21) and the multi-display
 	// scanout (22..26) are not there yet; host import (21) is (navi33_native.cpp, ABI 1.9). The n48dcn display layer (DCN 4.1) is never bound on a Navi 33.
+	// 0.0.667: on a Navi 33, selector 15 (the DAL step, gfx12-only) is the SMU power experiment instead: in [0] message [1] parameter,
+	// out [0] response [1] the parameter register after it. Administrator only (selector_allowed above); the message must be on
+	// Navi48Bringup::n33SmuExperiment's allow-list (power-saving / read-only messages of smu_v13_0_7_ppsmc.h).
+	if (n33 && selector == N48N_SEL_DAL_STEP) {
+		if (!shape(2, 2, 0, 0) || owner == nullptr) return kIOReturnBadArgument;
+		return owner->n33SmuExperiment((uint32_t)si[0], (uint32_t)si[1], so);
+	}
 	if (n33 && selector > N48N_SEL_SCAN_RELEASE && selector != N48N_SEL_METAL_NUB_PUBLISH && selector != N48N_SEL_METAL_NUB_WITHDRAW && selector != N48N_SEL_BO_IMPORT_HOST)
 		return kIOReturnUnsupported;
 	if (n33 && selector >= N48N_SEL_SCAN_QUERY && selector <= N48N_SEL_SCAN_RELEASE) {

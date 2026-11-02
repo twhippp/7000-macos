@@ -44,6 +44,7 @@ class Navi48Bringup : public IOService {
 	using super = IOService;
 
 public:
+	IOReturn n33SmuExperiment(uint32_t msg, uint32_t param, uint64_t out[2]);   // 0.0.667: N48N selector 15 on a Navi 33
 	void navi33SmuMetrics();    // 0.0.666: SMU 13.0.7 metrics -> N33,Temps / N33,Fan / N33,Clocks (read-only)
 	void navi33MetricsStart();  // first read + a 10 s refresh
 	IOService *probe(IOService *provider, SInt32 *score) override;
@@ -120,7 +121,8 @@ private:
 	void publishNavi33Summary();   // N33,Summary / N33,Warnings: one short line per boot
 	void stagePSPNavi33(); // navi33-psp=1 — PSP 13.0.7 SOS boot; navi33-psp=2 adds ring + TMR
 	void stagePSPRingNavi33(uint32_t level); // navi33-psp=2: ring + TOC + SMU + TMR; >=3: + GFX firmware + RLC autoload
-	uint32_t smuMailbox(uint32_t msgId, uint32_t param, uint32_t *ret, uint32_t timeoutMs = 500);   // MP1 C2PMSG_66/82/90; returns resp
+	uint32_t smuMailbox(uint32_t msgId, uint32_t param, uint32_t *ret, uint32_t timeoutMs = 500);
+	uint32_t smuMailboxLocked(uint32_t msgId, uint32_t param, uint32_t *ret, uint32_t timeoutMs);   // MP1 C2PMSG_66/82/90; returns resp
 	void navi33SmuFeatures();   // navi33-psp>=3: Linux smu_smc_hw_setup subset (driver table, BTC, feature enable)
 	bool runPspChain(const uint8_t *fw, size_t fwSize, int gen);   // shared body; gen = n48::PspGen
 	bool buildDeviceContext();   // fills `dev` for the ported amdgpu modules

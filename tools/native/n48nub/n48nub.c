@@ -10,7 +10,8 @@
 
 int main(int argc, char **argv) {
     int regs = argc >= 3 && !strcmp(argv[1], "regs");
-    if (!regs && (argc != 2 || (strcmp(argv[1], "publish") && strcmp(argv[1], "withdraw")))) { fprintf(stderr, "usage: n48nub publish|withdraw | regs <gc dword offset, hex> [count]\n"); return 64; }
+    int smu = argc >= 3 && !strcmp(argv[1], "smu");
+    if (!regs && !smu && (argc != 2 || (strcmp(argv[1], "publish") && strcmp(argv[1], "withdraw")))) { fprintf(stderr, "usage: n48nub publish|withdraw | regs <gc dword offset, hex> [count] | smu <msg hex> [param hex]\n"); return 64; }
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("Navi48Bringup"));
     if (!svc) { printf("n48nub: no Navi48Bringup service\n"); return 1; }
     io_connect_t c = 0;
@@ -22,6 +23,12 @@ int main(int argc, char **argv) {
     if (kr) { printf("n48nub: hello failed 0x%08x\n", kr); IOServiceClose(c); return 1; }
     printf("n48nub: hello ABI %llu.%llu\n", out[0] & 0xffff, out[0] >> 16);
     uint64_t f = 0; memset(out, 0, sizeof out);
+    if (smu) {    /* Navi 33 (kext >= 0.0.667): one allow-listed SMU 13.0.7 message (selector 15) */
+        uint64_t si[2] = { strtoull(argv[2], NULL, 16), argc >= 4 ? strtoull(argv[3], NULL, 16) : 0 }, so[2] = { 0 }; uint32_t sn = 2;
+        kr = IOConnectCallScalarMethod(c, 15, si, 2, so, &sn);
+        if (kr) printf("smu: refused 0x%08x\n", kr); else printf("smu msg %#llx param %#llx -> resp %#llx (1 = OK) ret %#llx\n", si[0], si[1], so[0], so[1]);
+        IOServiceClose(c); return kr ? 1 : 0;
+    }
     if (regs) {   /* Navi 33 (kext >= 0.0.667): GC status registers, BASE_IDX 0 (GC segment 0 = 0x1260 on this card) */
         uint64_t gc = strtoull(argv[2], NULL, 16), cnt = argc >= 4 ? strtoull(argv[3], NULL, 0) : 1;
         uint64_t ri[3] = { gc + 0x1260, cnt, 0xFFFFFFFFull }; uint32_t vals[16] = { 0 }; size_t vs = cnt * 4;

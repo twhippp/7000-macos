@@ -829,7 +829,27 @@ static amdgpu::BringupContext gBringup;   // one ladder per boot; constructed at
 // Returns the response (0 = no answer within timeoutMs, default ~500 ms, or no mailbox).
 // Stages 1-2 send only TestMessage and GetSmuVersion, which change nothing; stage 3's
 // navi33SmuFeatures() is the one caller that changes power state.
+static IOLock *gSmuMbLock;   // 0.0.667: the boot path, the telemetry tick and the experiment selector share the mailbox
 uint32_t Navi48Bringup::smuMailbox(uint32_t msgId, uint32_t param, uint32_t *ret, uint32_t timeoutMs) {
+	if (!gSmuMbLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, &gSmuMbLock)) IOLockFree(l); }
+	if (gSmuMbLock) IOLockLock(gSmuMbLock);
+	const uint32_t r = smuMailboxLocked(msgId, param, ret, timeoutMs);
+	if (gSmuMbLock) IOLockUnlock(gSmuMbLock);
+	return r;
+}
+// Messages a client may send on a Navi 33 (selector 15): power saving and reads only (smu_v13_0_7_ppsmc.h).
+IOReturn Navi48Bringup::n33SmuExperiment(uint32_t msg, uint32_t param, uint64_t out[2]) {
+	static const uint32_t kAllowed[] = { 0x02, 0x03, 0x0C, 0x0D, 0x19, 0x1A, 0x1D, 0x1E, 0x1F, 0x24, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x33, 0x35 };
+	bool ok = false;
+	for (uint32_t m : kAllowed) ok |= m == msg;
+	if (!ok || !amdgpu::n33n_available()) return kIOReturnBadArgument;
+	uint32_t ret = 0;
+	const uint32_t resp = smuMailbox(msg, param, &ret, 2000);
+	out[0] = resp; out[1] = ret;
+	N48LOG("n33 smu experiment: msg %#x param %#x -> resp %#x ret %#x", msg, param, resp, ret);
+	return kIOReturnSuccess;
+}
+uint32_t Navi48Bringup::smuMailboxLocked(uint32_t msgId, uint32_t param, uint32_t *ret, uint32_t timeoutMs) {
 	uint32_t regMsg, regParam, regResp;
 	if (!ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, 0, 0x0282, regMsg)   ||
 	    !ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, 0, 0x0292, regParam) ||
