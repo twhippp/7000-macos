@@ -46,6 +46,9 @@ is in: `N33,Native` says ready.
   Tahoe 26.6.2 (25G83), SMBIOS MacPro7,1: all 12 stages, ABI 1.8 reported, fill / triangle / present all OK
   (CI run 41340553721). The Navi 33 engine is one exclusive session; APP sessions, host import (21), VRAM budget
   (1.10) and the multi-display scanout (22..26) are not on gfx11 yet.
+- 2026-11-01: layout map generated on the Tahoe bench (`tools/ioaccel-layout/make-layout.sh`): carve_kc.py carved
+  IOAcceleratorFamily2 (130 vtables) and AppleParavirtGPU (78) from the real KCs, check_layout: MATCH (16 classes,
+  3150 slots). Output in tools/ioaccel-layout/generated (gitignored, Apple-derived, stays on the Mac).
 - Known limits: only the gfx queue (compute/transfer submits are refused by cs_parse), all BOs in
   the BAR0-visible pool (216 MiB), GTT requests also land there.
 
@@ -55,5 +58,10 @@ is in: `N33,Native` says ready.
    GB_ADDR_CONFIG, and the firmware versions RADV gates features on (canned me 2390 / pfp 2530 /
    mec 2600 vs what the kext loaded).
 5. Scanout: copy-to-console done (above). Real flips on DCN 3.2 (vsync, no console fight) later.
-6. Next big piece: the Metal side (tools/native/navi48metal) on Navi 33, so macOS itself draws
+6. Metal side, in order: build navi48accel (aux kext, needs the generated map + src/RDNA4FB/MacKernelSDK) and
+   navi48metal on the Mac; work out its install (the aux kext depends on IOAcceleratorFamily2 in the System KC, so it
+   goes to the Aux KC: /Library/Extensions + approval, not OpenCore); present through the bundle's copy route
+   (n48_dispflip, the ABI 1.1 scanout the RX 7600 already passes) instead of upstream's DCN display pipe; host import
+   (21) for WindowServer's IOSurfaces. Upstream's autoarm recipe is DCN-4.1-specific (display pipe, M6): not usable as is.
+7. (old) Next big piece: the Metal side (tools/native/navi48metal) on Navi 33, so macOS itself draws
    through RADV. Then more VRAM (the hi pool above BAR0), compute/SDMA queues.
