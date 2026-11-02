@@ -28,7 +28,7 @@ rm -rf "$B"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$B/sanity
 cp "$D/Info.plist" "$APP/Contents/Info.plist"
 cp "$RADV" "$APP/Contents/Resources/libvulkan_radeon.dylib"
 cp "$XL" "$APP/Contents/Resources/libn48xlate.dylib"
-mkdir -p "$APP/Contents/Resources/spvcache"; for f in "$D"/spvcache/*.spv "$D"/spvcache/*.meta.json; do cat "$f" > "$APP/Contents/Resources/spvcache/${f:t}"; done   # cat, not cp: cp(1) hung forever in lseek on spvcache/eee33f36...meta.json   # 10d SPIR-V cache
+mkdir -p "$APP/Contents/Resources/spvcache"; for f in "$D"/spvcache/*.spv(N) "$D"/spvcache/*.meta.json(N); do cat "$f" > "$APP/Contents/Resources/spvcache/${f:t}"; done   # cat, not cp: cp(1) hung forever in lseek on spvcache/eee33f36...meta.json   # 10d SPIR-V cache; (N): none is fine (a public clone has none: Apple-derived)
 clang $VKINC -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -O2 -Wall -Wextra -Werror \
       -DN48_LAZY=$LAZY -DN48_9D=$F9D -I"$D" -bundle -framework Foundation -framework Metal -framework IOKit -framework IOSurface \
       -o "$APP/Contents/MacOS/Navi48Metal" "$D/Navi48Device.m"
