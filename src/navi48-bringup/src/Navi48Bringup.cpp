@@ -845,8 +845,52 @@ IOReturn Navi48Bringup::n33FbPublish(uint64_t out[4]) {
 	N48LOG("n33 fbpublish: console vram+%#llx %ux%u row %u -> status %u", (unsigned long long)off, w, h, row, st);
 	return st == 0 ? kIOReturnSuccess : kIOReturnError;
 }
-// Messages a client may send on a Navi 33 (selector 15): power saving and reads only (smu_v13_0_7_ppsmc.h).
+// 0.0.669: GFX clock gating as Linux sets it for GC 11.0.2 (gfx_v11_0_update_gfx_clock_gating; soc21.c cg_flags = GFX_CGCG | GFX_CGLS | REPEATER_FGCG,
+// one gfx pipe, two SDMA): coarse-grain gating + light sleep and the repeater FGCG, under RLC safe mode. Without it the RLC never gates the GFX clock,
+// which the PMFW counts as 100% activity (seen: 100% busy, 130 W, hotspot 104 C with GRBM idle). Register writes only, all in GC (gc_11_0_0 offsets).
+// Returns RLC_CGCG_CGLS_CTRL after the change.
+uint32_t Navi48Bringup::n33ClockGating(bool enable) {
+	using amdgpu::navi33_gc_reg;
+	auto rd = [&](uint32_t off, uint32_t idx) { return RREG32(dev, navi33_gc_reg(dev, off, idx)); };
+	auto wr = [&](uint32_t off, uint32_t idx, uint32_t v) { WREG32(dev, navi33_gc_reg(dev, off, idx), v); };
+	constexpr uint32_t kSafeMode = 0x0980, kMgcgOvr = 0x4c48, kCgcgCtrl = 0x4c49, kWptrPoll = 0x0f62, kCpInt = 0x1de9, kCpIntRing0 = 0x1e0a, kSdma0Cg = 0x005c, kSdma1Cg = 0x065c;
+	constexpr uint32_t kCgcgOvr = 0x8, kCglsOvr = 0x10, kRepOvr = 0x200, kCgcgEn = 0x1, kCglsEn = 0x2, kThrMask = 0x07FFFF00, kDelayMask = 0xFC;
+	constexpr uint32_t kIntBits = 0x00040000 | 0x00080000 | 0x00100000 | 0x00200000;   // CMP_BUSY, CNTX_BUSY, CNTX_EMPTY, GFX_IDLE
+	wr(kSafeMode, 1, 0x1 | (1u << 1));                                                  // enter RLC safe mode
+	for (uint32_t i = 0; i < 100000 && (rd(kSafeMode, 1) & 1u); i++) IODelay(1);
+	if (enable) {
+		wr(kMgcgOvr, 1, rd(kMgcgOvr, 1) & ~(kCgcgOvr | kCglsOvr | kRepOvr));
+		uint32_t c = rd(kCgcgCtrl, 1);
+		c = (c & ~kThrMask) | (0x36u << 8) | kCgcgEn;
+		c = (c & ~kDelayMask) | (0xFu << 2) | kCglsEn;
+		wr(kCgcgCtrl, 1, c);
+		wr(kWptrPoll, 0, (rd(kWptrPoll, 0) & ~0xFFFFFFFFu) | 0x0100u | (0x0090u << 16));
+		wr(kCpInt, 0, rd(kCpInt, 0) | kIntBits);
+		wr(kSdma0Cg, 0, rd(kSdma0Cg, 0) | 0x2u);
+		wr(kSdma1Cg, 0, rd(kSdma1Cg, 0) | 0x2u);
+		wr(kCpIntRing0, 0, rd(kCpIntRing0, 0) | kIntBits);                                // gfx_v11_0_enable_gui_idle_interrupt (one gfx pipe)
+	} else {
+		wr(kCgcgCtrl, 1, rd(kCgcgCtrl, 1) & ~(kCgcgEn | kCglsEn));
+		wr(kSdma0Cg, 0, rd(kSdma0Cg, 0) & ~0x2u);
+		wr(kSdma1Cg, 0, rd(kSdma1Cg, 0) & ~0x2u);
+		wr(kMgcgOvr, 1, rd(kMgcgOvr, 1) | kRepOvr);
+		wr(kCpIntRing0, 0, rd(kCpIntRing0, 0) & ~kIntBits);
+	}
+	wr(kSafeMode, 1, 0x1);                                                               // exit RLC safe mode
+	const uint32_t now = rd(kCgcgCtrl, 1);
+	N48LOG("n33 clock gating %s: RLC_CGCG_CGLS_CTRL %#x, RLC_CGTT_MGCG_OVERRIDE %#x", enable ? "ON" : "OFF", now, rd(kMgcgOvr, 1));
+	setProperty("N33,ClockGating", enable ? "on" : "off");
+	return now;
+}
+
+// Messages a client may send on a Navi 33 (selector 15): power saving and reads only (smu_v13_0_7_ppsmc.h). 0x1000 / 0x1001 (not SMU
+// messages): GFX clock gating on / off (n33ClockGating), out[1] = RLC_CGCG_CGLS_CTRL after.
 IOReturn Navi48Bringup::n33SmuExperiment(uint32_t msg, uint32_t param, uint64_t out[2]) {
+	if (msg == 0x1000u || msg == 0x1001u) {
+		if (!amdgpu::n33n_available()) return kIOReturnNotReady;
+		out[0] = 1; out[1] = n33ClockGating(msg == 0x1000u);
+		return kIOReturnSuccess;
+	}
 	static const uint32_t kAllowed[] = { 0x02, 0x03, 0x0C, 0x0D, 0x19, 0x1A, 0x1D, 0x1E, 0x1F, 0x24, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x33, 0x35 };
 	bool ok = false;
 	for (uint32_t m : kAllowed) ok |= m == msg;
@@ -965,7 +1009,7 @@ void Navi48Bringup::navi33SmuMetrics() {
 		const uint32_t g1 = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0da4, 0)), g2 = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0da2, 0));   // GRBM_STATUS, GRBM_STATUS2
 		const uint32_t cps = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0f40, 0)), rb0r = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0f60, 0));   // CP_STAT, CP_RB0_RPTR
 		const uint32_t ha = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x1e80, 0)), hr = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x1e88, 0)), hw = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x1e91, 0));   // CP_GFX_HQD_ACTIVE / RPTR / WPTR
-		const uint32_t se0 = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0da6, 0)), cpb = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0f3f, 0));   // GRBM_STATUS_SE0, CP_BUSY_STAT
+		const uint32_t se0 = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0da5, 0)), cpb = RREG32(dev, amdgpu::navi33_gc_reg(dev, 0x0f3f, 0));   // GRBM_STATUS_SE0, CP_BUSY_STAT
 		snprintf(buf, sizeof buf, "GRBM %08x GRBM2 %08x SE0 %08x CP_STAT %08x CP_BUSY %08x RB0_RPTR %x GFX_HQD act %x rptr %x wptr %x",
 		         g1, g2, se0, cps, cpb, rb0r, ha, hr, hw);
 		setProperty("N33,Busy", buf);
@@ -1380,6 +1424,8 @@ void Navi48Bringup::stagePSPRingNavi33(uint32_t level) {
 		if (!consoleGeometry(nullptr, nullptr, &conW, &conH, &conRow)) conW = conH = conRow = 0;   // scanout refused without it
 		amdgpu::n33n_attach(dev, bootFbOff, bootFbLen, conW, conH, conRow);
 		setProperty("N33,Native", amdgpu::n33n_available() ? "ready" : "not-ready");
+		uint32_t cg = 0;   // 0.0.669: navi33-cg=1 turns GFX clock gating on at boot (default off until proven on the bench)
+		if (amdgpu::n33n_available() && PE_parse_boot_argn("navi33-cg", &cg, sizeof(cg)) && cg == 1u) (void)n33ClockGating(true);
 	}
 }
 
