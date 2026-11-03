@@ -11,19 +11,22 @@ clang -O1 "$REPO/tools/pc/navi48test.c" -framework IOKit -o "$T" 2>/dev/null || 
 sudo -v || exit 1
 echo "boot-args: $(sysctl -n kern.bootargs)"
 case " $(sysctl -n kern.bootargs) " in *" navi48-metal-disp=1 "*) ;; *) echo "navi48-metal-disp=1 is not set: run tools/native/install-metal-mac.sh --desktop-bootargs and reboot first"; exit 1 ;; esac
-echo "starting; the screen will go to the login window in about 20 s. Log: $LOG"
+if ioreg -lw0 | grep -q '"IOClass" = "IONDRVFramebuffer"'; then echo "the generic IONDRVFramebuffer is running: add navi33-fb-boot=1 to boot-args (install-metal-mac.sh --desktop-bootargs) and reboot first"; exit 1; fi
+ioreg -lw0 | grep -q '"IOClass" = "Navi48Framebuffer"' || { echo "Navi48Framebuffer is not running: the screen is not ours yet"; exit 1; }
+echo "starting; you will be logged out in about 10 s. Log: $LOG (and /var/tmp/n33-desktop.log)"
 sudo nohup zsh -c "
 exec > /var/tmp/n33-desktop.log 2>&1
+sync
 say() { print -r -- \"== \$(date +%T) \$*\"; }
 say readings; ioreg -l -w0 -c Navi48Bringup | grep -E '\"N33,(Temps|Clocks|ClockGating)\"'
-say fbpublish; '$N' fbpublish; sleep 4
+say 'fbpublish (already done at boot)'; '$N' fbpublish; sync; sleep 2
 ioreg -lw0 | grep -E '\"IOClass\" = \".*(Framebuffer|NDRV)\"' | head
 say 'metal publish'; '$N' publish; sleep 4
 kmutil showloaded --list-only 2>/dev/null | grep -E 'navi48'
-say pipeadopt; '$T' accel pipeadopt
+say pipeadopt; '$T' accel pipeadopt; sync
 say 'pipeagdc 1'; '$T' accel pipeagdc 1
 touch /private/tmp/n48m-headless-no; chmod 644 /private/tmp/n48m-headless-no
-say 'pipearm 1'; '$T' accel pipearm 1
+say 'pipearm 1'; '$T' accel pipearm 1; sync
 say pipereload; '$T' accel pipereload
 say 'restart WindowServer'; killall -9 WindowServer; sleep 20
 say 'after restart'; pgrep -lx WindowServer

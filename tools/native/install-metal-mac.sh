@@ -36,9 +36,9 @@ if [ "${1:-}" = "--desktop-bootargs" ] || [ "${1:-}" = "--plain-bootargs" ]; the
   cur=$(/usr/libexec/PlistBuddy -c "Print $BA" "$OC")
   sudo cp "$OC" "$OC.pre-bootargs.$(date +%s).backup"
   new=" $cur "
-  for a in navi48-metal-boot=1 navi48-metal-disp=1 navi48-metal-ws=1 amfi=0x80; do new=${new// $a / }; done
+  for a in navi48-metal-boot=1 navi48-metal-disp=1 navi48-metal-ws=1 amfi=0x80 navi33-fb-boot=1; do new=${new// $a / }; done
   new=$(echo $new)
-  [ "$1" = "--desktop-bootargs" ] && new="$new navi48-metal-disp=1 navi48-metal-ws=1 amfi=0x80"
+  [ "$1" = "--desktop-bootargs" ] && new="$new navi48-metal-disp=1 navi48-metal-ws=1 amfi=0x80 navi33-fb-boot=1"
   sudo /usr/libexec/PlistBuddy -c "Set $BA $new" "$OC"
   say "boot-args: $(/usr/libexec/PlistBuddy -c "Print $BA" "$OC")"
   exit 0

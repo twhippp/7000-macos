@@ -38,4 +38,12 @@ public:
 	void free() override;
 };
 
+class Navi33FbBlocker : public IOService {   // 0.0.674: see Navi48DisplayNub.cpp
+	OSDeclareDefaultStructors(Navi33FbBlocker)
+	using super = IOService;
+public:
+	IOService *probe(IOService *provider, SInt32 *score) override;
+	bool start(IOService *provider) override;
+};
+
 #endif /* Navi48DisplayNub_hpp */

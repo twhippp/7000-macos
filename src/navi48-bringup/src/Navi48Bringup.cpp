@@ -8303,7 +8303,11 @@ bool Navi48Bringup::start(IOService *provider) {
 			// ac_darwin_iokit.c, navi48test) only sees registered services, so without this
 			// the N33 app door is loaded and "ready" but no client can find it to open.
 			registerService();
-			if (profile->gen == amdgpu::GpuGeneration::Navi33) Navi48MetalNub::autoPublishNavi33(this);   // boot-arg navi48-metal-boot=1
+			if (profile->gen == amdgpu::GpuGeneration::Navi33) {
+				uint32_t fbb = 0;   // 0.0.674: navi33-fb-boot=1: the console framebuffer at boot (Navi33FbBlocker keeps IONDRVFramebuffer off the screen)
+				if (PE_parse_boot_argn("navi33-fb-boot", &fbb, sizeof(fbb)) && fbb == 1u) { uint64_t o[4] = { 0 }; (void)n33FbPublish(o); }
+				Navi48MetalNub::autoPublishNavi33(this);   // boot-arg navi48-metal-boot=1
+			}
 			return true;
 		}
 
