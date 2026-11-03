@@ -274,6 +274,31 @@ uint32_t Navi48DisplayNub::publishNavi33(uint64_t aperPhys, uint64_t aperLen, ui
 		FBLOG("n33 fbpublish: console nub published (id %llu): %ux%u pitch %u, aperture %#llx + %#llx: the aux framebuffer may now match it", (unsigned long long)out[1], w, h, pitch, (unsigned long long)aperPhys, (unsigned long long)aperLen);
 		nub->registerService();
 		nub->release();
+		// 0.0.673: the generic IONDRVFramebuffer on the same GPU drives the SAME screen. Once our Navi48Framebuffer has started (up to 5 s), the
+		// generic one is terminated, so WindowServer (and the accelerator's display machine, created after this by the Metal publish) see one display.
+		IOService *ours = nullptr;
+		for (int i = 0; i < 50 && !(ours = framebufferOf(N48_DISP_N33_INDEX)); i++) IOSleep(100);
+		uint32_t killed = 0;
+		if (ours) {
+			ours->release();
+			if (IOService *pci = navi48_bringup_pci())
+				if (OSIterator *it = pci->getChildIterator(gIOServicePlane)) {
+					OSArray *victims = OSArray::withCapacity(2);
+					while (OSObject *o = it->getNextObject()) {
+						IOService *svc = OSDynamicCast(IOService, o);
+						const OSMetaClass *mc = svc ? svc->getMetaClass() : nullptr;
+						const char *cn = mc ? mc->getClassName() : nullptr;
+						if (victims && cn && strcmp(cn, "IONDRVFramebuffer") == 0) victims->setObject(svc);
+					}
+					it->release();
+					if (victims) {
+						for (unsigned k = 0; k < victims->getCount(); k++) if (IOService *v = OSDynamicCast(IOService, victims->getObject(k))) { v->terminate(); killed++; }
+						victims->release();
+					}
+				}
+		}
+		out[3] = aperLen | ((uint64_t)killed << 56);
+		FBLOG("n33 fbpublish: our framebuffer %s; generic IONDRVFramebuffer(s) terminated: %u", ours ? "started" : "did NOT start within 5 s", killed);
 	}
 	out[0] = n48fb::kOk;
 	return n48fb::kOk;

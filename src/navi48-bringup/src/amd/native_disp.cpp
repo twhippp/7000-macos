@@ -409,6 +409,21 @@ struct KernelEnv {
         }
         return nullptr;
     }
+    // 0.0.673: on a Navi 33 the display machine has a pipe per framebuffer (the generic IONDRVFramebuffer's and ours): the one to adopt is the pipe
+    // whose +0x98 is the console Navi48Framebuffer, not necessarily pipes[0]. 0 when none is.
+    uint64_t n33_pipe(uint64_t dm) {
+        uint32_t n = 0;
+        if (!rd32(dm + n48disp::kDmCount, &n)) return 0;
+        IOService *fb = Navi48DisplayNub::framebufferOf(N48_DISP_N33_INDEX);
+        if (!fb) return 0;
+        const uint64_t want = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fb));
+        fb->release();
+        for (uint32_t i = 0; i < n && i < 8u; i++) {
+            uint64_t pp = 0, f = 0;
+            if (rd64(dm + n48disp::kDmPipes + 8u * i, &pp) && n48disp::kptr_ok(pp) && rd64(pp + n48disp::kPipeFb, &f) && f == want) return pp;
+        }
+        return 0;
+    }
     n48disp::PipeProbe probe_pipe() {
         n48disp::PipeProbe p {};
         if (!find_accel()) return p;
@@ -421,8 +436,10 @@ struct KernelEnv {
         p.dmReadable = true;
         if (!rd32(dm + n48disp::kDmCount, &p.count)) p.count = 0;
         uint64_t pipe0 = 0;
-        if (p.count >= 1u && rd64(dm + n48disp::kDmPipes, &pipe0) && pipe0 == 0ull) p.nullPipe = true;     // 0.0.615 (P3): counted but NULL
-        if (p.count >= 1u && rd64(dm + n48disp::kDmPipes, &pipe0) && n48disp::kptr_ok(pipe0)) {
+        const bool n33 = amdgpu::n33n_available();
+        if (!n33 && p.count >= 1u && rd64(dm + n48disp::kDmPipes, &pipe0) && pipe0 == 0ull) p.nullPipe = true;     // 0.0.615 (P3): counted but NULL
+        if (n33) pipe0 = n33_pipe(dm);                                     // 0.0.673
+        if (p.count >= 1u && (n33 || rd64(dm + n48disp::kDmPipes, &pipe0)) && n48disp::kptr_ok(pipe0)) {
             p.havePipe = true;
             p.classOurs = class_is(pipe0, "Navi48DisplayPipe");
             p.traced = known_pipe(pipe0);
@@ -511,7 +528,10 @@ struct KernelEnv {
     }
     void record_adopted(const n48disp::PipeProbe &) {
         uint64_t dm = 0, pipe0 = 0;
-        if (rd64(accel_addr() + n48disp::kAccelDm, &dm) && rd64(dm + n48disp::kDmPipes, &pipe0)) gD.adoptedPipe = pipe0;
+        if (rd64(accel_addr() + n48disp::kAccelDm, &dm)) {
+            if (amdgpu::n33n_available()) { pipe0 = n33_pipe(dm); if (pipe0) gD.adoptedPipe = pipe0; }   // 0.0.673
+            else if (rd64(dm + n48disp::kDmPipes, &pipe0)) gD.adoptedPipe = pipe0;
+        }
         if (!gD.scratch) gD.scratch = static_cast<uint8_t *>(IOMalloc(n48disp::kScratchBytes));
         if (n48m6_latched_on()) m6_record_map();
         __atomic_store_n(&gD.adopted, 1u, __ATOMIC_RELEASE);

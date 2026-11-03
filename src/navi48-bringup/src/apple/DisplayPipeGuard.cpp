@@ -45,6 +45,8 @@
 #include "../amd/native_disp.h"      // 0.0.614: n48disp_latched_on (the native AGDC route is behind boot-arg navi48-metal-disp=1)
 #include "../amd/native_agdc_flow.h"  // 0.0.614: the native publish sequence (host-tested, tests/native_agdc_test.cpp)
 #include "../Navi48DisplayNub.hpp"       // 0.0.659 (M6): framebufferOf(index)
+#include "../Navi48DisplayOps.h"        // 0.0.673: N48_DISP_N33_INDEX
+#include "../amd/navi33_native.h"      // 0.0.673: n33n_available
 #include "../amd/native_m6_pure.h"    // 0.0.659 (M6 Stage 1a): the AGDC list of several framebuffers and the per-endpoint 0x921 / 0x711 answers
 #include "sdma_gcr.h"   // 0.0.416 (an internal design note): the GCR_REQ dword count for the control line (G3)
 
@@ -78,6 +80,7 @@ static const char *dpg_class(const void *obj) {
 // accept Apple's own AMDFramebuffer and AMDRadeonX6000 classes. Only these two names are ours.
 static bool dpg_is_our_fb_name(const char *cls) {
     if (!cls) return false;
+    if (amdgpu::n33n_available() && !strcmp(cls, "Navi48Framebuffer")) return true;   // 0.0.673: the Navi 33 console framebuffer
     return !strcmp(cls, "RDNA4FB") || !strcmp(cls, "AMDRDNA4FB");
 }
 static bool dpg_is_our_fb(const void *obj) {
@@ -2101,7 +2104,9 @@ struct AgdcNativeEnv {
     }
     bool have_targets() {
         static const char *const kNames[2] = { "RDNA4FB", "AMDRDNA4FB" };     // RDNA4FB matches under either name (fbname swaps the OSMetaClass name pointer)
-        for (unsigned i = 0; i < 2 && !fb; ++i) {
+        const bool n33 = amdgpu::n33n_available();
+        if (n33 && !fb) fb = Navi48DisplayNub::framebufferOf(N48_DISP_N33_INDEX);   // 0.0.673: the Navi 33 console framebuffer (retained)
+        for (unsigned i = 0; i < 2 && !fb && !n33; ++i) {
             OSDictionary *m = IOService::serviceMatching(kNames[i]);
             if (!m) continue;
             fb = IOService::waitForMatchingService(m, 0);                  // non-blocking lookup; returns a retained service
@@ -2110,7 +2115,7 @@ struct AgdcNativeEnv {
         pci = navi48_bringup_pci();
         provider = navi48_bringup_service();
         const OSMetaClass *mc = fb ? fb->getMetaClass() : nullptr;
-        bool ok = fb && mc && n48agdc::fb_name_ok(mc->getClassName()) && pci && provider;
+        bool ok = fb && mc && (n48agdc::fb_name_ok(mc->getClassName()) || (n33 && strcmp(mc->getClassName(), "Navi48Framebuffer") == 0)) && pci && provider;
         if (!ok) DPGLOG("agdc: native: REFUSED - framebuffer %p (%s), PCI %p, provider %p", fb, fb ? dpg_class(fb) : "none", pci, provider);
         if (ok && n48m6_latched_on()) ok = collect_m6();
         return ok;

@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
     if (fbp) {    /* Navi 33 (kext >= 0.0.667): the boot console as display index 3 for the aux framebuffer (selector 16) */
         uint64_t so[4] = { 0 }; uint32_t sn = 4;
         kr = IOConnectCallScalarMethod(c, 16, NULL, 0, so, &sn);
-        printf("fbpublish: %s 0x%08x status %llu nub id %#llx aperture %#llx + %#llx\n", kr ? "refused" : "ok", kr, so[0], so[1], so[2], so[3]);
+        printf("fbpublish: %s 0x%08x status %llu nub id %#llx aperture %#llx + %#llx, generic framebuffers stopped %llu\n", kr ? "refused" : "ok", kr, so[0], so[1], so[2], so[3] & ((1ull << 56) - 1), so[3] >> 56);
         IOServiceClose(c); return kr ? 1 : 0;
     }
     if (smu) {    /* Navi 33 (kext >= 0.0.667): one allow-listed SMU 13.0.7 message (selector 15) */
