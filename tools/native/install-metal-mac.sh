@@ -90,6 +90,11 @@ sudo kmutil load -p "$AUX_DST" 2>&1 | tail -5 || true
 
 fi
 say "4/4 Metal bundle -> /Library/GPUBundles"
+# a stale tarball silently reinstalled the previous bundle (2026-11-04): rebuild when any bundle source is newer than it
+if [ ! -f "$TAR" ] || [ -n "$(find "$REPO/tools/native/navi48metal" -maxdepth 1 -type f -newer "$TAR" -print -quit)" ]; then
+  echo "the bundle sources changed since the last build: building it first (tools/native/build-metal-mac.sh)"
+  "$REPO/tools/native/build-metal-mac.sh" || { echo "BUILD FAILED"; exit 1; }
+fi
 U=$(mktemp -d)
 tar -xf "$TAR" -C "$U"
 sudo mkdir -p /Library/GPUBundles

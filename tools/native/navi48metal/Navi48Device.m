@@ -193,20 +193,20 @@ static BOOL n48_counter_tripped(int *countOut) {
     return count >= 3;
 }
 // Called after the first successfully completed command buffer of an admitted instance that is counted.
-// Bundle 21: the marker is written only once the instance has ALSO survived 60 s past its first completed command buffer. An instance that
+// Bundle 21: the marker is written only once the instance has ALSO survived 180 s past its first completed command buffer (N33 runs lived up to 68 s). An instance that
 // dies in Core Animation 15-45 s in (seen on N33, 2026-11-04) had already marked itself clean after ~1 s and so never counted: the 3-in-300 s
-// rule could not trip and the login loop never ended. A process that dies inside the 60 s never runs the block and stays counted.
+// rule could not trip and the login loop never ended. A process that dies inside the 180 s never runs the block and stays counted.
 static void n48_write_clean(void);
 static void n48_mark_clean(void) {
     if (!atomic_load(&n48_counter_on) || atomic_exchange(&n48_clean_done, 1)) return;
-    N48LOG("clean marker: first completed command buffer; written in 60 s if this instance is still alive");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60ll * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ n48_write_clean(); });
+    N48LOG("clean marker: first completed command buffer; written in 180 s if this instance is still alive");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 180ll * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ n48_write_clean(); });
 }
 static void n48_write_clean(void) {
     int fd = open(n48_ok_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
     if (fd < 0) { N48LOG("clean marker: cannot append to %s (errno %d)", n48_ok_path, errno); return; }
     char b[96]; int n = snprintf(b, sizeof b, "%d %lld %lld\n", (int)getpid(), n48_start_epoch, (long long)time(NULL)); (void)!write(fd, b, (size_t)n); close(fd);
-    N48LOG("clean marker written to %s (alive 60 s after the first completed command buffer)", n48_ok_path);
+    N48LOG("clean marker written to %s (alive 180 s after the first completed command buffer)", n48_ok_path);
 }
 
 // N48G_FLAG_ABSENT (-1) = property absent (or filtered by a sandbox: the registry cannot tell), N48G_FLAG_NONUB (-2) = the nub could not be reached, 0 = false/zero, 1 = true.
