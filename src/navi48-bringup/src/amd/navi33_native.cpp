@@ -168,6 +168,15 @@ bool idle_wait(uint64_t ns = 2000000000ull) {
 	while (retired() < gS.emitted) { if (now_ns() - t0 > ns) return false; IODelay(20); }
 	return true;
 }
+// 0.0.675: at most kMaxInflight submits between the emitted and the retired seqno. Every emit is at most kMaxEmitDw dwords and the
+// gfx ring holds 2048, so kMaxInflight * kMaxEmitDw (+ the copy IBs' 16) always fits: navi33_gfx_emit can skip its rptr check
+// (that register reads 0 on this card). Waits up to 2 s for room; false = the GPU stopped retiring (a real hang).
+constexpr uint64_t kMaxInflight = 4;
+bool room_wait() {
+	const uint64_t t0 = now_ns();
+	while (gS.emitted - retired() >= kMaxInflight) { if (now_ns() - t0 > 2000000000ull) return false; IODelay(20); }
+	return true;
+}
 bool hello() { return __atomic_load_n(&gOpen, __ATOMIC_ACQUIRE) && gS.hello; }
 
 // Unwire a host import's pages (only once the GPU can no longer touch them: after idle and the unmap).
@@ -444,7 +453,9 @@ IOReturn n33n_submit(const uint8_t *in, uint32_t size, uint64_t *seqOut) {
 		if (hasFence) k += release_mem(gSubmit + k, gDev->vramMC(gS.bo[v.fenceHandle].off + v.fenceOffset), seq);
 		k += release_mem(gSubmit + k, gDev->vramMC(slot_off() + kSeqOff), seq);
 		amdgpu_hdp_flush(*gDev);                              // the CPU's writes through BAR0 reach VRAM first
-		if (!navi33_gfx_emit(*gDev, gSubmit, k)) { rc = kIOReturnTimeout; break; }
+		static_assert(sizeof(gSubmit) / 4 * kMaxInflight <= 2048 - 64, "kMaxInflight full submits fit in the gfx ring");
+		if (!room_wait()) { rc = kIOReturnTimeout; break; }
+		if (!navi33_gfx_emit(*gDev, gSubmit, k, true)) { rc = kIOReturnTimeout; break; }
 		gS.emitted = seq;
 		*seqOut = seq;
 	} while (false);
@@ -505,7 +516,7 @@ bool run_copy_ib(uint32_t which, uint64_t *seqOut) {
 	const uint64_t seq = gS.emitted + 1;
 	k += release_mem(gSubmit + k, seqMc, seq);
 	amdgpu_hdp_flush(*gDev);
-	if (!navi33_gfx_emit(*gDev, gSubmit, k)) return false;
+	if (!room_wait() || !navi33_gfx_emit(*gDev, gSubmit, k, true)) return false;
 	gS.emitted = seq;
 	if (seqOut) *seqOut = seq;
 	return true;

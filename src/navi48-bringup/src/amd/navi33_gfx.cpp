@@ -1798,11 +1798,14 @@ bool navi33_flush_vmid(DeviceContext &dev, uint32_t vmid, uint32_t timeoutUs) {
 }
 
 // Append dwords to the gfx queue and ring its doorbell. Waits (bounded) for room.
-bool navi33_gfx_emit(DeviceContext &dev, const uint32_t *dw, uint32_t n) {
+bool navi33_gfx_emit(DeviceContext &dev, const uint32_t *dw, uint32_t n, bool callerKnowsSpace) {
 	constexpr uint32_t kRing = kGfxRingBytes / 4;
 	if (gGfxWptrDw == 0 || n == 0 || n > kRing / 2) return false;
 	const uint64_t base = slot(dev);
-	for (uint32_t us = 0;; us += 10) {
+	// 0.0.675: CP_GFX_HQD_RPTR reads 0 on this card (seen in N33,Busy while work retired), so once the write pointer had gone
+	// round the ring the check below saw it permanently full and every submit failed after 200 ms (WindowServer: DEVICE_LOST).
+	// The native engine bounds the work in flight by its retired seqno instead and passes callerKnowsSpace.
+	for (uint32_t us = 0; !callerKnowsSpace; us += 10) {
 		grbm_select(dev, 0, 0, 0, 0);
 		const uint32_t rptr = RREG32(dev, gc0(dev, G::CP_GFX_HQD_RPTR)) % kRing;
 		const uint32_t used = (gGfxWptrDw % kRing - rptr + kRing) % kRing;
