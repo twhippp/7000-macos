@@ -692,17 +692,31 @@ struct N33Seg {
 	}
 };
 }
+static IOReturn n33n_bo_import_host_impl(task_t task, uint64_t hostVa, uint64_t size, uint64_t flags, uint64_t gpuVa, uint64_t out[4], const char **why);
+// 0.0.676: every refused host import is logged with its reason (WindowServer's 8 MB NoCopy buffers were refused with no kernel line).
 IOReturn n33n_bo_import_host(task_t task, uint64_t hostVa, uint64_t size, uint64_t flags, uint64_t gpuVa, uint64_t out[4]) {
+	const char *why = "?";
+	const IOReturn rc = n33n_bo_import_host_impl(task, hostVa, size, flags, gpuVa, out, &why);
+	if (rc != kIOReturnSuccess) {
+		static uint32_t n = 0;
+		if (n++ < 64) N33N_LOG("host import REFUSED rc %#x (%s): va %#llx size %llu KiB flags %#llx gpuVa %#llx imported %llu KiB", (unsigned)rc, why,
+		                       (unsigned long long)hostVa, (unsigned long long)(size >> 10), (unsigned long long)flags, (unsigned long long)gpuVa,
+		                       (unsigned long long)(__atomic_load_n(&gS.importedBytes, __ATOMIC_RELAXED) >> 10));
+	}
+	return rc;
+}
+static IOReturn n33n_bo_import_host_impl(task_t task, uint64_t hostVa, uint64_t size, uint64_t flags, uint64_t gpuVa, uint64_t out[4], const char **why) {
+	*why = "not open";
 	if (!hello()) return kIOReturnNotReady;
-	if (task == nullptr || out == nullptr) return kIOReturnBadArgument;
+	*why = "args"; if (task == nullptr || out == nullptr) return kIOReturnBadArgument;
 	const ImportChk pre = import_check(hostVa, size, flags, gpuVa, __atomic_load_n(&gS.importedBytes, __ATOMIC_RELAXED));
-	if (pre.rc != kOk) return (IOReturn)pre.rc;
+	if (pre.rc != kOk) { *why = "import_check (align / size / flags / va / cap)"; return (IOReturn)pre.rc; }
 	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)hostVa, (mach_vm_size_t)size, kIODirectionInOut, task);
-	if (md == nullptr) return kIOReturnNoMemory;
-	if (md->prepare() != kIOReturnSuccess) { md->release(); return kIOReturnBadArgument; }   // not (fully) mapped in the caller
+	if (md == nullptr) { *why = "withAddressRange"; return kIOReturnNoMemory; }
+	if (const IOReturn pr = md->prepare(); pr != kIOReturnSuccess) { md->release(); *why = pr == kIOReturnVMError ? "prepare: VM error (unmapped or not wireable)" : "prepare (wire) failed"; N33N_LOG("host import: prepare rc %#x", (unsigned)pr); return kIOReturnBadArgument; }   // not (fully) mapped in the caller
 	const vm_size_t listBytes = (vm_size_t)(pre.pages * sizeof(uint64_t));
 	uint64_t *pages = static_cast<uint64_t *>(IOMalloc(listBytes));
-	if (pages == nullptr) { md->complete(); md->release(); return kIOReturnNoMemory; }
+	if (pages == nullptr) { md->complete(); md->release(); *why = "page list alloc"; return kIOReturnNoMemory; }
 	N33Seg seg { md };
 	uint32_t crc = collect_pages(seg, size, pages, kImportMaxPages);
 	if (crc == kOk)
@@ -711,24 +725,24 @@ IOReturn n33n_bo_import_host(task_t task, uint64_t hostVa, uint64_t size, uint64
 	if (crc != kOk) {
 		IOFree(pages, listBytes); md->complete(); md->release();
 		N33N_LOG("import refused (%#x): %#llx + %llu KiB", crc, (unsigned long long)hostVa, (unsigned long long)(size >> 10));
-		return (IOReturn)crc;
+		*why = "page collect / BAR0 page"; return (IOReturn)crc;
 	}
 	IOLockLock(gLock);
 	IOReturn rc = kIOReturnSuccess;
 	bool taken = false;
 	do {
-		if (!gS.hello) { rc = kIOReturnNotReady; break; }
+		if (!gS.hello) { rc = kIOReturnNotReady; *why = "closed"; break; }
 		const ImportChk c = import_check(hostVa, size, flags, gpuVa, gS.importedBytes);   // authoritative, under the lock
-		if (c.rc != kOk) { rc = (IOReturn)c.rc; break; }
+		if (c.rc != kOk) { rc = (IOReturn)c.rc; *why = "import_check under lock"; break; }
 		const uint32_t h = lowest_free(gS.boUsed, 1, N48N_MAX_BOS - 1);
-		if (h == 0) { rc = kIOReturnNoResources; break; }
+		if (h == 0) { rc = kIOReturnNoResources; *why = "no free BO handle"; break; }
 		int slot = -1;
 		if (c.gpuStripped != 0ull) {
-			if (va_overlap(gS.maps, kMaxMaps, c.gpuStripped, size) >= 0) { rc = kIOReturnBadArgument; break; }
+			if (va_overlap(gS.maps, kMaxMaps, c.gpuStripped, size) >= 0) { rc = kIOReturnBadArgument; *why = "GPU VA overlap"; break; }
 			slot = va_insert(gS.maps, kMaxMaps, VaEnt{ c.gpuStripped, size, 0, h, (uint32_t)flags });
-			if (slot < 0) { rc = kIOReturnNoResources; break; }
+			if (slot < 0) { rc = kIOReturnNoResources; *why = "no free VA slot"; break; }
 			const uint32_t r = pt_map_list(c.gpuStripped, c.pages, pages, leaf((uint32_t)flags) | kSys | kSnoop);
-			if (r != kOk) { pt_unmap(c.gpuStripped, c.pages); gS.maps[slot] = VaEnt{0, 0, 0, 0, 0}; rc = (IOReturn)r; break; }
+			if (r != kOk) { pt_unmap(c.gpuStripped, c.pages); gS.maps[slot] = VaEnt{0, 0, 0, 0, 0}; rc = (IOReturn)r; *why = "page-table map"; break; }
 		}
 		Bo b {};
 		b.used = 1; b.kind = kBoHost; b.size = size; b.hmd = md; b.hpages = pages; b.hpageCount = (uint32_t)c.pages;
