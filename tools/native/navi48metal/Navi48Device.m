@@ -2082,10 +2082,12 @@ static _Atomic uint64_t n48_alloc_total;   // bytes of VkDeviceMemory held by li
     BOOL _noacct;   // heap resource: the heap's size is in n48_alloc_total, not this buffer's memory
     N48Mem _pm; BOOL _pooled;   // P1: the memory comes from the pool (slab range / recycled allocation / own allocation made through n48_mem_alloc); _vkmem is then NULL
     void (^_deallocator)(void *, NSUInteger); BOOL _imported;   // no-copy buffer: client memory imported as host memory; the block is called once, at release
+    void *_ncOrig;   // bundle 22: a read-only NoCopy range served by a COPY: the client's pointer (handed back to the deallocator)
 }
 - (instancetype)initWithDevice:(id)dev length:(NSUInteger)len options:(NSUInteger)opts error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev bytesNoCopy:(void *)p length:(NSUInteger)len options:(NSUInteger)opts deallocator:(void (^)(void *, NSUInteger))d error:(NSError **)err;
 - (BOOL)n48Imported;
+- (void)n48AdoptReadOnlyCopyOf:(void *)p deallocator:(void (^)(void *, NSUInteger))d;
 - (void)n48AdoptHeap:(N48Heap *)h offset:(NSUInteger)o size:(NSUInteger)sz bid:(uint64_t)bid;
 - (VkBuffer)vkBuffer;
 @end
@@ -2103,6 +2105,18 @@ static void n48_region_log(void *p, NSUInteger len) {
                depth, si.object_id, si.pages_resident, si.pages_shared_now_private, si.external_pager);
         if (ra + rs <= a) return; a = ra + rs;
     }
+}
+// Bundle 22: YES when every page of [p, p+len) is mapped and NONE can ever be written through this mapping (max protection without VM_PROT_WRITE).
+// WindowServer's one refused NoCopy range (8294400 B, tag 70, prot 1/1) is such a range: a writable host import cannot wire it.
+static BOOL n48_range_readonly(void *p, NSUInteger len) {
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)p; const mach_vm_address_t end = a + len;
+    for (int i = 0; i < 64 && a < end; i++) {
+        mach_vm_address_t ra = a; mach_vm_size_t rs = 0; vm_region_submap_info_data_64_t si; mach_msg_type_number_t c = VM_REGION_SUBMAP_INFO_COUNT_64; natural_t depth = 0;
+        if (mach_vm_region_recurse(mach_task_self(), &ra, &rs, &depth, (vm_region_recurse_info_t)&si, &c) != KERN_SUCCESS || ra > a) return NO;
+        if (si.max_protection & VM_PROT_WRITE) return NO;
+        if (ra + rs <= a) return NO; a = ra + rs;
+    }
+    return a >= end;
 }
 @implementation N48Buffer
 - (instancetype)initWithDevice:(id)dev length:(NSUInteger)len options:(NSUInteger)opts error:(NSError **)err {
@@ -2186,6 +2200,7 @@ static void n48_region_log(void *p, NSUInteger len) {
     return self;
 }
 - (BOOL)n48Imported { return _imported; }
+- (void)n48AdoptReadOnlyCopyOf:(void *)p deallocator:(void (^)(void *, NSUInteger))d { _ncOrig = p; _deallocator = [d copy]; }
 - (void)n48AdoptHeap:(N48Heap *)h offset:(NSUInteger)o size:(NSUInteger)sz bid:(uint64_t)bid {
     _hpHeap = h; _hpOff = o; _hpSize = sz; _hpId = bid;
     if (!_noacct && !_imported) { atomic_fetch_sub(&n48_alloc_total, (uint64_t)_asz); _noacct = YES; }
@@ -2197,7 +2212,7 @@ static void n48_region_log(void *p, NSUInteger len) {
         if (_pooled) { n48_mem_free(&_pm); if (!_noacct) atomic_fetch_sub(&n48_alloc_total, (uint64_t)_asz); }   // P1
         else if (_vkmem) { vkFreeMemory(N48R.dev, _vkmem, NULL); if (_imported) { @synchronized ([Navi48Device class]) { N48R.impTotal -= _len; } } else if (!_noacct) atomic_fetch_sub(&n48_alloc_total, (uint64_t)_asz); }
     }
-    if (_deallocator) { void (^d)(void *, NSUInteger) = _deallocator; _deallocator = nil; d(_ptr, _len); }
+    if (_deallocator) { void (^d)(void *, NSUInteger) = _deallocator; _deallocator = nil; d(_ncOrig ? _ncOrig : _ptr, _len); }
 }
 - (void)doesNotRecognizeSelector:(SEL)sel {
     N48LOG("UNRECOGNIZED selector %s on N48Buffer", sel_getName(sel));
@@ -6153,6 +6168,19 @@ static void n48_census_log(void) {
 - (id)newBufferWithBytesNoCopy:(void *)p length:(NSUInteger)len options:(MTLResourceOptions)o deallocator:(void (^)(void *, NSUInteger))d {
     N48LOG("newBufferWithBytesNoCopy:length:%lu options:0x%lx", (unsigned long)len, (unsigned long)o);
     NSError *e = nil; N48Buffer *b = [[N48Buffer alloc] initWithDevice:self bytesNoCopy:p length:len options:o deallocator:d error:&e];
+    // Bundle 22: a READ-ONLY client range cannot be imported (the import wires it writable). Nobody can write through this mapping, so a snapshot
+    // copy in our own memory is the same buffer for every reader. Returning nil here made QuartzCore assert (CA::OGL::Context::push_surface) ~30 s later.
+    // Kill file /private/tmp/n48m-norocopy restores the nil.
+    if (!b && p && len && n48_range_readonly(p, len) && access("/private/tmp/n48m-norocopy", F_OK) != 0) {
+        NSError *e2 = nil;
+        N48Buffer *c = [[N48Buffer alloc] initWithDevice:self length:len options:(o & ~(MTLResourceOptions)0xF0) /* Shared */ error:&e2];
+        if (c && [c contents]) {
+            memcpy([c contents], p, len); [c n48AdoptReadOnlyCopyOf:p deallocator:d];
+            N48LOG("newBufferWithBytesNoCopy: READ-ONLY range %p + %lu B served by a copy (buffer %p)", p, (unsigned long)len, (__bridge void *)c);
+            return c;
+        }
+        N48LOG("newBufferWithBytesNoCopy: read-only copy failed: %s", e2.localizedDescription.UTF8String);
+    }
     if (!b) N48LOG("newBufferWithBytesNoCopy: NIL: %s", e.localizedDescription.UTF8String);   // a refused buffer never owned the memory: the deallocator is NOT called
     return b;
 }
