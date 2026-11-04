@@ -359,7 +359,7 @@ IOReturn n33n_gem_va(const n48n_gem_va *in) {
 	if (!hello()) return kIOReturnNotReady;
 	const VaReq q = gemva_check(in->operation, in->handle, in->_pad, in->flags, in->va_address, in->offset_in_bo, in->map_size,
 	                            in->vm_timeline_point, in->vm_timeline_syncobj_out, in->num_syncobj_handles, in->input_fence_syncobj_handles);
-	if (q.rc != kOk) return (IOReturn)q.rc;
+	if (q.rc != kOk) { N33N_LOG("gem_va REFUSED by the argument check rc %#x: op %u handle %u va %#llx size %llu KiB", (unsigned)q.rc, (unsigned)in->operation, (unsigned)in->handle, (unsigned long long)in->va_address, (unsigned long long)(in->map_size >> 10)); return (IOReturn)q.rc; }
 	IOLockLock(gLock);
 	IOReturn rc = kIOReturnSuccess;
 	do {
@@ -385,6 +385,11 @@ IOReturn n33n_gem_va(const n48n_gem_va *in) {
 		}
 	} while (false);
 	IOLockUnlock(gLock);
+	if (rc != kIOReturnSuccess) {   // 0.0.677: a refused map was silent; WindowServer's NoCopy imports may die here (after a good BoImportHost)
+		static uint32_t n = 0;
+		if (n++ < 64) N33N_LOG("gem_va REFUSED rc %#x: op %u handle %u va %#llx size %llu KiB off %#llx flags %#x", (unsigned)rc, (unsigned)in->operation, (unsigned)in->handle,
+		                       (unsigned long long)in->va_address, (unsigned long long)(in->map_size >> 10), (unsigned long long)in->offset_in_bo, (unsigned)in->flags);
+	}
 	return rc;
 }
 
