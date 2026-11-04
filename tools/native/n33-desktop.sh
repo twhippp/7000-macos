@@ -29,8 +29,9 @@ touch /private/tmp/n48m-headless-no; chmod 644 /private/tmp/n48m-headless-no
 say 'pipearm 1'; '$T' accel pipearm 1; sync
 say pipereload; '$T' accel pipereload
 say 'restart WindowServer'; killall -9 WindowServer; sleep 20
-say 'after restart'; pgrep -lx WindowServer
-log show --last 1m --predicate 'eventMessage CONTAINS \"Navi48Metal\"' 2>/dev/null | tail -60
+say 'after restart (waiting 40 s for the translator)'; sleep 20
+tail -20 /private/var/tmp/n48m-translate-state/translate.log 2>/dev/null; ls /private/var/tmp/n48m-spv 2>/dev/null | head -20
+log show --last 1m --predicate 'eventMessage CONTAINS \"Navi48Metal\"' 2>/dev/null | grep -E 'FALLBACK|HOT-SWAP|hotswap|scanout|D-copy|counter|declin' | tail -40
 '$T' accel pipestat 4 2>/dev/null | tail -15
 ioreg -l -w0 -c Navi48Bringup | grep -E '\"N33,(Temps|Clocks)\"'
 say done
