@@ -19,7 +19,7 @@ exec > /var/tmp/n33-desktop.log 2>&1
 sync
 say() { print -r -- \"== \$(date +%T) \$*\"; }
 say 'clear the crash counter (a re-run in the same boot)'; rm -f /private/tmp/n48m-starts /private/tmp/n48m-ok
-say "translated shaders so far: \$(ls /private/var/tmp/n48m-spv 2>/dev/null | grep -c '\\.spv\$')"
+say 'translated shaders so far:'; ls /private/var/tmp/n48m-spv 2>/dev/null | grep -c spv
 say readings; ioreg -l -w0 -c Navi48Bringup | grep -E '\"N33,(Temps|Clocks|ClockGating)\"'
 say 'fbpublish (already done at boot)'; '$N' fbpublish; sync; sleep 2
 ioreg -lw0 | grep -E '\"IOClass\" = \".*(Framebuffer|NDRV)\"' | head
