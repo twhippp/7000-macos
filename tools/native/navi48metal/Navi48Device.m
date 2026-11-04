@@ -11,6 +11,7 @@
 //                -[MTLIOAccelDevice supportLazyInitialization] at 0x7ff80f5a9cd3 is `xor eax,eax; ret`).
 //   N48_9D=1     the 9d feature/limit queries (default).  N48_9D=0 leaves them to the MTLIOAccelDevice base.
 #import <Foundation/Foundation.h>
+#include <mach/mach_vm.h>
 #include <stdatomic.h>
 #import <Metal/Metal.h>
 #import <os/log.h>
@@ -2089,6 +2090,20 @@ static _Atomic uint64_t n48_alloc_total;   // bytes of VkDeviceMemory held by li
 - (VkBuffer)vkBuffer;
 @end
 
+// Bundle 22: what kind of memory a refused NoCopy pointer is (only 8294400 B = one 1920x1080x4 screen is refused on N33; the small ones import).
+// user_tag 21 = VM_MEMORY_IOKIT (an IOKit mapping such as a framebuffer), share mode, protections and the object, per region covering [p, p+len).
+static void n48_region_log(void *p, NSUInteger len) {
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)p; const mach_vm_address_t end = a + len;
+    for (int i = 0; i < 8 && a < end; i++) {
+        mach_vm_address_t ra = a; mach_vm_size_t rs = 0; vm_region_submap_info_data_64_t si; mach_msg_type_number_t c = VM_REGION_SUBMAP_INFO_COUNT_64; natural_t depth = 0;
+        kern_return_t k = mach_vm_region_recurse(mach_task_self(), &ra, &rs, &depth, (vm_region_recurse_info_t)&si, &c);
+        if (k != KERN_SUCCESS) { N48LOG("NoCopy region: mach_vm_region_recurse(%#llx) = %d", (unsigned long long)a, k); return; }
+        N48LOG("NoCopy region %d: %#llx + %llu KiB (asked %p + %lu KiB) tag %u share %u prot %d/%d depth %u obj %#x pages res %u shared-now %u external %u",
+               i, (unsigned long long)ra, (unsigned long long)(rs >> 10), p, (unsigned long)(len >> 10), si.user_tag, si.share_mode, si.protection, si.max_protection,
+               depth, si.object_id, si.pages_resident, si.pages_shared_now_private, si.external_pager);
+        if (ra + rs <= a) return; a = ra + rs;
+    }
+}
 @implementation N48Buffer
 - (instancetype)initWithDevice:(id)dev length:(NSUInteger)len options:(NSUInteger)opts error:(NSError **)err {
     self = [super init];
@@ -2161,7 +2176,7 @@ static _Atomic uint64_t n48_alloc_total;   // bytes of VkDeviceMemory held by li
     VkImportMemoryHostPointerInfoEXT imp = { .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = p };
     VkMemoryAllocateInfo ma = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = len, .memoryTypeIndex = (uint32_t)mt };
     r = vkAllocateMemory(N48R.dev, &ma, NULL, &_vkmem); n48t_add(&T1.imp, n48_now() - timp_);
-    if (r != VK_SUCCESS) { _vkmem = VK_NULL_HANDLE; NCFAIL(118, @"vkAllocateMemory(import %lu B at %p) = %d", (unsigned long)len, p, r); }
+    if (r != VK_SUCCESS) { _vkmem = VK_NULL_HANDLE; n48_region_log(p, len); NCFAIL(118, @"vkAllocateMemory(import %lu B at %p) = %d", (unsigned long)len, p, r); }
     r = vkBindBufferMemory(N48R.dev, _vkbuf, _vkmem, 0);
     if (r != VK_SUCCESS) NCFAIL(119, @"vkBindBufferMemory = %d", r);
     @synchronized ([Navi48Device class]) { N48R.impTotal += len; }
